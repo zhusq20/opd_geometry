@@ -38,9 +38,12 @@ oj_router = APIRouter()
 MAX_COMPLETION_BYTES = 8 * 1024 * 1024
 MAX_PROMPT_BYTES = 8 * 1024 * 1024
 MAX_LABELS_BYTES = 1024 * 1024
-MAX_TEST_PAYLOAD_BYTES = 48 * 1024 * 1024
+# The pinned online64 protocol contains official rows up to about 102 MiB and
+# individual stdin/stdout cases up to about 11 MiB. Keep finite deployment
+# bounds while allowing every row in that checked-in evaluation set.
+MAX_TEST_PAYLOAD_BYTES = 128 * 1024 * 1024
 MAX_TEST_CASES = 2048
-MAX_CASE_BYTES = 8 * 1024 * 1024
+MAX_CASE_BYTES = 16 * 1024 * 1024
 MAX_CASE_TIMEOUT_SECONDS = 30.0
 LIVE_CODE_BENCH_CLASS = "LiveCodeBenchDataset"
 LIVE_CODE_BENCH_ROW_KEYS = {"id", "labels", "content", "test"}
