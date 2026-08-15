@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SLIME_DIR=/workspace/dev/iclr2027/slime_opd_geometry
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SLIME_DIR="${SLIME_DIR:-$(cd -- "${SCRIPT_DIR}/../.." && pwd)}"
+SINGLE_TASK_RL_SCRIPT="${SINGLE_TASK_RL_SCRIPT:-${SLIME_DIR}/examples/optimizer_geometry/run_single_task_rl.sh}"
 RAY_TEMP_DIR=/tmp/ray_gca8_retry1
 RAY_JOB_ADDRESS=http://127.0.0.1:8267
 RAY_HEAD_PID=""
+
+if [[ ! -f "${SINGLE_TASK_RL_SCRIPT}" ]]; then
+  echo "找不到现有训练入口：${SINGLE_TASK_RL_SCRIPT}" >&2
+  exit 2
+fi
 
 cleanup() {
   if [[ -n "${RAY_HEAD_PID}" ]]; then
@@ -62,10 +69,11 @@ export PYTHONUNBUFFERED=1
 export AVAILABLE_CUDA_DEVICES=2,3,5,7
 export RAY_ADDRESS="${RAY_JOB_ADDRESS}"
 export START_RAY=0
-export SANDBOXFUSION_BASE_URL=http://127.0.0.1:8080
-export M2RL_SANDBOX_PREFLIGHT_MARKER=/tmp/slime-sandbox/sandboxfusion_preflight.json
+export SANDBOXFUSION_BASE_URL="${SANDBOXFUSION_BASE_URL:-http://127.0.0.1:8080}"
+export M2RL_SANDBOX_PREFLIGHT_MARKER="${M2RL_SANDBOX_PREFLIGHT_MARKER:-${SLIME_DIR}/data/m2rl/sandbox/sandboxfusion_preflight.json}"
 export TASK=code
 export RL_ALGORITHM=grpo
 export OPTIMIZERS=adamw
 
-bash examples/optimizer_geometry/run_single_task_rl.sh
+echo "Running existing single-task RL entry: ${SINGLE_TASK_RL_SCRIPT}"
+bash "${SINGLE_TASK_RL_SCRIPT}"
