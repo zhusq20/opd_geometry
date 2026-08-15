@@ -64,6 +64,22 @@ Only skip fixed matrix registration when the test is intentionally helper-only o
 - Run repository-wide checks only when they are already part of the task or workflow.
 - Avoid documenting placeholder test commands that may not exist in the current tree.
 
+#### Pin imports to the current checkout
+
+Run validation from the repository root and prepend that root to `PYTHONPATH` when another slime checkout or an installed `slime` package may be present:
+
+```bash
+env PYTHONPATH="${PWD}${PYTHONPATH:+:${PYTHONPATH}}" pytest -q tests/test_wandb_utils.py tests/test_rollout_metrics.py
+```
+
+Treat missing new modules, symbols, or rollout metrics as a possible import-provenance failure before treating them as an implementation failure. A stale package can otherwise make current-checkout behavior invisible and produce a non-reproducible test result. Confirm the imported path when symptoms are ambiguous:
+
+```bash
+env PYTHONPATH="${PWD}${PYTHONPATH:+:${PYTHONPATH}}" python -c 'import slime; print(slime.__file__)'
+```
+
+Require the printed path to live under the current repository before accepting the validation result.
+
 ### Step 5: Keep Workflow Template as Source of Truth
 
 For CI workflow changes unrelated to a new, moved, or renamed test:
@@ -96,6 +112,7 @@ Include:
 - Adding tests without following existing constants/conventions
 - Making tests too large or non-deterministic
 - Skipping local validation and relying only on remote CI
+- Running tests against a stale installed package or another checkout, which can hide new modules and rollout metrics
 
 ## Reference Locations
 

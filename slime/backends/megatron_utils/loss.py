@@ -681,24 +681,60 @@ def apply_opd_kl_to_advantages(
         https://github.com/thinking-machines-lab/tinker-cookbook/blob/main/tinker_cookbook/distillation/train_on_policy.py
     """
 
-    if student_log_probs is None:
-        return
+    if not student_log_probs:
+        raise ValueError(
+            "Sampled-token OPD requires one student log-probability per generated response token; "
+            "the student sampled-token log-probs are missing."
+        )
 
     teacher_log_probs = rollout_data.get("teacher_log_probs")
     if teacher_log_probs is None:
         raise ValueError(f"OPD with opd_type='{args.opd_type}' requires teacher_log_probs, but it is missing.")
 
+    num_samples = len(advantages)
+    if len(student_log_probs) != num_samples or len(teacher_log_probs) != num_samples:
+        raise ValueError(
+            "Sampled-token OPD requires one aligned advantage/student/teacher tensor per sample; "
+            f"got advantages={num_samples}, student={len(student_log_probs)}, teacher={len(teacher_log_probs)}."
+        )
+
     device = student_log_probs[0].device
     teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
 
-    reverse_kls = []
-    for i, adv in enumerate(advantages):
-        reverse_kl = student_log_probs[i] - teacher_log_probs[i]
-        advantages[i] = adv - args.opd_kl_coef * reverse_kl
-        reverse_kls.append(reverse_kl)
+    sampled_logratios = []
+    for i, (adv, student_log_prob, teacher_log_prob) in enumerate(
+        zip(advantages, student_log_probs, teacher_log_probs, strict=True)
+    ):
+        tensors = {
+            "advantage": adv,
+            "student_log_probs": student_log_prob,
+            "teacher_log_probs": teacher_log_prob,
+        }
+        for name, tensor in tensors.items():
+            if not isinstance(tensor, torch.Tensor) or tensor.ndim != 1:
+                shape = tuple(tensor.shape) if isinstance(tensor, torch.Tensor) else type(tensor).__name__
+                raise ValueError(
+                    "Sampled-token OPD accepts only one scalar per generated token; "
+                    f"sample {i} {name} has shape/type {shape}. Full-vocabulary [tokens, vocab] "
+                    "teacher/student tensors are not supported by this loss."
+                )
+        if student_log_prob.shape != teacher_log_prob.shape or adv.shape != student_log_prob.shape:
+            raise ValueError(
+                "Sampled-token OPD tensors must align token-for-token; "
+                f"sample {i} has advantage={tuple(adv.shape)}, student={tuple(student_log_prob.shape)}, "
+                f"teacher={tuple(teacher_log_prob.shape)}."
+            )
 
-    # Store reverse KL for logging
-    rollout_data["opd_reverse_kl"] = reverse_kls
+        # a_t is the token actually sampled by the student rollout.  This is the
+        # Monte-Carlo reverse-KL advantage, not a full-vocabulary distillation
+        # loss: A_t <- A_t + coef * (log p_T(a_t|h_t) - log p_S(a_t|h_t)).
+        sampled_logratio = student_log_prob - teacher_log_prob
+        advantages[i] = adv - args.opd_kl_coef * sampled_logratio
+        sampled_logratios.append(sampled_logratio)
+
+    # This is one sampled-action log-ratio per response token, not a
+    # full-vocabulary KL divergence.
+    rollout_data["sampled_reverse_kl_logratio"] = sampled_logratios
 
 
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
@@ -1166,9 +1202,9 @@ def policy_loss_function(
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
 
     # Add OPD metrics if available
-    if batch.get("opd_reverse_kl"):
-        opd_reverse_kl = torch.cat(batch["opd_reverse_kl"], dim=0)
-        reported_loss["opd_reverse_kl"] = sum_of_sample_mean(opd_reverse_kl).clone().detach()
+    if batch.get("sampled_reverse_kl_logratio"):
+        sampled_logratio = torch.cat(batch["sampled_reverse_kl_logratio"], dim=0)
+        reported_loss["sampled_reverse_kl_logratio"] = sum_of_sample_mean(sampled_logratio).clone().detach()
 
     return loss, reported_loss
 

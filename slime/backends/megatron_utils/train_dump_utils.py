@@ -18,7 +18,7 @@ _CONTEXT_PARALLEL_FIELDS = (
     "returns",
     "kl",
     "entropy",
-    "opd_reverse_kl",
+    "sampled_reverse_kl_logratio",
 )
 
 

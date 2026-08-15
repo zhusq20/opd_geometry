@@ -20,6 +20,7 @@ from slime.utils.async_utils import run
 from slime.utils.data import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
 from slime.utils.http_utils import get, get_rollout_num_engines, post
+from slime.utils.metric_utils import rollout_prompt_count
 from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.processing_utils import (
     build_processor_kwargs,
@@ -397,8 +398,9 @@ async def generate_rollout_async(
 
     metric_gatherer = MetricGatherer()
 
-    # target_data_size is the total number of valid samples to get
-    target_data_size = args.rollout_batch_size
+    # Under --num-epoch, the final rollout consumes the exact dataset tail
+    # instead of wrapping to the beginning to manufacture a full batch.
+    target_data_size = rollout_prompt_count(args, rollout_id)
 
     data = []
     all_data = []
@@ -407,7 +409,11 @@ async def generate_rollout_async(
     while len(data) < target_data_size:
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
-            samples = data_source(args.over_sampling_batch_size)
+            request_size = min(
+                args.over_sampling_batch_size,
+                target_data_size - state.remaining_batch_size,
+            )
+            samples = data_source(request_size)
             state.submit_generate_tasks(samples)
 
         # wait for the generation to finish
@@ -450,7 +456,7 @@ async def generate_rollout_async(
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(args, rollout_id)
 
-    assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
+    assert len(data) == target_data_size, f"Got {len(data)} samples, expected {target_data_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
     all_samples = sorted(
         all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index
@@ -476,9 +482,11 @@ EVAL_PROMPT_DATASET = {}
 async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict[str, list[Any]]], list[list[Sample]]]:
     assert not args.group_rm, "Group RM is not supported for eval rollout"
 
+    max_concurrency = getattr(args, "eval_max_concurrency", None)
+    semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency is not None else None
     coros = []
     for dataset_cfg in getattr(args, "eval_datasets", []) or []:
-        coros.append(eval_rollout_single_dataset(args, rollout_id, dataset_cfg))
+        coros.append(eval_rollout_single_dataset(args, rollout_id, dataset_cfg, semaphore=semaphore))
     results_list = await asyncio.gather(*coros)
     results = {}
     for r in results_list:
@@ -487,7 +495,11 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
 
 
 async def eval_rollout_single_dataset(
-    args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig
+    args: Namespace,
+    rollout_id: int,
+    dataset_cfg: EvalDatasetConfig,
+    *,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> dict[str, dict[str, list[Any]]]:
     """An example to implement the eval_rollout function for an rule based rm rollout generation.
 
@@ -583,11 +595,11 @@ async def eval_rollout_single_dataset(
                 sampling_params["sampling_seed"] = args.rollout_seed + j
             tasks.append(
                 asyncio.create_task(
-                    generate_and_rm(
+                    _generate_eval_sample(
                         args,
                         sample,
                         sampling_params=sampling_params,
-                        evaluation=True,
+                        semaphore=semaphore,
                     )
                 )
             )
@@ -622,6 +634,20 @@ async def eval_rollout_single_dataset(
             "samples": data,
         }
     }
+
+
+async def _generate_eval_sample(
+    args: Namespace,
+    sample: Sample,
+    sampling_params: dict[str, Any],
+    semaphore: asyncio.Semaphore | None,
+) -> Sample | list[Sample]:
+    """Generate and score one eval sample under the shared eval-only limit."""
+
+    if semaphore is None:
+        return await generate_and_rm(args, sample, sampling_params=sampling_params, evaluation=True)
+    async with semaphore:
+        return await generate_and_rm(args, sample, sampling_params=sampling_params, evaluation=True)
 
 
 def generate_rollout(

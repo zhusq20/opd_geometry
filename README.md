@@ -98,6 +98,10 @@ For a comprehensive quick start guide covering environment setup, data preparati
 
 We also provide examples for some use cases not covered in the quick start guide; please check [examples](examples/).
 
+For optimizer-mechanism research, [`examples/optimizer_geometry`](examples/optimizer_geometry/README.md)
+provides an AdamW/SGD/Muon × GRPO/PPO/OPD matrix, deterministic multi-task curricula,
+five-domain M2RL rewards, distributed parameter-geometry observations, and forgetting metrics.
+
 ### Agentic RL examples
 
 For agentic RL workloads, the following examples plug into the standard rollout / Data Buffer loop through customization interfaces — they are not separate frameworks:

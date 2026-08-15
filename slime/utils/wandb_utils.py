@@ -1,6 +1,8 @@
 import logging
 import os
+import re
 from copy import deepcopy
+from pathlib import Path
 
 import wandb
 
@@ -40,17 +42,24 @@ def init_wandb_primary(args):
     if (not offline) and args.wandb_key is not None:
         wandb.login(key=args.wandb_key, host=args.wandb_host)
 
-    # Prepare wandb init parameters
-    # add random 6 length string with characters
+    run_id = _resolve_wandb_run_id(args)
+
+    # Prepare wandb init parameters. Keep the historical group-derived run
+    # name unless a launcher supplies an explicit experiment name.
+    base_group = args.wandb_group or "default"
+    base_run_name = getattr(args, "wandb_run_name", None) or base_group
     if args.wandb_random_suffix:
-        group = args.wandb_group + "_" + wandb.util.generate_id()
-        run_name = f"{group}-RANK_{args.rank}"
+        suffix = wandb.util.generate_id()
+        group = f"{base_group}_{suffix}"
+        run_name = f"{base_run_name}_{suffix}-RANK_{args.rank}"
     else:
-        group = args.wandb_group
-        run_name = args.wandb_group
+        group = base_group
+        run_name = base_run_name
 
     # Prepare wandb init parameters
     init_kwargs = {
+        "id": run_id,
+        "resume": "allow",
         "entity": args.wandb_team,
         "project": args.wandb_project,
         "group": group,
@@ -77,6 +86,62 @@ def init_wandb_primary(args):
 
     # Set wandb_run_id in args for easy access throughout the training process
     args.wandb_run_id = wandb.run.id
+    _log_provenance_artifact(args)
+
+
+def _resolve_wandb_run_id(args) -> str:
+    """Resolve and durably persist the run id before any distributed worker joins."""
+
+    run_id = getattr(args, "wandb_run_id", None)
+    id_file_value = getattr(args, "wandb_run_id_file", None)
+    id_file = None
+    if id_file_value:
+        id_file = Path(os.path.expandvars(os.path.expanduser(id_file_value)))
+        if run_id is None and id_file.exists():
+            run_id = id_file.read_text(encoding="utf-8").strip()
+    if run_id is None:
+        run_id = wandb.util.generate_id()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", str(run_id)):
+        raise ValueError(f"Invalid W&B run id {run_id!r}.")
+    if id_file is not None:
+        id_file.parent.mkdir(parents=True, exist_ok=True)
+        if id_file.exists():
+            persisted = id_file.read_text(encoding="utf-8").strip()
+            if persisted and persisted != run_id:
+                raise ValueError(f"W&B id file {id_file} contains {persisted!r}, but {run_id!r} was requested.")
+        else:
+            temporary = id_file.with_name(f".{id_file.name}.{os.getpid()}.tmp")
+            with temporary.open("w", encoding="utf-8") as stream:
+                stream.write(f"{run_id}\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, id_file)
+    return str(run_id)
+
+
+def _log_provenance_artifact(args) -> None:
+    manifest_value = getattr(args, "run_manifest_path", None)
+    if not manifest_value or wandb.run is None:
+        return
+    manifest = Path(os.path.expandvars(os.path.expanduser(manifest_value)))
+    if not manifest.is_file():
+        logger.warning("Run manifest does not exist; skipping W&B provenance artifact: %s", manifest)
+        return
+    artifact = wandb.Artifact(
+        name=f"{wandb.run.id}-provenance",
+        type="run-provenance",
+        description="Exact command, configuration hashes, environment and source snapshot for this run.",
+    )
+    artifact.add_file(str(manifest), name="run_manifest.json")
+    for snapshot in sorted(manifest.parent.glob("source_snapshot*.tar.gz")):
+        artifact.add_file(str(snapshot), name=snapshot.name)
+    for marker in sorted(manifest.parent.glob("run_*_before_resume_*.json")):
+        artifact.add_file(str(marker), name=f"resume_history/{marker.name}")
+    inputs = manifest.parent / "inputs"
+    if inputs.is_dir():
+        for path in sorted(item for item in inputs.rglob("*") if item.is_file()):
+            artifact.add_file(str(path), name=f"inputs/{path.relative_to(inputs)}")
+    wandb.log_artifact(artifact)
 
 
 def _compute_config_for_logging(args):
@@ -96,7 +161,11 @@ def _compute_config_for_logging(args):
 
 
 def _args_to_config_dict(args):
-    return deepcopy(args.__dict__)
+    output = deepcopy(args.__dict__)
+    # Credentials must never become W&B run configuration. The preferred
+    # authentication path is WANDB_API_KEY, which is not part of argparse.
+    output.pop("wandb_key", None)
+    return output
 
 
 def _prefix_config_keys(config, prefix):
@@ -174,3 +243,7 @@ def _init_wandb_common():
     wandb.define_metric("eval/step")
     wandb.define_metric("eval/*", step_metric="eval/step")
     wandb.define_metric("perf/*", step_metric="rollout/step")
+    wandb.define_metric("geometry/step")
+    wandb.define_metric("geometry/*", step_metric="geometry/step")
+    wandb.define_metric("forgetting/step")
+    wandb.define_metric("forgetting/*", step_metric="forgetting/step")

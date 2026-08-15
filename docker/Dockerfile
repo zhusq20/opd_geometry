@@ -103,6 +103,7 @@ RUN pip install "nvidia-modelopt[torch]>=0.37.0" --no-build-isolation
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --ignore-installed PyJWT && \
     pip install -r /tmp/requirements.txt
+RUN python -m nltk.downloader -q punkt punkt_tab
 
 # Megatron currently requires NumPy 1.x, while SciPy 1.18+ requires NumPy 2.x.
 # Pin both packages together so downgrading NumPy does not leave an incompatible SciPy.

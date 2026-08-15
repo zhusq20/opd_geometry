@@ -2,6 +2,7 @@
 
 import tempfile
 from argparse import Namespace
+from pathlib import Path
 
 import pytest
 import yaml
@@ -88,6 +89,69 @@ class TestMegatronRoleConfig:
         assert critic_args.lr == args.lr
         assert critic_args.kl_coef == 0
         assert critic_args.use_opd is False
+
+    def test_role_config_expands_environment_variables(self, monkeypatch):
+        from slime.utils.arguments import parse_megatron_role_args
+
+        monkeypatch.setenv("SLIME_TEST_CRITIC_LOAD", "/checkpoints/value")
+        path = _write_yaml(
+            {
+                "megatron": [
+                    {
+                        "name": "default",
+                        "role": "critic",
+                        "overrides": {"load": "${SLIME_TEST_CRITIC_LOAD}"},
+                    }
+                ]
+            }
+        )
+
+        critic_args = parse_megatron_role_args(_base_args(), path, role="critic")
+
+        assert critic_args.load == "/checkpoints/value"
+
+    def test_optimizer_geometry_ppo_critic_uses_batch_profile_values(self, monkeypatch):
+        from slime.utils.arguments import parse_megatron_role_args
+
+        critic_values = {
+            "OPTIMIZER_GEOMETRY_CRITIC_LOAD": "/checkpoints/actor",
+            "OPTIMIZER_GEOMETRY_CRITIC_SAVE": "/checkpoints/critic",
+            "OPTIMIZER_GEOMETRY_CRITIC_LR": "2.5e-6",
+            "OPTIMIZER_GEOMETRY_CRITIC_WEIGHT_DECAY": "0.025",
+            "OPTIMIZER_GEOMETRY_CRITIC_BETA2": "0.9987381276",
+        }
+        for name, value in critic_values.items():
+            monkeypatch.setenv(name, value)
+        config = Path(__file__).parents[2] / "examples/optimizer_geometry/configs/ppo_roles.yaml"
+
+        critic_args = parse_megatron_role_args(_base_args(), str(config), role="critic")
+
+        assert critic_args.optimizer == "adam"
+        assert critic_args.load == "/checkpoints/actor"
+        assert critic_args.save == "/checkpoints/critic"
+        assert critic_args.lr == pytest.approx(2.5e-6)
+        assert critic_args.weight_decay == pytest.approx(0.025)
+        assert critic_args.adam_beta1 == pytest.approx(0.9)
+        assert critic_args.adam_beta2 == pytest.approx(0.9987381276)
+
+    def test_role_config_rejects_unresolved_environment_variables(self, monkeypatch):
+        from slime.utils.arguments import parse_megatron_role_args
+
+        monkeypatch.delenv("SLIME_TEST_MISSING_LOAD", raising=False)
+        path = _write_yaml(
+            {
+                "megatron": [
+                    {
+                        "name": "default",
+                        "role": "critic",
+                        "overrides": {"load": "${SLIME_TEST_MISSING_LOAD}"},
+                    }
+                ]
+            }
+        )
+
+        with pytest.raises(ValueError, match="SLIME_TEST_MISSING_LOAD"):
+            parse_megatron_role_args(_base_args(), path, role="critic")
 
     @pytest.mark.parametrize(
         "config",

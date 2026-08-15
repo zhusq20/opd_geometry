@@ -1,11 +1,8 @@
 """CPU unit tests for ``slime.rollout.rm_hub.deepscaler``.
 
-Pins the wrapper that decides which segment of the response counts as
-the "solution" and reduces grading to ``math_utils``. The branching is
-small (3 cases) but silent-failure prone: if the ``</think>`` /
-``###Response`` markers stop matching the format the rollout actually
-produces, the function returns 0 *for every sample* and no other CI
-signal would catch it.
+Pins the wrapper that decides which segment of thinking, alternate, and
+non-thinking responses counts as the solution before grading with
+``math_utils``.
 """
 
 from __future__ import annotations
@@ -13,7 +10,6 @@ from __future__ import annotations
 import pytest
 
 from slime.rollout.rm_hub.deepscaler import get_deepscaler_rule_based_reward
-
 
 NUM_GPUS = 0
 
@@ -36,11 +32,16 @@ def test_response_split_on_response_marker_grades_tail():
 
 
 @pytest.mark.unit
-def test_response_without_any_marker_returns_zero():
-    """No ``</think>`` AND no ``###Response`` → fall through to 0
-    immediately (deepscaler.py:9-10). This is the silent-failure pole —
-    if upstream chat templates drop both markers, all rewards become 0."""
-    assert get_deepscaler_rule_based_reward(r"\boxed{42}", "42") == 0
+def test_non_thinking_response_grades_entire_completion():
+    """Qwen non-thinking templates prefill ``<think></think>`` in the
+    prompt, leaving no reasoning marker in the generated response. The
+    completion itself must still be graded."""
+    assert get_deepscaler_rule_based_reward(r"Final: \boxed{42}", "42") == 1
+
+
+@pytest.mark.unit
+def test_non_thinking_response_with_wrong_answer_returns_zero():
+    assert get_deepscaler_rule_based_reward(r"Final: \boxed{43}", "42") == 0
 
 
 @pytest.mark.unit

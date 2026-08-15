@@ -7,7 +7,11 @@ def get_deepscaler_rule_based_reward(response, label):
     elif "###Response" in response:
         model_solution = response.split("###Response")[1]
     else:
-        return 0
+        # Non-thinking chat templates may prefill an empty <think></think>
+        # block in the prompt, so the generated response contains only the
+        # solution. Grade that completion directly instead of silently
+        # assigning zero reward to every sample.
+        model_solution = response
 
     model_answer = extract_answer(model_solution)
     if model_answer is None:

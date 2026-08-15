@@ -671,6 +671,50 @@ jobs:
             },
             {
               "num_gpus": 0,
+              "test_file": "test_rollout_geometry.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_rollout_reward_metrics.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_m2rl_opd.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_geometry_observer.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_optimizer_factory.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_megatron_step_hooks.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_forgetting_logger.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_geometry_analysis.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_run_artifacts.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_paper_statistics.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_optimizer_geometry_launcher.py"
+            },
+            {
+              "num_gpus": 0,
               "test_file": "test_filter_long_prompt.py"
             },
             {
@@ -780,7 +824,7 @@ jobs:
         shell: bash
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install pytest numpy packaging pyyaml omegaconf tqdm httpx requests ray pybase64 pylatexenc sympy aiohttp pillow safetensors psutil
+          pip install pytest numpy matplotlib packaging pyyaml omegaconf tqdm httpx requests ray pybase64 pylatexenc sympy aiohttp pillow safetensors psutil
 
           pip install transformers
 
@@ -870,7 +914,7 @@ jobs:
         shell: bash
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install pytest numpy packaging pyyaml omegaconf tqdm httpx requests ray pybase64 pylatexenc sympy aiohttp pillow safetensors psutil
+          pip install pytest numpy matplotlib packaging pyyaml omegaconf tqdm httpx requests ray pybase64 pylatexenc sympy aiohttp pillow safetensors psutil
 
 
       - name: Install

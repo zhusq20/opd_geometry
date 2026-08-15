@@ -1,13 +1,18 @@
+absl-py
 accelerate
 anthropic
 blake3
 blobfile
 datasets
 e2b
+emerging_optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.1.0
 httpx[http2]
+immutabledict
+langdetect
 mcp[cli]
 memray  # needed for debugging (but is lightweight), we can put it to dev mode when using pyproject.toml
 numba
+nltk>=3.9.3
 omegaconf
 openai
 openai-agents

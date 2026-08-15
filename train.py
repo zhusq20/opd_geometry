@@ -2,7 +2,8 @@ import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
-from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
+from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking, mark_run_complete
+from slime.utils.metric_utils import num_updates_before_rollout, updates_per_rollout
 from slime.utils.misc import should_run_periodic_action
 
 
@@ -32,9 +33,20 @@ def train(args):
     if args.offload_rollout:
         ray.get(rollout_manager.onload_kv.remote())
 
+    last_eval_num_updates = None
+
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:
-        ray.get(rollout_manager.eval.remote(rollout_id=0))
+        num_updates = num_updates_before_rollout(args, args.start_rollout_id)
+        ray.get(
+            rollout_manager.eval.remote(
+                rollout_id=args.start_rollout_id,
+                num_updates=num_updates,
+                model_version=num_updates,
+                eval_phase="eval_only",
+            )
+        )
+        last_eval_num_updates = num_updates
 
     def offload_train(actor_trains_this_step):
         # Each model auto-offloads after train() when offload_train is set,
@@ -48,7 +60,15 @@ def train(args):
     # train loop.
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
-            ray.get(rollout_manager.eval.remote(rollout_id))
+            ray.get(
+                rollout_manager.eval.remote(
+                    rollout_id,
+                    num_updates=0,
+                    model_version=0,
+                    eval_phase="pre_train",
+                )
+            )
+            last_eval_num_updates = 0
 
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
 
@@ -67,6 +87,8 @@ def train(args):
                 ray.get(value_refs)
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+
+        num_updates_after = num_updates_before_rollout(args, rollout_id) + updates_per_rollout(args)
 
         if release_train or should_run_periodic_action(
             rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
@@ -88,9 +110,36 @@ def train(args):
             ray.get(rollout_manager.onload_kv.remote())
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
-            ray.get(rollout_manager.eval.remote(rollout_id))
+            ray.get(
+                rollout_manager.eval.remote(
+                    rollout_id,
+                    num_updates=num_updates_after,
+                    model_version=num_updates_after,
+                    eval_phase="post_update",
+                )
+            )
+            last_eval_num_updates = num_updates_after
+
+    final_num_updates = (
+        last_eval_num_updates
+        if args.num_rollout == 0 and last_eval_num_updates is not None
+        else num_updates_before_rollout(args, args.num_rollout)
+    )
+    # A run whose length is not divisible by eval_interval still needs a final
+    # paper-facing measurement of the final checkpoint.
+    if args.eval_interval is not None and last_eval_num_updates != final_num_updates:
+        final_rollout_id = max(args.start_rollout_id, args.num_rollout - 1)
+        ray.get(
+            rollout_manager.eval.remote(
+                final_rollout_id,
+                num_updates=final_num_updates,
+                model_version=final_num_updates,
+                eval_phase="final",
+            )
+        )
 
     ray.get(rollout_manager.dispose.remote())
+    mark_run_complete(args, final_num_updates=final_num_updates)
     finish_tracking(args)
 
 

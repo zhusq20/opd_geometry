@@ -3,6 +3,7 @@ import copy
 import json
 import logging
 import os
+import re
 from typing import Any
 
 import yaml
@@ -618,8 +619,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Number of epochs for the training. "
                     "This is used to calculate the number of rollout steps from the dataset size. "
-                    "If set, we will calculate the number of rollout steps as `num_rollout = num_epoch * dataset_size // rollout_batch_size`."
+                    "By default, only complete rollout batches are used. "
                     "If both `--num-epoch` and `--num-rollout` are set, `--num-epoch` will be ignored."
+                ),
+            )
+            parser.add_argument(
+                "--include-epoch-tail",
+                action="store_true",
+                default=False,
+                help=(
+                    "With --num-epoch, include the exact final partial rollout batch instead of dropping it. "
+                    "The built-in SGLang rollout path supports this mode."
                 ),
             )
 
@@ -834,6 +844,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--eval-max-prompt-len", type=int, default=None)
             parser.add_argument("--eval-min-new-tokens", type=int, default=None)
             parser.add_argument("--eval-max-context-len", type=int, default=None)
+            parser.add_argument(
+                "--eval-max-concurrency",
+                type=int,
+                default=None,
+                help=(
+                    "Maximum number of evaluation samples generated concurrently across all eval datasets. "
+                    "This client-side limit is independent of --sglang-max-running-requests."
+                ),
+            )
 
             return parser
 
@@ -1178,6 +1197,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--wandb-host", type=str, default=None)
             parser.add_argument("--wandb-team", type=str, default=None)
             parser.add_argument("--wandb-group", type=str, default=None)
+            parser.add_argument(
+                "--wandb-run-name",
+                type=str,
+                default=None,
+                help="Optional W&B run name. Defaults to --wandb-group for backward compatibility.",
+            )
             reset_arg(parser, "--wandb-project", type=str, default=None)
             parser.add_argument(
                 "--disable-wandb-random-suffix",
@@ -1227,6 +1252,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Whether to turn on passrate logging, which will log the pass@n of the responses in the rollout.",
             )
             parser.add_argument("--wandb-run-id", type=str, default=None)
+            parser.add_argument(
+                "--wandb-run-id-file",
+                type=str,
+                default=None,
+                help=(
+                    "Persist the W&B run id here and reuse it with resume=allow. "
+                    "This makes launcher-level checkpoint resumes continue the same run."
+                ),
+            )
             return parser
 
         # tensorboard
@@ -1470,6 +1504,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
             )
             parser.add_argument(
+                "--custom-megatron-after-backward-hook-path",
+                type=str,
+                default=None,
+                help="Hook called after backward and before optimizer.step().",
+            )
+            parser.add_argument(
+                "--custom-megatron-after-train-step-hook-path",
+                type=str,
+                default=None,
+                help="Hook called after optimizer.step() and before gradients are cleared.",
+            )
+            parser.add_argument(
                 "--megatron-deepgemm-forward-layers",
                 nargs="+",
                 type=int,
@@ -1501,6 +1547,201 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="Optional TEGroupedMLP module-name suffixes; defaults to mlp.experts.",
             )
+            return parser
+
+        def add_geometry_arguments(parser):
+            group = parser.add_argument_group("parameter geometry")
+            group.add_argument(
+                "--geometry-output-dir",
+                type=str,
+                default=None,
+                help="Enable parameter-geometry observations and write them under this directory.",
+            )
+            group.add_argument(
+                "--geometry-interval",
+                type=int,
+                default=1,
+                help=(
+                    "Run low-frequency CountSketch/vector observations every N optimizer steps. "
+                    "Required exact scalar geometry is still recorded for every attempted update."
+                ),
+            )
+            group.add_argument(
+                "--geometry-projection-dim",
+                type=int,
+                default=256,
+                help="CountSketch dimension used for update/displacement/cosine measurements.",
+            )
+            group.add_argument("--geometry-seed", type=int, default=1234)
+            group.add_argument(
+                "--geometry-parameter-include",
+                type=str,
+                default=".*",
+                help="Regular expression selecting named trainable parameters.",
+            )
+            group.add_argument(
+                "--geometry-parameter-exclude",
+                type=str,
+                default=None,
+                help="Optional regular expression excluding named parameters.",
+            )
+            group.add_argument(
+                "--geometry-group-by",
+                choices=["global", "layer", "module"],
+                default="layer",
+                help="Granularity of stored geometry metrics.",
+            )
+            group.add_argument(
+                "--geometry-roles",
+                nargs="+",
+                choices=["actor", "critic"],
+                default=["actor"],
+                help="Model roles to observe. PPO critics are excluded by default.",
+            )
+            group.add_argument(
+                "--geometry-sketch-chunk-size",
+                type=int,
+                default=1_048_576,
+                help="Maximum parameter elements hashed in one projection chunk.",
+            )
+            group.add_argument(
+                "--geometry-support-sample-size",
+                type=int,
+                default=1024,
+                help=(
+                    "Deterministic coordinates retained per optimizer-owned parameter range for "
+                    "low-frequency support Jaccard/window estimates."
+                ),
+            )
+            group.add_argument(
+                "--geometry-support-window",
+                type=int,
+                default=8,
+                help="Number of successful updates in the sampled-coordinate support window.",
+            )
+            group.add_argument(
+                "--geometry-matrix-sample-count",
+                type=int,
+                default=1,
+                help=(
+                    "Fixed full optimizer-owned matrices sampled per real optimizer branch and rank for low-frequency "
+                    "spectral/orthogonality diagnostics."
+                ),
+            )
+            group.add_argument(
+                "--geometry-matrix-randomized-rank",
+                type=int,
+                default=16,
+                help="Deterministic randomized-SVD rank for sampled matrices larger than 256.",
+            )
+            group.add_argument(
+                "--no-geometry-save-vectors",
+                action="store_false",
+                dest="geometry_save_vectors",
+                default=True,
+                help="Store scalar JSONL only; omit projected-vector .pt files.",
+            )
+            group.add_argument(
+                "--geometry-wandb-groups",
+                type=str,
+                default=(
+                    "global,optimizer_branch/adam,optimizer_branch/sgd,"
+                    "optimizer_branch/muon_matrix,optimizer_branch/adam_fallback"
+                ),
+                help=(
+                    "Comma-separated geometry groups mirrored to W&B when --use-wandb is enabled. "
+                    "Optimizer branches come from actual optimizer membership, never tensor shape. "
+                    "Use `all` for every stored group or an empty value to disable geometry W&B metrics."
+                ),
+            )
+            return parser
+
+        def add_m2rl_experiment_arguments(parser):
+            group = parser.add_argument_group("M2RL multi-task experiments")
+            group.add_argument(
+                "--m2rl-reward-config",
+                type=str,
+                default=None,
+                help="JSON/YAML config for code sandboxes and optional remote reward routes.",
+            )
+            group.add_argument(
+                "--m2rl-task-sampling-seed",
+                type=int,
+                default=None,
+                help="Override the task-mixture seed in the manifest (the launcher ties this to --seed).",
+            )
+            group.add_argument(
+                "--opd-teacher-router-config",
+                type=str,
+                default=None,
+                help="JSON/YAML mapping from task/rm_type to an SGLang teacher URL.",
+            )
+            group.add_argument(
+                "--opd-task-reward-weight",
+                type=float,
+                default=0.0,
+                help="Optional task-reward coefficient in multi-teacher OPD (0 gives pure distillation).",
+            )
+            group.add_argument(
+                "--hybrid-sft-loss-coef",
+                type=float,
+                default=1.0,
+                help="Coefficient of supervised NLL in the sft_opd mixed loss.",
+            )
+            group.add_argument(
+                "--hybrid-opd-loss-coef",
+                type=float,
+                default=1.0,
+                help="Coefficient of the OPD policy term in the sft_opd mixed loss.",
+            )
+            group.add_argument(
+                "--code-sandbox-url",
+                type=str,
+                default=None,
+                help="Fallback sandbox endpoint for the M2RL unit_test reward.",
+            )
+            group.add_argument(
+                "--workplace-assistant-resources-server-url",
+                type=str,
+                default=None,
+                help="WorkBench resource/environment server used by the multi-turn agent rollout.",
+            )
+            group.add_argument(
+                "--forgetting-output-dir",
+                type=str,
+                default=None,
+                help="Directory for per-task eval curves and max-so-far forgetting metrics.",
+            )
+            group.add_argument(
+                "--metrics-output-dir",
+                type=str,
+                default=None,
+                help="Directory for durable local JSONL copies of every scalar log call.",
+            )
+            group.add_argument(
+                "--eval-artifact-dir",
+                type=str,
+                default=None,
+                help="Directory for per-sample evaluation JSONL artifacts and summaries.",
+            )
+            group.add_argument(
+                "--run-manifest-path",
+                type=str,
+                default=None,
+                help="Reproducibility manifest optionally uploaded as a W&B artifact.",
+            )
+            group.add_argument(
+                "--completion-marker-path",
+                type=str,
+                default=None,
+                help="Atomic marker written only after the complete train loop and final evaluation succeed.",
+            )
+            group.add_argument("--experiment-task", type=str, default=None)
+            group.add_argument("--experiment-teacher", type=str, default=None)
+            group.add_argument("--experiment-condition", type=str, default=None)
+            group.add_argument("--experiment-name", type=str, default=None)
+            group.add_argument("--experiment-optimizer", type=str, default=None)
+            group.add_argument("--experiment-data-index", type=str, default=None)
             return parser
 
         def add_mtp_training_arguments(parser):
@@ -1567,6 +1808,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_mtp_training_arguments(parser)
         parser = add_ci_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
+        parser = add_geometry_arguments(parser)
+        parser = add_m2rl_experiment_arguments(parser)
         reset_arg(
             parser,
             "--custom-config-path",
@@ -1666,6 +1909,15 @@ def _apply_megatron_role_overrides(base_args, overrides, role):
                     pass
         setattr(role_args, key, value)
 
+    if hasattr(role_args, "_slime_non_muon_overlap_flags"):
+        for flag in (
+            "overlap_grad_reduce",
+            "overlap_param_gather",
+            "overlap_param_gather_with_optimizer_step",
+        ):
+            if flag in overrides:
+                role_args._slime_non_muon_overlap_flags[flag] = bool(overrides[flag])
+
     if role == "critic":
         # Critic-specific: disable features that only apply to actors.
         role_args.kl_coef = 0
@@ -1687,7 +1939,13 @@ def parse_megatron_role_args(base_args, megatron_config_path, role):
     assert role in {"actor", "critic"}, f"Unsupported Megatron config role: {role}"
 
     with open(megatron_config_path) as f:
-        raw_config = yaml.safe_load(f) or {}
+        # Role checkpoint paths often depend on the run directory. Environment
+        # expansion keeps one checked-in PPO config usable across all runs.
+        expanded_config = os.path.expandvars(f.read())
+        unresolved = sorted(set(re.findall(r"\$\{([^}]+)\}", expanded_config)))
+        if unresolved:
+            raise ValueError(f"Unresolved environment variables in {megatron_config_path}: {', '.join(unresolved)}")
+        raw_config = yaml.safe_load(expanded_config) or {}
 
     assert "megatron" in raw_config, (
         "megatron config must contain a top-level 'megatron' list, e.g. "
@@ -1834,6 +2092,9 @@ def slime_validate_args(args):
 
     if args.eval_interval is not None:
         assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."
+
+    if args.eval_max_concurrency is not None and args.eval_max_concurrency <= 0:
+        raise ValueError("--eval-max-concurrency must be a positive integer when set.")
 
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."
@@ -1996,6 +2257,11 @@ def slime_validate_args(args):
             "num_epoch is not set, but num_rollout is not set, " "please set --num-rollout or --num-epoch"
         )
 
+    if getattr(args, "include_epoch_tail", False):
+        assert (
+            args.num_epoch is not None and args.num_rollout is None
+        ), "--include-epoch-tail requires --num-epoch and cannot be combined with --num-rollout"
+
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
 
@@ -2009,6 +2275,52 @@ def slime_validate_args(args):
             if hasattr(args, k):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
+        # A custom config is applied after the first Megatron default pass. If
+        # it changes the optimizer, restore the corresponding runtime flags
+        # before the final Megatron validation.
+        if "optimizer" in data:
+            from slime.backends.megatron_utils.optimizer_factory import configure_optimizer_runtime
+
+            configure_optimizer_runtime(args)
+
+    if getattr(args, "geometry_output_dir", None) is not None:
+        if getattr(args, "overlap_param_gather", False) or getattr(
+            args, "overlap_param_gather_with_optimizer_step", False
+        ):
+            raise ValueError(
+                "Parameter geometry requires synchronous post-step parameters; disable "
+                "--overlap-param-gather and --overlap-param-gather-with-optimizer-step."
+            )
+        if args.geometry_interval <= 0:
+            raise ValueError("--geometry-interval must be positive.")
+        if args.geometry_projection_dim <= 0:
+            raise ValueError("--geometry-projection-dim must be positive.")
+        if args.geometry_sketch_chunk_size <= 0:
+            raise ValueError("--geometry-sketch-chunk-size must be positive.")
+        if args.geometry_support_sample_size <= 0:
+            raise ValueError("--geometry-support-sample-size must be positive.")
+        if args.geometry_support_window <= 0:
+            raise ValueError("--geometry-support-window must be positive.")
+        if args.geometry_matrix_sample_count <= 0:
+            raise ValueError("--geometry-matrix-sample-count must be positive.")
+        if args.geometry_matrix_randomized_rank <= 0:
+            raise ValueError("--geometry-matrix-randomized-rank must be positive.")
+        try:
+            re.compile(args.geometry_parameter_include)
+            if args.geometry_parameter_exclude:
+                re.compile(args.geometry_parameter_exclude)
+        except re.error as exc:
+            raise ValueError(f"Invalid geometry parameter regular expression: {exc}") from exc
+
+    if getattr(args, "custom_loss_function_path", None) == "slime_plugins.m2rl.hybrid.hybrid_loss_function":
+        if not args.use_opd or args.opd_type != "sglang":
+            raise ValueError("The sft_opd hybrid loss requires external SGLang OPD.")
+        if args.hybrid_sft_loss_coef < 0 or args.hybrid_opd_loss_coef < 0:
+            raise ValueError("Hybrid SFT/OPD loss coefficients must be non-negative.")
+        if args.hybrid_sft_loss_coef == 0 and args.hybrid_opd_loss_coef == 0:
+            raise ValueError("At least one hybrid SFT/OPD loss coefficient must be positive.")
+        if args.rollout_top_p != 1.0:
+            raise ValueError("sft_opd currently requires --rollout-top-p 1.0.")
 
     if args.eval_max_context_len is None:
         logger.info(

@@ -52,6 +52,9 @@ megatron:
 
 > **注意：** `overrides` 中的 key 使用 argparse 属性名，而不是命令行 flag 名。例如写 `tensor_model_parallel_size`，而不是 `tensor-model-parallel-size`。
 
+字符串值可以引用 `${CRITIC_CHECKPOINT_DIR}` 这类环境变量。系统会在解析
+YAML 前展开；若变量未定义，会直接报错，而不会把它当成字面路径使用。
+
 ---
 
 ## 使用方式

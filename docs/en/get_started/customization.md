@@ -28,6 +28,8 @@ Below is a summary of all available customization interfaces and their purposes.
 | [`--custom-megatron-init-path`](#17-megatron-hooks) | Custom initialization after Megatron setup. |
 | [`--custom-megatron-before-log-prob-hook-path`](#17-megatron-hooks) | Custom logic before log probability computation. |
 | [`--custom-megatron-before-train-step-hook-path`](#17-megatron-hooks) | Custom logic before each training step. |
+| [`--custom-megatron-after-backward-hook-path`](#17-megatron-hooks) | Inspect reduced gradients before the optimizer step. |
+| [`--custom-megatron-after-train-step-hook-path`](#17-megatron-hooks) | Inspect the actual parameter update before gradients are cleared. |
 
 ## Agentic workflows through customization interfaces
 
@@ -443,6 +445,39 @@ def custom_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler
 ```
 
 **Purpose**: Custom logic before each training step.
+
+#### After Backward Hook (`--custom-megatron-after-backward-hook-path`)
+
+**Signature**:
+```python
+def custom_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler) -> None
+```
+
+**Purpose**: Called after the complete forward/backward schedule and before
+`optimizer.step()`. Gradients have been finalized by Megatron's backward path
+but have not been clipped or consumed by the optimizer.
+
+#### After Train Step Hook (`--custom-megatron-after-train-step-hook-path`)
+
+**Signature**:
+```python
+def custom_hook(
+    args,
+    rollout_id,
+    step_id,
+    model,
+    optimizer,
+    opt_param_scheduler,
+    *,
+    update_successful,
+    grad_norm,
+    num_zeros_in_grad,
+) -> None
+```
+
+**Purpose**: Called immediately after the optimizer/scheduler step and before
+model/optimizer gradients are cleared. This boundary can compare pre-step and
+post-step parameters and distinguish skipped mixed-precision updates.
 
 ---
 

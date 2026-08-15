@@ -28,6 +28,8 @@ slime 通过函数路径参数提供了广泛的自定义能力。这些参数�
 | [`--custom-megatron-init-path`](#17-megatron-hook) | Megatron 设置后的自定义初始化。 |
 | [`--custom-megatron-before-log-prob-hook-path`](#17-megatron-hook) | log probability 计算前的自定义逻辑。 |
 | [`--custom-megatron-before-train-step-hook-path`](#17-megatron-hook) | 每个训练步骤前的自定义逻辑。 |
+| [`--custom-megatron-after-backward-hook-path`](#17-megatron-hook) | optimizer step 前观测完整梯度。 |
+| [`--custom-megatron-after-train-step-hook-path`](#17-megatron-hook) | 清空梯度前观测真实参数更新。 |
 
 ## 通过 customization 接口实现 agentic workflow
 
@@ -445,6 +447,37 @@ def custom_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler
 ```
 
 **用途**: 每个训练步骤前的自定义逻辑。
+
+#### 反向传播后 Hook (`--custom-megatron-after-backward-hook-path`)
+
+**函数签名**:
+```python
+def custom_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler) -> None
+```
+
+**用途**: 在完整 forward/backward schedule 结束后、`optimizer.step()`
+之前调用。适合观测尚未被 optimizer 消耗的梯度。
+
+#### Optimizer Step 后 Hook (`--custom-megatron-after-train-step-hook-path`)
+
+**函数签名**:
+```python
+def custom_hook(
+    args,
+    rollout_id,
+    step_id,
+    model,
+    optimizer,
+    opt_param_scheduler,
+    *,
+    update_successful,
+    grad_norm,
+    num_zeros_in_grad,
+) -> None
+```
+
+**用途**: 在 optimizer/scheduler 更新之后、模型和 optimizer 梯度清空之前调用，
+可比较 step 前后参数，并识别混合精度下被跳过的更新。
 
 ---
 

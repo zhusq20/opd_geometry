@@ -1,0 +1,147 @@
+services:
+  sandboxfusion:
+    # Required: immutable local image ID (sha256:...) or pushed repository
+    # digest (...@sha256:...) emitted by build_sandboxfusion_cgroup2.sh.
+    image: ${SANDBOXFUSION_IMAGE:?Build and pin the cgroup-v2 SandboxFusion image first}
+    container_name: ${SANDBOXFUSION_CONTAINER_NAME:-iclr2027-sandboxfusion}
+    init: true
+    read_only: true
+    mem_limit: 4g
+    pids_limit: 2048
+    privileged: false
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_OVERRIDE
+      - FOWNER
+      - KILL
+      - MKNOD
+      - NET_ADMIN
+      - SETGID
+      - SETPCAP
+      - SETUID
+      - SYS_ADMIN
+      - SYS_CHROOT
+    security_opt:
+      - apparmor=unconfined
+      - no-new-privileges=true
+      - seccomp=builtin
+    cgroup: host
+    environment:
+      SANDBOX_CONFIG: ci
+      # Use the existing host-cgroup path as the in-container mountpoint. This
+      # path already exists in the host cgroup namespace, which lets runc mount
+      # it while the container root filesystem remains read-only.
+      SANDBOX_CGROUP2_ROOT: ${SANDBOXFUSION_CGROUP_PATH:?start_sandboxfusion.sh prepares the delegated cgroup path}
+      SANDBOX_CGROUP2_EXEC: /usr/local/libexec/sandboxfusion-cgroup2-exec
+      SANDBOX_MAX_MEMORY_MB: "4096"
+      SANDBOX_PIDS_LIMIT: "512"
+      SANDBOX_RUN_UID: "1000"
+      SANDBOX_MAX_UPLOAD_BYTES: "67108864"
+      SANDBOX_MAX_FETCH_BYTES: "67108864"
+    volumes:
+      - type: bind
+        source: ${SANDBOXFUSION_CGROUP_PATH:?start_sandboxfusion.sh prepares the delegated cgroup path}
+        target: ${SANDBOXFUSION_CGROUP_PATH:?start_sandboxfusion.sh prepares the delegated cgroup path}
+        bind:
+          propagation: rprivate
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,exec,mode=1777,size=2147483648
+      - /run:rw,nosuid,nodev,noexec,mode=755,size=67108864
+      - /var/tmp:rw,nosuid,nodev,exec,mode=1777,size=536870912
+    expose:
+      - "8080"
+    networks:
+      - sandbox_internal
+    command:
+      - uvicorn
+      - sandbox.server.server:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --workers
+      - "8"
+    # A crashed/rebooted service must be re-attested by the start script.
+    restart: "no"
+
+  loopback_proxy:
+    # Docker 28 discards published ports on an internal network. Keep the code
+    # execution service internal-only and publish through this fixed-purpose,
+    # capability-free TCP relay instead of giving the service an egress route.
+    image: ${SANDBOXFUSION_IMAGE:?Build and pin the cgroup-v2 SandboxFusion image first}
+    container_name: ${SANDBOXFUSION_PROXY_CONTAINER_NAME:-iclr2027-sandboxfusion-proxy}
+    init: true
+    read_only: true
+    mem_limit: 128m
+    pids_limit: 64
+    privileged: false
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges=true
+      - seccomp=builtin
+    depends_on:
+      - sandboxfusion
+    environment:
+      SANDBOXFUSION_PROXY_UPSTREAM_HOST: sandboxfusion
+      SANDBOXFUSION_PROXY_UPSTREAM_PORT: "8080"
+    entrypoint:
+      - python3
+      - -c
+    command:
+      - |
+        import asyncio
+        import contextlib
+        import os
+
+        async def copy_stream(reader, writer):
+            try:
+                while data := await reader.read(65536):
+                    writer.write(data)
+                    await writer.drain()
+            except (ConnectionError, asyncio.CancelledError):
+                pass
+            finally:
+                with contextlib.suppress(Exception):
+                    writer.write_eof()
+                    await writer.drain()
+
+        async def handle(client_reader, client_writer):
+            try:
+                upstream_reader, upstream_writer = await asyncio.open_connection(
+                    os.environ["SANDBOXFUSION_PROXY_UPSTREAM_HOST"],
+                    int(os.environ["SANDBOXFUSION_PROXY_UPSTREAM_PORT"]),
+                )
+            except (OSError, asyncio.TimeoutError):
+                client_writer.close()
+                with contextlib.suppress(Exception):
+                    await client_writer.wait_closed()
+                return
+            await asyncio.gather(
+                copy_stream(client_reader, upstream_writer),
+                copy_stream(upstream_reader, client_writer),
+            )
+            for writer in (client_writer, upstream_writer):
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
+
+        async def main():
+            server = await asyncio.start_server(handle, "0.0.0.0", 8080)
+            async with server:
+                await server.serve_forever()
+
+        asyncio.run(main())
+    ports:
+      - "127.0.0.1:${SANDBOXFUSION_PORT:-8080}:8080"
+    networks:
+      - sandbox_internal
+      - loopback_ingress
+    restart: "no"
+
+networks:
+  sandbox_internal:
+    internal: true
+  loopback_ingress:
+    internal: false

@@ -13,8 +13,8 @@ first. These tests pin that contract:
 
   1. ``total_lengths`` comes out DP-local (already the case).
   2. ``raw_reward`` stays global — ``log_passrate`` reshapes it into
-     ``[rollout_batch_size, n_samples_per_prompt]`` groups, which only works
-     on the full batch.
+     ``[actual_prompt_groups, n_samples_per_prompt]`` groups, including a
+     partial epoch tail.
   3. ``local_raw_reward`` is the DP-local view, positionally aligned with the
      per-sample fields.
 
@@ -28,11 +28,13 @@ sample's reward to a different sample).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import ray
 
+from slime.backends.megatron_utils import data as megatron_data
 from slime.utils.data import process_rollout_data
-
 
 NUM_GPUS = 0
 
@@ -142,6 +144,25 @@ def test_raw_reward_stays_global(unwrap_ray_get):
     for dp_rank in range(len(partitions)):
         rollout_data = process_rollout_data(args=None, rollout_data_ref=refs, dp_rank=dp_rank, dp_size=len(partitions))
         assert rollout_data["raw_reward"] == RAW_REWARD
+
+
+def test_log_passrate_uses_actual_partial_tail_size(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(megatron_data.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(megatron_data.mpu, "is_pipeline_last_stage", lambda: True)
+    monkeypatch.setattr(
+        megatron_data,
+        "gather_log_data",
+        lambda name, args, rollout_id, metrics: captured.update(metrics),
+    )
+
+    megatron_data.log_passrate(
+        rollout_id=298,
+        args=SimpleNamespace(n_samples_per_prompt=1),
+        rollout_data={"raw_reward": [0.0] * 52 + [1.0]},
+    )
+
+    assert captured["pass@1"] == pytest.approx(1 / 53)
 
 
 def test_missing_raw_reward_is_tolerated(unwrap_ray_get):

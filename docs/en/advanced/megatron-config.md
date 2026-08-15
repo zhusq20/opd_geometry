@@ -52,6 +52,10 @@ megatron:
 
 > **Note:** Keys inside `overrides` use argparse attribute names, not CLI flag names. For example, use `tensor_model_parallel_size` rather than `tensor-model-parallel-size`.
 
+String values may reference environment variables such as
+`${CRITIC_CHECKPOINT_DIR}`. They are expanded before YAML parsing, and an
+unresolved variable is reported as an error rather than used as a literal path.
+
 ---
 
 ## Usage Pattern

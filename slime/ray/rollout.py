@@ -1,10 +1,15 @@
 import dataclasses
+import hashlib
 import itertools
+import json
 import logging
+import math
 import multiprocessing
 import os
 import random
+import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +30,13 @@ from slime.utils.dp_schedule import build_dp_schedule
 from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
 from slime.utils.logging_utils import configure_logger, init_tracking
-from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
+from slime.utils.metric_utils import (
+    compute_pass_rate,
+    compute_rollout_step,
+    compute_statistics,
+    dict_add_prefix,
+    num_updates_before_rollout,
+)
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.types import Sample
 
@@ -480,6 +491,28 @@ class RolloutManager:
 
         data_source_cls = load_function(self.args.data_source_path)
         self.data_source = data_source_cls(args)
+        if (
+            self.args.num_rollout is None
+            and self.args.num_epoch is not None
+            and getattr(self.args, "include_epoch_tail", False)
+        ):
+            prompts_per_epoch = len(self.data_source)
+            if prompts_per_epoch <= 0:
+                raise ValueError("--num-epoch requires at least one usable prompt after length filtering.")
+            steps_per_epoch = math.ceil(prompts_per_epoch / self.args.rollout_batch_size)
+            # These attributes intentionally live on the RolloutManager's
+            # private args copy. Generation and DP scheduling happen in this
+            # actor and use them to preserve the final partial batch.
+            self.args.rollout_prompts_per_epoch = prompts_per_epoch
+            self.args.rollout_steps_per_epoch = steps_per_epoch
+            final_batch = prompts_per_epoch % self.args.rollout_batch_size or self.args.rollout_batch_size
+            logger.info(
+                "Dataset-epoch rollout: %d usable prompts/epoch, batch=%d, steps=%d, final_batch=%d.",
+                prompts_per_epoch,
+                self.args.rollout_batch_size,
+                steps_per_epoch,
+                final_batch,
+            )
 
         self.generate_rollout = load_function(self.args.rollout_function_path)
         self.eval_generate_rollout = load_function(self.args.eval_function_path)
@@ -585,6 +618,8 @@ class RolloutManager:
 
     def get_num_rollout_per_epoch(self):
         assert self.args.rollout_global_dataset
+        if getattr(self.args, "include_epoch_tail", False):
+            return math.ceil(len(self.data_source) / self.args.rollout_batch_size)
         return len(self.data_source) // self.args.rollout_batch_size
 
     def generate(self, rollout_id):
@@ -596,6 +631,15 @@ class RolloutManager:
             self._try_ci_fault_injection()
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
+        metrics = dict(metrics or {})
+        model_version = num_updates_before_rollout(self.args, rollout_id)
+        metrics.update(
+            {
+                "rollout/id": int(rollout_id),
+                "rollout/num_updates": model_version,
+                "rollout/model_version": model_version,
+            }
+        )
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         if self.args.debug_rollout_only:
             # if debug rollout only, we don't convert samples to train data and directly return
@@ -603,7 +647,13 @@ class RolloutManager:
         data = self._convert_samples_to_train_data(data)
         return self._split_train_data_by_dp(data)
 
-    def eval(self, rollout_id):
+    def eval(
+        self,
+        rollout_id,
+        num_updates: int | None = None,
+        model_version: int | None = None,
+        eval_phase: str = "unspecified",
+    ):
         if self.args.debug_train_only:
             # if debug train only, we don't generate evaluation data
             return
@@ -613,7 +663,20 @@ class RolloutManager:
         result = call_rollout_fn(self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True)
         data = result.data
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
-        _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
+        if num_updates is None:
+            num_updates = num_updates_before_rollout(self.args, rollout_id)
+        if model_version is None:
+            model_version = num_updates
+        metrics = dict(result.metrics or {})
+        metrics.update(
+            {
+                "eval/rollout_id": int(rollout_id),
+                "eval/num_updates": int(num_updates),
+                "eval/model_version": int(model_version),
+                "eval/phase": str(eval_phase),
+            }
+        )
+        _log_eval_rollout_data(rollout_id, self.args, data, metrics)
 
     def save(self, rollout_id):
         self.data_source.save(rollout_id)
@@ -821,6 +884,16 @@ class RolloutManager:
                 for sample in samples
             ]
 
+        if any(sample.metadata and "task_reward_observed" in sample.metadata for sample in samples):
+            train_data["task_rewards_observed"] = [
+                (
+                    sample.metadata["task_reward_observed"]
+                    if sample.metadata and "task_reward_observed" in sample.metadata
+                    else None
+                )
+                for sample in samples
+            ]
+
         # For rollout buffer
         if samples[0].metadata and "round_number" in samples[0].metadata:
             train_data["round_number"] = [sample.metadata["round_number"] for sample in samples]
@@ -884,11 +957,25 @@ class RolloutManager:
         total_lengths = [len(t) for t in data["tokens"]]
         data["total_lengths"] = total_lengths
 
+        schedule_global_batch_size = self.args.global_batch_size
+        if hasattr(self.args, "rollout_prompts_per_epoch"):
+            # A dataset epoch can end with fewer prompt groups than the normal
+            # global batch.  Use every returned rollout exactly once and let
+            # the loss/scheduler consume the true final-step sample count.
+            actual_rollout_count = len(set(data["rollout_ids"]))
+            if actual_rollout_count < schedule_global_batch_size:
+                logger.info(
+                    "Training partial epoch tail with global_batch_size=%d (configured full batch=%d).",
+                    actual_rollout_count,
+                    schedule_global_batch_size,
+                )
+                schedule_global_batch_size = actual_rollout_count
+
         partitions, micro_batch_indices, num_microbatches, global_batch_sizes = build_dp_schedule(
             self.args,
             self.train_parallel_config,
             total_lengths,
-            global_batch_size=self.args.global_batch_size,
+            global_batch_size=schedule_global_batch_size,
             rollout_indices=data["rollout_ids"],
         )
 
@@ -913,6 +1000,7 @@ class RolloutManager:
                 "rollout_top_p_token_offsets",
                 "rollout_routed_experts",
                 "source_names",
+                "metadata",
                 "prompt",
                 "teacher_log_probs",
             ]:
@@ -1314,24 +1402,169 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
             truncated = data[key]["truncated"]
             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
         if args.log_passrate:
+            group_size = args.n_samples_per_eval_prompt
+            for dataset_cfg in getattr(args, "eval_datasets", []) or []:
+                if dataset_cfg.name == key:
+                    group_size = dataset_cfg.n_samples_per_eval_prompt
+                    break
             log_dict |= dict_add_prefix(
                 compute_pass_rate(
                     flat_rewards=rewards,
-                    group_size=args.n_samples_per_eval_prompt,
+                    group_size=group_size,
                 ),
                 f"eval/{key}-",
             )
 
     logger.info(f"eval {rollout_id}: {log_dict}")
 
-    step = compute_rollout_step(args, rollout_id)
+    _save_eval_artifacts(args, rollout_id, data, log_dict)
+    step = int(log_dict.get("eval/num_updates", compute_rollout_step(args, rollout_id)))
     log_dict["eval/step"] = step
     logging_utils.log(args, log_dict, step_key="eval/step")
 
     return log_dict
 
 
+def _eval_json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _eval_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_eval_json_safe(item) for item in value]
+    if torch.is_tensor(value):
+        return value.detach().cpu().tolist() if value.numel() != 1 else value.detach().cpu().item()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _compact_eval_metadata(metadata: dict[str, Any] | None) -> tuple[dict[str, Any], str]:
+    metadata = metadata or {}
+    serialized = json.dumps(_eval_json_safe(metadata), sort_keys=True, allow_nan=False).encode("utf-8")
+    heavy = {"unit_tests", "private_test_cases", "public_test_cases", "sandboxfusion_row", "test"}
+    compact = {
+        str(key): _eval_json_safe(value)
+        for key, value in metadata.items()
+        if key not in heavy and len(json.dumps(_eval_json_safe(value), allow_nan=False)) <= 8192
+    }
+    return compact, hashlib.sha256(serialized).hexdigest()
+
+
+def _save_eval_artifacts(args, rollout_id: int, data: dict[str, dict[str, Any]], metrics: dict[str, Any]) -> None:
+    output_value = getattr(args, "eval_artifact_dir", None)
+    if not output_value:
+        return
+    output_dir = Path(os.path.expandvars(os.path.expanduser(output_value)))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    num_updates_value = metrics.get("eval/num_updates")
+    if num_updates_value is None:
+        num_updates_value = compute_rollout_step(args, rollout_id)
+    num_updates = int(num_updates_value)
+    phase = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(metrics.get("eval/phase", "unspecified")))
+    timestamp = datetime.now(timezone.utc).isoformat()
+    summary_datasets: dict[str, Any] = {}
+
+    for dataset_name, info in sorted(data.items()):
+        dataset_dir = output_dir / re.sub(r"[^A-Za-z0-9_.-]+", "_", dataset_name)
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        path = dataset_dir / f"updates_{num_updates:08d}_{phase}.jsonl"
+        if path.exists():
+            raise FileExistsError(
+                f"Refusing to overwrite an existing evaluation artifact: {path}. "
+                "Use a distinct eval phase or archive the stale artifact before resuming."
+            )
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        samples = info.get("samples") or []
+        rewards = info.get("rewards") or []
+        group_size = 1
+        for dataset_cfg in getattr(args, "eval_datasets", []) or []:
+            if dataset_cfg.name == dataset_name:
+                group_size = int(dataset_cfg.n_samples_per_eval_prompt)
+                break
+        digest = hashlib.sha256()
+        with temporary.open("w", encoding="utf-8") as stream:
+            for sample_index, sample in enumerate(samples):
+                compact_metadata, metadata_sha256 = _compact_eval_metadata(sample.metadata)
+                reward = rewards[sample_index] if sample_index < len(rewards) else sample.reward
+                record = {
+                    "schema_version": 1,
+                    "timestamp_utc": timestamp,
+                    "dataset": dataset_name,
+                    "rollout_id": int(rollout_id),
+                    "num_updates": num_updates,
+                    "model_version": int(metrics.get("eval/model_version", num_updates)),
+                    "eval_phase": phase,
+                    "sample_index": sample_index,
+                    "prompt_index": sample_index // max(group_size, 1),
+                    "sample_within_prompt": sample_index % max(group_size, 1),
+                    "source_index": sample.index,
+                    "group_index": sample.group_index,
+                    "prompt": _eval_json_safe(sample.prompt),
+                    "response": sample.response,
+                    "label": _eval_json_safe(sample.label),
+                    "reward": _eval_json_safe(reward),
+                    "status": sample.status.value,
+                    "response_length": int(sample.response_length),
+                    "effective_response_length": int(sample.effective_response_length),
+                    "weight_versions": _eval_json_safe(sample.weight_versions),
+                    "metadata": compact_metadata,
+                    "metadata_sha256": metadata_sha256,
+                }
+                line = (json.dumps(record, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+                stream.write(line.decode("utf-8"))
+                digest.update(line)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        summary_datasets[dataset_name] = {
+            # Analysis may run from a different working directory long after
+            # Ray exits.  Persist an absolute artifact path rather than making
+            # paper scripts depend on the launcher's cwd.
+            "path": str(path.resolve()),
+            "run_relative_path": str(path.relative_to(output_dir.parent)),
+            "samples": len(samples),
+            "prompts": len(samples) // max(group_size, 1),
+            "n_samples_per_prompt": group_size,
+            "sha256": digest.hexdigest(),
+        }
+
+    summary = {
+        "schema_version": 1,
+        "timestamp_utc": timestamp,
+        "rollout_id": int(rollout_id),
+        "num_updates": num_updates,
+        "model_version": int(metrics.get("eval/model_version", num_updates)),
+        "eval_phase": phase,
+        "datasets": summary_datasets,
+        "metrics": _eval_json_safe(metrics),
+    }
+    payload = (json.dumps(summary, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+    index_path = output_dir / "index.jsonl"
+    descriptor = os.open(index_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError(f"Failed to append evaluation index to {index_path}.")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
+    if getattr(args, "geometry_output_dir", None) and not getattr(args, "load_debug_rollout_data", None):
+        # Keep prompt/response serialization and durable I/O entirely off the
+        # normal training path.  Import lazily so geometry has zero import cost
+        # when it is disabled.
+        from slime_plugins.geometry.rollout_samples import persist_rollout_samples
+
+        persist_rollout_samples(rollout_id, args, samples)
+
     if args.custom_rollout_log_function_path is not None:
         custom_log_func = load_function(args.custom_rollout_log_function_path)
         if custom_log_func(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
@@ -1354,14 +1587,139 @@ def compute_metrics_from_samples(args, samples):
 
     log_dict = {}
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
+    if response_lengths:
+        lengths = np.asarray(response_lengths, dtype=np.float64)
+        for percentile in (90, 95, 99):
+            log_dict[f"response_len/p{percentile}"] = float(np.percentile(lengths, percentile))
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
+    log_dict |= _compute_training_reward_metrics(args, samples)
+    log_dict |= _compute_sample_outcome_metrics(samples)
     log_dict |= _compute_top_p_kept_vocab_metrics(args, samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     return log_dict
+
+
+def _compute_sample_outcome_metrics(samples: list[Sample]) -> dict[str, float | int]:
+    """Expose generation/filter/sandbox outcomes instead of silently losing them."""
+
+    metrics: dict[str, float | int] = {}
+    total = len(samples)
+    status_counts: dict[str, int] = {}
+    sandbox_status_counts: dict[str, int] = {}
+    removed = 0
+    sandbox_samples = sandbox_cases = sandbox_passed = sandbox_errors = sandbox_timeouts = 0
+    sandbox_infrastructure_errors = sandbox_execution_errors = 0
+    for sample in samples:
+        status = sample.status.value
+        status_counts[status] = status_counts.get(status, 0) + 1
+        removed += int(bool(sample.remove_sample))
+        sandbox = (sample.metadata or {}).get("sandbox_eval")
+        if not isinstance(sandbox, dict):
+            continue
+        sandbox_samples += 1
+        outcome = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(sandbox.get("outcome", "unknown"))) or "unknown"
+        sandbox_status_counts[outcome] = sandbox_status_counts.get(outcome, 0) + 1
+        sandbox_cases += int(sandbox.get("cases_total", 0) or 0)
+        sandbox_passed += int(sandbox.get("cases_passed", 0) or 0)
+        sandbox_errors += int(sandbox.get("errors", 0) or 0)
+        sandbox_infrastructure_errors += int(sandbox.get("infrastructure_errors", 0) or 0)
+        sandbox_execution_errors += int(sandbox.get("execution_errors", 0) or 0)
+        sandbox_timeouts += int(sandbox.get("timeouts", 0) or 0)
+    for status, count in sorted(status_counts.items()):
+        metrics[f"status/count_{status}"] = count
+        metrics[f"status/fraction_{status}"] = count / total if total else 0.0
+    metrics["filtered/count"] = removed
+    metrics["filtered/fraction"] = removed / total if total else 0.0
+    if sandbox_samples:
+        metrics.update(
+            {
+                "sandbox/samples": sandbox_samples,
+                "sandbox/cases": sandbox_cases,
+                "sandbox/cases_passed": sandbox_passed,
+                "sandbox/errors": sandbox_errors,
+                "sandbox/infrastructure_errors": sandbox_infrastructure_errors,
+                "sandbox/execution_errors": sandbox_execution_errors,
+                "sandbox/timeouts": sandbox_timeouts,
+            }
+        )
+        for outcome, count in sorted(sandbox_status_counts.items()):
+            metrics[f"sandbox/outcome_{outcome}"] = count
+    return metrics
+
+
+def _scalar_task_reward(args, sample: Sample) -> float | None:
+    """Extract a verifier reward without mistaking an OPD teacher payload for one."""
+
+    metadata = sample.metadata or {}
+    value = metadata.get("task_reward_observed", metadata.get("raw_task_reward"))
+    if value is None:
+        value = sample.get_reward_value(args)
+    if isinstance(value, dict):
+        value = value.get("task_reward")
+    if torch.is_tensor(value):
+        if value.numel() != 1:
+            return None
+        value = value.detach().cpu().item()
+    if isinstance(value, (int, float, np.number)) and np.isfinite(float(value)):
+        return float(value)
+    return None
+
+
+def _task_reward_statistics(values: list[float]) -> dict[str, float | int]:
+    array = np.asarray(values, dtype=np.float64)
+    if array.size == 0:
+        return {"count": 0}
+    return {
+        "count": int(array.size),
+        "mean": float(array.mean()),
+        "std": float(array.std()),
+        "min": float(array.min()),
+        "max": float(array.max()),
+        "p10": float(np.percentile(array, 10)),
+        "p50": float(np.percentile(array, 50)),
+        "p90": float(np.percentile(array, 90)),
+        # Reward functions use exactly 1 for a passed verifier.  Do not call a
+        # merely-positive partial credit a pass.
+        "pass_rate": float(np.mean(array == 1.0)),
+    }
+
+
+def _metric_source_name(sample: Sample) -> str:
+    metadata = sample.metadata or {}
+    value = metadata.get("task_name") or metadata.get("source_name") or getattr(sample, "source", "unknown")
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_") or "unknown"
+
+
+def _compute_training_reward_metrics(args, samples: list[Sample]) -> dict[str, float | int]:
+    """Log verifier rewards and the sampled data composition to W&B/stdout."""
+
+    metrics: dict[str, float | int] = {}
+    source_groups = group_by(samples, _metric_source_name)
+    total = len(samples)
+    for source, source_samples in source_groups.items():
+        metrics[f"source_count/{source}"] = len(source_samples)
+        metrics[f"source_fraction/{source}"] = len(source_samples) / total if total else 0.0
+        rewards = [value for sample in source_samples if (value := _scalar_task_reward(args, sample)) is not None]
+        if rewards:
+            metrics |= dict_add_prefix(_task_reward_statistics(rewards), f"reward/{source}/")
+
+    rewards = [value for sample in samples if (value := _scalar_task_reward(args, sample)) is not None]
+    if rewards:
+        metrics |= dict_add_prefix(_task_reward_statistics(rewards), "reward/")
+    use_opd = bool(getattr(args, "use_opd", False))
+    reward_coefficient = float(getattr(args, "opd_task_reward_weight", 0.0) or 0.0) if use_opd else 1.0
+    reward_observed = bool(rewards)
+    reward_used = reward_coefficient != 0.0 and any(
+        _scalar_task_reward(args, sample) is not None and not sample.remove_sample for sample in samples
+    )
+    metrics["task_reward_observed"] = int(reward_observed)
+    metrics["reward_used_in_loss"] = int(reward_used)
+    metrics["reward_loss_coefficient"] = reward_coefficient if reward_used else 0.0
+    return metrics
 
 
 def compute_perf_metrics_from_samples(args, samples, rollout_time):
@@ -1455,14 +1813,16 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]):
     if args.advantage_estimator == "ppo":
         return {}
 
-    def _is_zero_std(samples: list[Sample]):
-        rewards = [sample.get_reward_value(args) for sample in samples]
-        return len(rewards) == 0 or all(rewards[0] == r for r in rewards)
-
     all_sample_groups = group_by(all_samples, lambda s: s.group_index)
-    interesting_sample_groups = [g for g in all_sample_groups.values() if _is_zero_std(g)]
-
-    interesting_rewards = [str(round(g[0].get_reward_value(args), 1)) for g in interesting_sample_groups]
+    interesting_rewards = []
+    for samples in all_sample_groups.values():
+        rewards = [value for sample in samples if (value := _scalar_task_reward(args, sample)) is not None]
+        # Pure OPD stores the teacher scoring response in ``sample.reward``.
+        # It is a payload used to recover token log-probabilities, not a
+        # scalar verifier reward, so it must not enter reward statistics.
+        if not rewards or not all(rewards[0] == reward for reward in rewards):
+            continue
+        interesting_rewards.append(str(round(rewards[0], 1)))
 
     return {f"zero_std/count_{reward}": len(items) for reward, items in group_by(interesting_rewards).items()}
 

@@ -145,8 +145,11 @@ def _hf_validate_args(args, hf_config):
 
 
 def _set_default_megatron_args(args):
-    # always use zero optimizer
-    args.use_distributed_optimizer = True
+    # AdamW/SGD keep Slime's ZeRO default. Muon has a dedicated Megatron
+    # implementation which is incompatible with that distributed optimizer.
+    from .optimizer_factory import configure_optimizer_runtime
+
+    configure_optimizer_runtime(args)
     # TODO: maybe change this after megatron has good fp8 support
     args.bf16 = not args.fp16
     # Checkpoint I/O defaults: these keep checkpoint contents unchanged while

@@ -1,0 +1,37 @@
+routes:
+  # Built-in local rule rewards; omit url to use them.
+  deepscaler: {}
+  gpqa: {}
+  ifevalg: {}
+  workbench: {}
+  unit_test:
+    url: ${SANDBOXFUSION_BASE_URL}/run_code
+    require_preflight: true
+    preflight_marker: ${M2RL_SANDBOX_PREFLIGHT_MARKER}
+    # One 51,200-prompt cell extrapolates to about 7.4 days for responsive16
+    # and 14.1 days for responsive8 before eval/teacher overhead. Re-run the
+    # active probe before every cell; 45 days also covers an exact double-budget
+    # extension without expiring the start-of-run attestation mid-cell.
+    preflight_max_age_seconds: 3888000
+    metric: pass_all
+    max_cases: 20
+    compile_timeout: 5
+    run_timeout: 10
+    request_timeout: 30
+    # SandboxFusion names this field in MiB.
+    memory_limit_mb: 4096
+    concurrency: 32
+    seed: 42
+  livecodebench:
+    url: ${SANDBOXFUSION_BASE_URL}/submit
+    preflight_url: ${SANDBOXFUSION_BASE_URL}/run_code
+    require_preflight: true
+    preflight_marker: ${M2RL_SANDBOX_PREFLIGHT_MARKER}
+    preflight_max_age_seconds: 3888000
+    dataset: m2rl_livecodebench
+    run_timeout: 6
+    request_timeout: 180
+    # Official rows can carry tens of MiB of private tests. Bounding in-flight
+    # submissions prevents the 880 x 10 final protocol from retaining every
+    # request body in the server at once.
+    concurrency: 8

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 
 import pytest
@@ -24,6 +25,7 @@ NUM_GPUS = 0
 DEFAULT_ROLLOUT_FUNCTION_PATH = "slime.rollout.sglang_rollout.generate_rollout"
 REFERENCE_ROLLOUT_FUNCTION_PATH = "plugin_contracts.test_plugin_rollout_contracts.valid_rollout_function"
 
+from slime.rollout import sglang_rollout
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput, call_rollout_fn
 from slime.rollout.sglang_rollout import generate_rollout as default_generate_rollout
 from slime.utils.misc import load_function
@@ -174,6 +176,33 @@ def test_default_rollout_compat_wrapper_stability():
     eval_output = call_rollout_fn(legacy_rollout_function, None, 1, data_source, evaluation=True)
     assert_train_rollout_contract(train_output, n_samples_per_prompt=1)
     assert_eval_rollout_contract(eval_output)
+
+
+def test_eval_generation_obeys_shared_concurrency_limit(monkeypatch):
+    active = 0
+    peak = 0
+
+    async def fake_generate_and_rm(args, sample, sampling_params, evaluation=False):
+        nonlocal active, peak
+        assert evaluation is True
+        active += 1
+        peak = max(peak, active)
+        try:
+            await asyncio.sleep(0.001)
+            return sample
+        finally:
+            active -= 1
+
+    async def run() -> None:
+        semaphore = asyncio.Semaphore(3)
+        await asyncio.gather(
+            *(sglang_rollout._generate_eval_sample(None, make_sample(index), {}, semaphore) for index in range(12))
+        )
+
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm", fake_generate_and_rm)
+    asyncio.run(run())
+
+    assert peak == 3
 
 
 def test_local_rollout_plugin_aligns_with_default_input_output_format():

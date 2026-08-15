@@ -1,0 +1,21 @@
+megatron:
+  - name: policy
+    role: actor
+    overrides: {}
+  - name: value
+    role: critic
+    overrides:
+      # Keep the critic fixed across the actor-optimizer ablation so the paper
+      # isolates actor geometry. The actor inherits the CLI optimizer.
+      optimizer: adam
+      # The launcher points these variables at the initial actor checkpoint on
+      # a fresh run and at the separately saved critic checkpoint on resume.
+      load: ${OPTIMIZER_GEOMETRY_CRITIC_LOAD}
+      save: ${OPTIMIZER_GEOMETRY_CRITIC_SAVE}
+      # The launcher exports batch-profile-specific values.  For responsive16,
+      # LR uses sqrt(16/256) scaling and weight decay is reduced by the same
+      # factor so cumulative decoupled shrinkage stays close to the reference.
+      lr: ${OPTIMIZER_GEOMETRY_CRITIC_LR}
+      weight_decay: ${OPTIMIZER_GEOMETRY_CRITIC_WEIGHT_DECAY}
+      adam_beta1: 0.9
+      adam_beta2: ${OPTIMIZER_GEOMETRY_CRITIC_BETA2}

@@ -172,6 +172,7 @@ cd $SLIME_DIR
 # in two RUN layers (line ~71 + line ~124).
 pip install -r requirements.txt
 pip install -e . --no-deps
+python -m nltk.downloader -q punkt punkt_tab
 
 # int4_qat kernel (matches Dockerfile)
 cd $SLIME_DIR/slime/backends/megatron_utils/kernels/int4_qat

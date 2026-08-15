@@ -1,0 +1,6 @@
+:job_id:01000000
+:actor_name:JobSupervisor
+2026-08-15 05:05:54,683	INFO job_supervisor.py:368 -- Submitting job with RAY_ADDRESS = 172.22.224.84:6379 job_id=01000000 worker_id=a1c4bf27823df7e6f09586412ae1b75a23972e3a8c552333d83195cf node_id=7241fc4cb3825cb6b1caca335969e3d13b2479c05370f84d9bf07127 actor_id=faf320db45f24ac2a6c77c6801000000 task_id=16310a0f0a45af5cfaf320db45f24ac2a6c77c6801000000 task_name=JobSupervisor.run task_func_name=ray.dashboard.modules.job.job_supervisor.JobSupervisor.run actor_name=_ray_internal_job_actor_raysubmit_TaPjqeiV2B4mAT8D timestamp_ns=1786770354683562421
+2026-08-15 05:06:22,389	INFO job_supervisor.py:430 -- Job raysubmit_TaPjqeiV2B4mAT8D entrypoint command exited with code 1 job_id=01000000 worker_id=a1c4bf27823df7e6f09586412ae1b75a23972e3a8c552333d83195cf node_id=7241fc4cb3825cb6b1caca335969e3d13b2479c05370f84d9bf07127 actor_id=faf320db45f24ac2a6c77c6801000000 task_id=16310a0f0a45af5cfaf320db45f24ac2a6c77c6801000000 task_name=JobSupervisor.run task_func_name=ray.dashboard.modules.job.job_supervisor.JobSupervisor.run actor_name=_ray_internal_job_actor_raysubmit_TaPjqeiV2B4mAT8D timestamp_ns=1786770382389116714
+Task was destroyed but it is pending!
+task: <Task pending name='Task-7' coro=<Event.wait() running at /usr/lib/python3.12/asyncio/locks.py:212> wait_for=<Future pending cb=[Task.task_wakeup()]>>

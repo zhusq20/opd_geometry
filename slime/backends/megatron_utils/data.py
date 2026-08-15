@@ -291,6 +291,8 @@ def log_rollout_data(
                 "num_microbatches",
                 "micro_batch_indices",
                 "source_names",
+                "metadata",
+                "task_rewards_observed",
                 # DP-local view of `raw_reward`, which this loop already logs;
                 # both reduce to the same mean, so skip the duplicate metric.
                 "local_raw_reward",
@@ -312,7 +314,7 @@ def log_rollout_data(
                         "advantages",
                         "values",
                         "teacher_log_probs",
-                        "opd_reverse_kl",
+                        "sampled_reverse_kl_logratio",
                     ]:
                         tensor = torch.cat(val).clone().detach()
                         sum_of_sample_mean = get_sum_of_sample_mean(
@@ -346,6 +348,13 @@ def log_rollout_data(
                 raise ValueError(f"Unsupported type: {type(val)} for key: {key}")
 
         reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict)
+        # Exact OPD/RL distributions are an experiment-only path.  Keeping the
+        # import and DP/CP payload gather behind geometry_output_dir leaves the
+        # normal training hot path unchanged.
+        if getattr(args, "geometry_output_dir", None):
+            from .rollout_geometry import collect_rollout_geometry
+
+            collect_rollout_geometry(rollout_id, args, rollout_data)
         if args.ci_test and reduced_log_dict is not None:
             # This is an initial actor/ref zero-KL check. R3 replays rollout
             # routing for the actor forward, while the reference forward
@@ -491,10 +500,13 @@ def log_passrate(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -
             if key != "raw_reward":
                 continue
 
+            group_size = int(args.n_samples_per_prompt)
+            if len(val) % group_size:
+                raise ValueError(f"raw_reward count {len(val)} is not divisible by n_samples_per_prompt={group_size}.")
             log_dict |= compute_pass_rate(
                 flat_rewards=val,
-                group_size=args.n_samples_per_prompt,
-                num_groups=args.rollout_batch_size,
+                group_size=group_size,
+                num_groups=len(val) // group_size,
             )
 
         gather_log_data("passrate", args, rollout_id, log_dict)

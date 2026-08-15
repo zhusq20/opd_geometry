@@ -1,0 +1,22 @@
+Raylet is terminated. Termination is unexpected. Possible reasons include: (1) SIGKILL by the user or system OOM killer, (2) Invalid memory access from Raylet causing SIGSEGV or SIGBUS, (3) Other termination signals. Last 20 lines of the Raylet logs:
+    [2026-08-15 16:39:03,895 I 21564 21564] (raylet) node_manager.cc:1438: Disconnecting worker, graceful=true, disconnect_type=1, has_creation_task_exception=false worker_id=d901a5c69130130a54937b135edbe74f7510a2bcee3c9a955e93041d job_id=02000000
+    [2026-08-15 16:39:04,081 W 21564 21587] (raylet) store.cc:366: Disconnecting client due to connection error with code 2: End of file
+    [2026-08-15 16:39:04,082 W 21564 21587] (raylet) store.cc:366: Disconnecting client due to connection error with code 2: End of file
+    [2026-08-15 16:39:04,377 W 21564 21587] (raylet) store.cc:366: Disconnecting client due to connection error with code 2: End of file
+    [2026-08-15 16:39:04,629 W 21564 21587] (raylet) store.cc:366: Disconnecting client due to connection error with code 2: End of file
+    [2026-08-15 16:39:04,763 W 21564 21587] (raylet) store.cc:366: Disconnecting client due to connection error with code 2: End of file
+    [2026-08-15 16:39:04,763 W 21564 21587] (raylet) store.cc:366: Disconnecting client due to connection error with code 2: End of file
+    [2026-08-15 16:39:04,763 W 21564 21587] (raylet) store.cc:366: Disconnecting client due to connection error with code 2: End of file
+    [2026-08-15 16:39:04,763 W 21564 21587] (raylet) store.cc:366: Disconnecting client due to connection error with code 2: End of file
+    [2026-08-15 16:39:04,961 W 21564 21564] (raylet) retryable_grpc_client.cc:85: Core worker 172.22.224.84 has been unavailable for more than 1 seconds
+    [2026-08-15 16:39:04,963 I 21564 21564] (raylet) core_worker_client_pool.cc:55: Disconnecting core worker client because the worker is dead worker_id=ce56a249af481d3f3611b16c48fbb323d39f987c656ab7b271b502bf node_id=8d5a6e1054d3a73daef64b5f42250a657a111cdcade9f74eddaa179d
+    [2026-08-15 16:39:04,963 I 21564 21564] (raylet) subscriber.cc:324: A worker is dead. subscription_failure_callback will be invoked. Publisher id: ce56a249af481d3f3611b16c48fbb323d39f987c656ab7b271b502bf
+    [2026-08-15 16:39:04,963 I 21564 21564] (raylet) ownership_object_directory.cc:250: Failed to get object location update. This should only happen if the worker / node is dead. worker_id=ce56a249af481d3f3611b16c48fbb323d39f987c656ab7b271b502bf node_id=8d5a6e1054d3a73daef64b5f42250a657a111cdcade9f74eddaa179d
+    [2026-08-15 16:39:05,124 I 21564 21564] (raylet) node_manager.cc:1445: Disconnecting driver, graceful=true, disconnect_type=3 worker_id=02000000ffffffffffffffffffffffffffffffffffffffffffffffff job_id=02000000
+    [2026-08-15 16:39:05,125 I 21564 21564] (raylet) node_manager.cc:1591: Driver (pid=27664) is disconnected. worker_id=02000000ffffffffffffffffffffffffffffffffffffffffffffffff job_id=02000000
+    [2026-08-15 16:39:05,126 I 21564 21564] (raylet) node_manager.cc:1970: Got request to remove 4 bundle(s) for placement group 225bb30b964c350308bafa192ab602000000
+    [2026-08-15 16:39:05,127 I 21564 21564] (raylet) worker_pool.cc:752: Job 02000000 already started in worker pool.
+    [2026-08-15 16:39:05,376 W 21564 21587] (raylet) store.cc:366: Disconnecting client due to connection error with code 2: End of file
+    [2026-08-15 16:39:11,243 I 21564 21564] (raylet) node_manager.cc:1438: Disconnecting worker, graceful=true, disconnect_type=3, has_creation_task_exception=false worker_id=1c51d58ba6b8e4cd693ab40bcb4fe47c9d877064962a75f98b4e49b6 job_id=01000000
+    [2026-08-15 16:39:11,257 W 21564 21587] (raylet) store.cc:366: Disconnecting client due to connection error with code 2: End of file
+

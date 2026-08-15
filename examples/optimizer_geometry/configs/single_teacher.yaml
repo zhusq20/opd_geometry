@@ -1,0 +1,13 @@
+teachers:
+  # OPD sends the student's exact token IDs to this endpoint. The launcher
+  # validates that the student and teacher token-to-ID maps are identical.
+  math: ${OPD_TEACHER_URL}
+  code: ${OPD_TEACHER_URL}
+  math_opd: ${OPD_TEACHER_URL}
+  code_opd: ${OPD_TEACHER_URL}
+default: ${OPD_TEACHER_URL}
+# Keep the scorer load fixed across optimizer cells. The per-request timeout
+# starts after a sample obtains a slot, so long-rollout queues do not create
+# false failures before execution begins.
+concurrency: 128
+request_timeout: 900

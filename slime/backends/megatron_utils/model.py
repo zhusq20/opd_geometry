@@ -15,7 +15,7 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
-from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -36,9 +36,33 @@ from .cp_utils import reduce_train_step_metrics
 from .data import DataIterator, get_batch
 from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
 from .model_provider import get_model_provider_func
+from .optimizer_factory import build_megatron_optimizer, configure_optimizer_runtime
 from .stateless_adam import StatelessAdam
 
 logger = logging.getLogger(__name__)
+
+
+def _distributed_cuda_memory_mib() -> dict[str, float]:
+    """Return the maximum current/peak PyTorch memory across training ranks."""
+
+    if not torch.cuda.is_available():
+        return {}
+    device = torch.cuda.current_device()
+    values = torch.tensor(
+        [
+            torch.cuda.memory_allocated(device),
+            torch.cuda.memory_reserved(device),
+            torch.cuda.max_memory_allocated(device),
+            torch.cuda.max_memory_reserved(device),
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.MAX)
+    values = values.cpu().tolist()
+    names = ("gpu_memory_allocated_mib", "gpu_memory_reserved_mib", "gpu_peak_allocated_mib", "gpu_peak_reserved_mib")
+    return {name: float(value) / 1024**2 for name, value in zip(names, values, strict=True)}
 
 
 def _disable_tqdm_for_non_main_rank() -> bool:
@@ -288,6 +312,11 @@ def setup_model_and_optimizer(
             - The constructed ``MegatronOptimizer`` instance.
             - The learning-rate/weight-decay scheduler tied to the optimizer.
     """
+    # Role YAML overrides are applied after the base Megatron validation. The
+    # flags must be normalized before get_model constructs Megatron DDP.
+    configure_optimizer_runtime(args)
+    args._slime_model_role = role
+
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
@@ -307,7 +336,7 @@ def setup_model_and_optimizer(
 
     optimizer_context = _patch_megatron_adam(StatelessAdam) if args.use_stateless_adam else nullcontext()
     with optimizer_context:
-        optimizer = get_megatron_optimizer(
+        optimizer = build_megatron_optimizer(
             config=config,
             model_chunks=model,
             use_gloo_process_groups=args.enable_gloo_process_groups,
@@ -592,6 +621,7 @@ def train_one_step(
                     "returns",
                     "rollout_log_probs",
                     "teacher_log_probs",
+                    "metadata",
                     "rollout_mask_sums",
                     # Only present when dumping train debug data; lets the loss
                     # snapshot each sample's log_probs keyed by rollout position.
@@ -653,18 +683,43 @@ def train_one_step(
         forward_only=False,
     )
 
+    if args.custom_megatron_after_backward_hook_path:
+        from slime.utils.misc import load_function
+
+        custom_after_backward_hook = load_function(args.custom_megatron_after_backward_hook_path)
+        custom_after_backward_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
+
+    if args.geometry_output_dir and args._slime_model_role in args.geometry_roles:
+        from slime_plugins.geometry.observer import after_backward
+
+        after_backward(
+            args,
+            rollout_id,
+            step_id,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            data_iterator=data_iterator,
+            num_microbatches=num_microbatches,
+            actual_batch_size=step_global_batch_size,
+        )
+
     valid_step = True
+    failure_reason = None
     grad_norm = float("nan")
     if not getattr(args, "check_for_nan_in_loss_and_grad", True):
         found_inf_flag = optimizer.prepare_grads()
         if found_inf_flag:
             valid_step = False
+            failure_reason = "nonfinite_gradient"
         else:
             grad_norm = optimizer.get_grad_norm()
             if isinstance(grad_norm, torch.Tensor):
                 valid_step = not (torch.isnan(grad_norm) or torch.isinf(grad_norm))
             else:
                 valid_step = not (math.isnan(grad_norm) or math.isinf(grad_norm))
+            if not valid_step:
+                failure_reason = "nonfinite_gradient_norm"
 
     # CI check: verify only MTP parameters have non-zero gradients when truncation happens
     # This check must happen before optimizer.step() as gradients may be modified during step
@@ -673,14 +728,57 @@ def train_one_step(
 
         check_mtp_only_grad(model, step_id)
 
+    update_successful = False
+    num_zeros_in_grad = None
     if valid_step:
         # Update parameters.
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        if not update_successful:
+            failure_reason = "optimizer_step_rejected"
 
-        # Update learning rate. Use the per-step global_batch_size when dynamic
-        # batching is on so the scheduler's samples-seen counter tracks reality.
+    if args.geometry_output_dir and args._slime_model_role in args.geometry_roles:
+        from slime_plugins.geometry.observer import after_optimizer_step
+
+        after_optimizer_step(
+            args,
+            rollout_id,
+            step_id,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            update_successful=update_successful,
+            grad_norm=grad_norm,
+            num_zeros_in_grad=num_zeros_in_grad,
+            failure_reason=failure_reason,
+        )
+
+    # Preserve Slime's established behavior for an optimizer-side rejection.
+    # Geometry has already durably recorded the failed event before this abort.
+    if valid_step:
         assert update_successful
+
+    # Advance the scheduler only after geometry has read the optimizer groups:
+    # their current LR is the one that produced this update, while step() may
+    # install the LR for the next update. Dynamic batches advance by the true
+    # per-step global batch size.
+    if update_successful:
         opt_param_scheduler.step(increment=step_global_batch_size)
+
+    if args.custom_megatron_after_train_step_hook_path:
+        from slime.utils.misc import load_function
+
+        custom_after_train_step_hook = load_function(args.custom_megatron_after_train_step_hook_path)
+        custom_after_train_step_hook(
+            args,
+            rollout_id,
+            step_id,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            update_successful=update_successful,
+            grad_norm=grad_norm,
+            num_zeros_in_grad=num_zeros_in_grad,
+        )
 
     # release grad
     for model_chunk in model:
@@ -822,8 +920,11 @@ def train(
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
+        accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
 
         # Run training step.
+        if args.geometry_output_dir and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(torch.cuda.current_device())
         loss_dict, grad_norm = train_one_step(
             args,
             rollout_id,
@@ -836,6 +937,7 @@ def train(
             global_batch_sizes[step_id],
             microbatch_pbar=microbatch_pbar,
         )
+        memory_metrics = _distributed_cuda_memory_mib() if args.geometry_output_dir else {}
 
         if step_id == 0:
             # Enable forward pre-hook after training step has successfully run. All subsequent
@@ -873,7 +975,6 @@ def train(
             and mpu.get_tensor_model_parallel_rank() == 0
             and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
         ):
-            accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
             role = getattr(model[0], "role", "actor")
             role_tag = "" if role == "actor" else f"{role}-"
             log_dict = {
@@ -881,6 +982,17 @@ def train(
                 for key, val in loss_dict.items()
             }
             log_dict[f"train/{role_tag}grad_norm"] = grad_norm
+            clip_threshold = float(getattr(args, "clip_grad", 0.0) or 0.0)
+            try:
+                finite_grad_norm = math.isfinite(float(grad_norm))
+            except (TypeError, ValueError):
+                finite_grad_norm = False
+            log_dict[f"train/{role_tag}grad_clip_threshold"] = clip_threshold
+            log_dict[f"train/{role_tag}grad_clipped"] = int(
+                finite_grad_norm and clip_threshold > 0 and float(grad_norm) > clip_threshold
+            )
+            for name, value in memory_metrics.items():
+                log_dict[f"train/{role_tag}{name}"] = value
             if args.enable_mtp_training:
                 for _i in range(mtp_losses.shape[0]):
                     log_dict[f"train/{role_tag}mtp_{_i + 1}_loss"] = mtp_losses[_i].item()
@@ -892,6 +1004,11 @@ def train(
             # Per-step gbs — uneven step sizes are easy to miss without this.
             log_dict[f"train/{role_tag}global_batch_size"] = global_batch_sizes[step_id]
             log_dict["train/step"] = accumulated_step_id
+            log_dict["train/rollout_id"] = int(rollout_id)
+            log_dict["train/step_within_rollout"] = int(step_id)
+            # One-based count: this event is emitted after the optimizer step.
+            log_dict["train/num_updates"] = accumulated_step_id + 1
+            log_dict["train/model_version"] = accumulated_step_id + 1
             logging_utils.log(args, log_dict, step_key="train/step")
 
             if args.ci_test and "train/train_rollout_logprob_abs_diff" in log_dict:

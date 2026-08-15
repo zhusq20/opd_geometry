@@ -1,0 +1,8 @@
+teachers:
+  math: http://127.0.0.1:13141/generate
+  science: http://127.0.0.1:13142/generate
+  if: http://127.0.0.1:13143/generate
+  code: http://127.0.0.1:13144/generate
+  agent: http://127.0.0.1:13145/generate
+# Optional fallback for datasets not explicitly mapped above.
+# default: http://127.0.0.1:13141/generate

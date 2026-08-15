@@ -319,8 +319,8 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
     rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
 
     # `raw_reward` is shipped whole on purpose: log_passrate reshapes it into
-    # [rollout_batch_size, n_samples_per_prompt] groups, which only works on the
-    # full rollout batch. Metrics that pair a reward with this rank's per-sample
+    # [actual_prompt_groups, n_samples_per_prompt], including a partial epoch
+    # tail. Metrics that pair a reward with this rank's per-sample
     # lists (response_lengths, loss_masks, log_probs, ...) need the DP-local
     # view instead, otherwise sample i's reward is matched against another
     # sample's data.

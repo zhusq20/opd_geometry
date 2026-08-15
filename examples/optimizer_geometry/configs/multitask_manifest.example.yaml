@@ -1,0 +1,51 @@
+version: 1
+sampling:
+  # uniform/weighted/proportional study simultaneous transfer; sequential is
+  # the continual-learning condition used to measure catastrophic forgetting.
+  strategy: uniform
+  unit: batch
+  seed: 42
+  repeat: true
+sources:
+  - name: math
+    path: /data/m2rl/math.jsonl
+    input_key: prompt
+    label_key: label
+    apply_chat_template: true
+    rm_type: deepscaler
+    weight: 1.0
+    phase_samples: 1024
+  - name: science
+    path: /data/m2rl/science.jsonl
+    input_key: prompt
+    label_key: label
+    apply_chat_template: true
+    rm_type: gpqa
+    weight: 1.0
+    phase_samples: 1024
+  - name: if
+    path: /data/m2rl/if.jsonl
+    input_key: prompt
+    label_key: label
+    apply_chat_template: true
+    rm_type: ifevalg
+    weight: 1.0
+    phase_samples: 1024
+  - name: code
+    path: /data/m2rl/code.jsonl
+    input_key: prompt
+    label_key: label
+    apply_chat_template: true
+    rm_type: unit_test
+    weight: 1.0
+    phase_samples: 1024
+  - name: agent
+    path: /data/m2rl/agent.jsonl
+    input_key: prompt
+    label_key: label
+    tool_key: tools
+    # WorkBench owns the multi-turn chat template and therefore needs raw messages.
+    apply_chat_template: false
+    rm_type: workbench
+    weight: 1.0
+    phase_samples: 1024

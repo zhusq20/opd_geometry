@@ -1,0 +1,9 @@
+teachers:
+  # Qwen3-1.7B and Qwen3-8B share the Qwen3 tokenizer/vocabulary. One fixed
+  # Qwen3-8B SGLang endpoint can therefore score every M2RL domain.
+  math: ${QWEN3_8B_TEACHER_URL}
+  science: ${QWEN3_8B_TEACHER_URL}
+  if: ${QWEN3_8B_TEACHER_URL}
+  code: ${QWEN3_8B_TEACHER_URL}
+  agent: ${QWEN3_8B_TEACHER_URL}
+default: ${QWEN3_8B_TEACHER_URL}

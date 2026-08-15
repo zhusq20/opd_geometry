@@ -5,7 +5,12 @@ import numpy as np
 import pytest
 import torch
 
-from slime.ray.rollout import _compute_top_p_kept_vocab_metrics
+from slime.ray.rollout import (
+    _compute_sample_outcome_metrics,
+    _compute_top_p_kept_vocab_metrics,
+    _compute_training_reward_metrics,
+)
+from slime.utils.metric_utils import compute_pass_rate, rollout_prompt_count
 from slime.utils.misc import decode_int32_meta_array
 from slime.utils.types import Sample
 
@@ -14,6 +19,95 @@ NUM_GPUS = 0
 
 def _make_args():
     return Namespace(sglang_speculative_algorithm=False, num_layers=2, moe_router_topk=2)
+
+
+@pytest.mark.unit
+def test_rollout_prompt_count_preserves_exact_epoch_tail_and_restarts_next_epoch():
+    args = Namespace(
+        rollout_batch_size=64,
+        rollout_prompts_per_epoch=19125,
+        rollout_steps_per_epoch=299,
+    )
+
+    assert rollout_prompt_count(args, 0) == 64
+    assert rollout_prompt_count(args, 297) == 64
+    assert rollout_prompt_count(args, 298) == 53
+    assert rollout_prompt_count(args, 299) == 64
+
+
+@pytest.mark.unit
+def test_rollout_prompt_count_keeps_fixed_size_num_rollout_behavior():
+    assert rollout_prompt_count(Namespace(rollout_batch_size=16), 999) == 16
+
+
+@pytest.mark.unit
+def test_training_reward_metrics_report_values_and_source_composition():
+    args = Namespace(reward_key=None)
+    samples = [
+        Sample(reward=1.0, metadata={"task_name": "math"}),
+        Sample(reward=0.0, metadata={"task_name": "math"}),
+        Sample(reward={"teacher": {}, "task_reward": 0.5}, metadata={"task_name": "science"}),
+        # A pure OPD teacher response is deliberately not treated as a task reward.
+        Sample(reward={"meta_info": {"input_token_logprobs": []}}, metadata={"task_name": "science"}),
+    ]
+
+    metrics = _compute_training_reward_metrics(args, samples)
+
+    assert metrics["source_count/math"] == 2
+    assert metrics["source_fraction/science"] == pytest.approx(0.5)
+    assert metrics["reward/math/mean"] == pytest.approx(0.5)
+    assert metrics["reward/science/mean"] == pytest.approx(0.5)
+    assert metrics["reward/count"] == 3
+    assert metrics["reward/mean"] == pytest.approx(0.5)
+
+
+@pytest.mark.unit
+def test_livecodebench_pass_rate_includes_standard_k_values():
+    rewards = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    metrics = compute_pass_rate(rewards, group_size=10)
+
+    assert {"pass@1", "pass@5", "pass@10"} <= metrics.keys()
+    assert metrics["pass@1"] == pytest.approx(0.1)
+    assert metrics["pass@5"] == pytest.approx(0.5)
+    assert metrics["pass@10"] == pytest.approx(1.0)
+    assert compute_pass_rate([1.0], group_size=1) == {"pass@1": 1.0}
+
+
+@pytest.mark.unit
+def test_sample_outcome_metrics_count_status_filter_and_sandbox_failures():
+    samples = [
+        Sample(
+            status=Sample.Status.COMPLETED,
+            metadata={"sandbox_eval": {"outcome": "accepted", "cases_total": 2, "cases_passed": 2}},
+        ),
+        Sample(
+            status=Sample.Status.TRUNCATED,
+            remove_sample=True,
+            metadata={
+                "sandbox_eval": {
+                    "outcome": "sandbox_error",
+                    "cases_total": 2,
+                    "cases_passed": 0,
+                    "errors": 1,
+                    "infrastructure_errors": 1,
+                    "execution_errors": 0,
+                    "timeouts": 1,
+                }
+            },
+        ),
+    ]
+
+    metrics = _compute_sample_outcome_metrics(samples)
+
+    assert metrics["status/count_completed"] == 1
+    assert metrics["status/fraction_truncated"] == pytest.approx(0.5)
+    assert metrics["filtered/count"] == 1
+    assert metrics["sandbox/cases"] == 4
+    assert metrics["sandbox/errors"] == 1
+    assert metrics["sandbox/infrastructure_errors"] == 1
+    assert metrics["sandbox/execution_errors"] == 0
+    assert metrics["sandbox/timeouts"] == 1
 
 
 @pytest.mark.unit

@@ -195,6 +195,7 @@ def make_slime_validate_args(**overrides):
         finetune=False,
         start_rollout_id=None,
         eval_interval=None,
+        eval_max_concurrency=None,
         save_interval=None,
         save=None,
         kl_loss_coef=0,
@@ -285,6 +286,15 @@ def test_slime_validate_args_defaults_start_rollout_id_to_zero(monkeypatch, mega
     module.slime_validate_args(args)
 
     assert args.start_rollout_id == 0
+
+
+@pytest.mark.unit
+def test_slime_validate_args_rejects_nonpositive_eval_concurrency(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(eval_max_concurrency=0)
+
+    with pytest.raises(ValueError, match="eval-max-concurrency"):
+        module.slime_validate_args(args)
 
 
 @pytest.mark.unit

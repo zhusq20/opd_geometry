@@ -1,0 +1,25 @@
+eval:
+  defaults:
+    max_response_len: 16384
+    top_p: 1.0
+    n_samples_per_eval_prompt: 1
+    apply_chat_template: true
+    custom_rm_path: slime_plugins.m2rl.rewards.reward
+  datasets:
+    - name: math
+      path: ${oc.env:M2RL_EVAL_DIR}/math.jsonl
+      rm_type: deepscaler
+    - name: science
+      path: ${oc.env:M2RL_EVAL_DIR}/science.jsonl
+      rm_type: gpqa
+    - name: if
+      path: ${oc.env:M2RL_EVAL_DIR}/if.jsonl
+      rm_type: ifevalg
+    - name: code
+      path: ${oc.env:M2RL_EVAL_DIR}/code.jsonl
+      rm_type: unit_test
+    - name: agent
+      path: ${oc.env:M2RL_EVAL_DIR}/agent.jsonl
+      rm_type: workbench
+      apply_chat_template: false
+      custom_generate_function_path: slime_plugins.m2rl.generate.generate
