@@ -96,10 +96,20 @@ if ! [[ "${MAX_TOKENS_PER_GPU}" =~ ^[1-9][0-9]*$ ]] || \
   echo "MAX_TOKENS_PER_GPU must be at least prompt+response=${REQUIRED_MAX_TOKENS_PER_GPU}." >&2
   exit 2
 fi
+if [[ "${EVAL_INTERVAL:-50}" != "50" ]]; then
+  echo "The frozen single-task GRPO/PPO scripts require EVAL_INTERVAL=50 optimizer updates." >&2
+  exit 2
+fi
+if [[ "${SAVE_INTERVAL:-100}" != "100" ]]; then
+  echo "The frozen single-task GRPO/PPO scripts require SAVE_INTERVAL=100 optimizer updates." >&2
+  exit 2
+fi
 export NUM_EPOCH=1
 export MAX_PROMPT_LEN
 export MAX_RESPONSE_LEN=8192
 export MAX_TOKENS_PER_GPU
+export EVAL_INTERVAL=50
+export SAVE_INTERVAL=100
 export SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-12}"
 if [[ "${TASK}" == "math" ]]; then
   export EVAL_MAX_RESPONSE_LEN=32768

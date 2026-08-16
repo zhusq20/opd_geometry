@@ -132,6 +132,8 @@ def test_launcher_dry_run_covers_full_matrix(tmp_path, optimizer, algorithm):
     if algorithm in {"grpo", "ppo"}:
         assert "--rollout-max-response-len 8192" in result.stdout
         assert "--max-tokens-per-gpu 10240" in result.stdout
+        assert "--save-interval 100" in result.stdout
+        assert "eval=50; checkpoint=100 updates" in result.stdout
     assert '--apply-chat-template-kwargs \\{\\"enable_thinking\\":false\\}' in result.stdout
     if algorithm in {"opd", "sft_opd", "grpo_opd", "ppo_opd"}:
         assert "--use-opd --opd-type sglang" in result.stdout
@@ -689,10 +691,10 @@ def test_single_task_three_optimizer_wrappers(tmp_path, script, expected_algorit
     (config_root / "single_task_index.json").write_text("{}\n")
     fake_launcher = tmp_path / "launcher.sh"
     fake_launcher.write_text(
-        'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n" '
+        'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n" '
         '"$TASK" "$ALGORITHM" "$OPTIMIZER" "${TEACHER:-}" "$WANDB_ENTITY" '
         '"$EXPERIMENT_DATA_INDEX" "$SEED" "$NUM_EPOCH" "${NUM_ROLLOUT:-}" '
-        '"${TARGET_PROMPT_BUDGET:-}"\n'
+        '"${TARGET_PROMPT_BUDGET:-}" "${EVAL_INTERVAL:-}" "${SAVE_INTERVAL:-}"\n'
     )
     env = os.environ.copy()
     env.update(
@@ -715,7 +717,8 @@ def test_single_task_three_optimizer_wrappers(tmp_path, script, expected_algorit
     assert all(line.split("|")[4] == "zsqzz" for line in cells)
     assert all(line.split("|")[5] == str(config_root / "single_task_index.json") for line in cells)
     assert {line.split("|")[6] for line in cells} == expected_seeds
-    assert all(line.split("|")[7:] == ["1", "", ""] for line in cells)
+    expected_cadence = ["50", "100"] if expected_algorithm == "grpo" else ["50", ""]
+    assert all(line.split("|")[7:] == ["1", "", "", *expected_cadence] for line in cells)
 
 
 @pytest.mark.unit
@@ -729,6 +732,8 @@ def test_single_task_three_optimizer_wrappers(tmp_path, script, expected_algorit
         ({"NUM_ROLLOUT": "3200"}, "do not accept NUM_ROLLOUT or TARGET_PROMPT_BUDGET"),
         ({"MAX_RESPONSE_LEN": "32768"}, "require training MAX_RESPONSE_LEN=8192"),
         ({"MAX_TOKENS_PER_GPU": "10239"}, "must be at least prompt+response=10240"),
+        ({"EVAL_INTERVAL": "320"}, "require EVAL_INTERVAL=50"),
+        ({"SAVE_INTERVAL": "320"}, "require SAVE_INTERVAL=100"),
     ],
 )
 def test_single_task_rl_rejects_non_frozen_seed_or_run_length(tmp_path, invalid_env, expected_error):
@@ -749,6 +754,8 @@ def test_single_task_rl_rejects_non_frozen_seed_or_run_length(tmp_path, invalid_
         "TARGET_PROMPT_BUDGET",
         "MAX_RESPONSE_LEN",
         "MAX_TOKENS_PER_GPU",
+        "EVAL_INTERVAL",
+        "SAVE_INTERVAL",
     ):
         env.pop(name, None)
     env.update(
@@ -814,9 +821,9 @@ def test_single_task_math_rl_uses_8k_train_and_32k_combined_eval_rollouts(tmp_pa
     (config_root / "single_task_index.json").write_text("{}\n")
     fake_launcher = tmp_path / "launcher.sh"
     fake_launcher.write_text(
-        'printf "%s|%s|%s|%s|%s|%s|%s\\n" "$ALGORITHM" "$EVAL_CONFIG" '
+        'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s\\n" "$ALGORITHM" "$EVAL_CONFIG" '
         '"$MAX_RESPONSE_LEN" "$MAX_TOKENS_PER_GPU" "$SGLANG_MAX_RUNNING_REQUESTS" '
-        '"$EVAL_MAX_RESPONSE_LEN" "$EVAL_MAX_CONCURRENCY"\n'
+        '"$EVAL_MAX_RESPONSE_LEN" "$EVAL_MAX_CONCURRENCY" "$EVAL_INTERVAL" "$SAVE_INTERVAL"\n'
     )
     env = os.environ.copy()
     for name in (
@@ -842,7 +849,7 @@ def test_single_task_math_rl_uses_8k_train_and_32k_combined_eval_rollouts(tmp_pa
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines()[-1] == (
-        f"{algorithm}|{combined_eval}|8192|10240|12|32768|48"
+        f"{algorithm}|{combined_eval}|8192|10240|12|32768|48|50|100"
     )
 
 
