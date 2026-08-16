@@ -2,15 +2,8 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-requested_repo=/mnt/data_from_server2/siqizhu4/iclr2027/slime_opd_geometry
 workspace_repo="$(cd -- "${script_dir}/../.." && pwd)"
-if [[ -n "${SLIME_DIR:-}" ]]; then
-  repo="${SLIME_DIR}"
-elif [[ -f "${requested_repo}/examples/optimizer_geometry/run_single_task_rl.sh" ]]; then
-  repo="${requested_repo}"
-else
-  repo="${workspace_repo}"
-fi
+repo="${SLIME_DIR:-${workspace_repo}}"
 single_task_rl="${repo}/examples/optimizer_geometry/run_single_task_rl.sh"
 marker="${M2RL_SANDBOX_PREFLIGHT_MARKER:-${repo}/data/m2rl/sandbox/sandboxfusion_preflight.json}"
 sandbox_url="${SANDBOXFUSION_BASE_URL:-http://127.0.0.1:8080}"

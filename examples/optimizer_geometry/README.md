@@ -181,11 +181,21 @@ digest. Start the localhost-only profile and export the attested endpoint before
 any code training/evaluation cell:
 
 ```bash
-bash examples/optimizer_geometry/build_sandboxfusion_cgroup2.sh
-bash examples/optimizer_geometry/start_sandboxfusion.sh
+export SANDBOX_STATE="${SANDBOX_STATE:-$HOME/.local/state/slime-opd-geometry/sandboxfusion}"
+mkdir -p "$SANDBOX_STATE"
+chmod 700 "$SANDBOX_STATE"
+
+SANDBOXFUSION_PIN_FILE="$SANDBOX_STATE/sandboxfusion-image.env" \
+  bash examples/optimizer_geometry/build_sandboxfusion_cgroup2.sh
+SANDBOXFUSION_PIN_FILE="$SANDBOX_STATE/sandboxfusion-image.env" \
+SANDBOX_PREFLIGHT_MARKER="$SANDBOX_STATE/sandboxfusion_preflight.json" \
+  bash examples/optimizer_geometry/start_sandboxfusion.sh
 export SANDBOXFUSION_BASE_URL=http://127.0.0.1:8080
-export M2RL_SANDBOX_PREFLIGHT_MARKER=$PWD/data/m2rl/sandbox/sandboxfusion_preflight.json
 ```
+
+Bind-mount `SANDBOX_STATE` read-only at `/workspace/sandboxfusion-state` in the
+training container, then set
+`M2RL_SANDBOX_PREFLIGHT_MARKER=/workspace/sandboxfusion-state/sandboxfusion_preflight.json`.
 
 The patched `lite` runner supports cgroup v2 directly and gives each execution
 CPU, memory, and PID controls in a dedicated delegated subtree. Startup probes

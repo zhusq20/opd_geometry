@@ -18,10 +18,13 @@ Qwen3-1.7B Megatron: /workspace/dev/checkpoints/Qwen3-1.7B_torch_dist
 Qwen3-8B teacher:    /workspace/dev/iclr2027/checkpoints/Qwen3-8B
 ```
 
-用户给出的 `/mnt/data_from_server2/siqizhu4/iclr2027` 在当前执行环境中映射为
-`/workspace/dev/iclr2027`。启动器会先找项目 checkpoint，再找共享的
-`/workspace/dev/checkpoints`，无需手工改脚本。1.7B 与 8B 的 151,669 项 tokenizer
-映射、added tokens 和 special-token IDs 已逐项验证一致。
+宿主机上的项目必须从 disk2 真实路径
+`/mnt/disk2_from_server2/siqizhu4/iclr2027/slime_opd_geometry` 编辑和启动，并通过
+bind mount 映射为容器内的 `/workspace/dev/iclr2027/slime_opd_geometry`。
+`/mnt/data_from_server2/siqizhu4/iclr2027` 是 mergerfs 视图，可能优先展示 disk3
+上的另一份同名文件，不能把它作为本项目的宿主机代码路径。启动器会先找项目
+checkpoint，再找共享的 `/workspace/dev/checkpoints`，无需手工改脚本。1.7B 与
+8B 的 151,669 项 tokenizer 映射、added tokens 和 special-token IDs 已逐项验证一致。
 
 单任务数据已经准备在：
 
@@ -338,10 +341,22 @@ code reward 会执行模型生成的程序，必须使用 SandboxFusion 等隔�
 禁公网、只读 cgroup/实际内存限制、降权、seccomp/userns 拒绝、timeout 和 teardown 主动探针：
 
 ```bash
-bash examples/optimizer_geometry/build_sandboxfusion_cgroup2.sh
-bash examples/optimizer_geometry/start_sandboxfusion.sh
-export SANDBOXFUSION_BASE_URL=http://127.0.0.1:8080
-export M2RL_SANDBOX_PREFLIGHT_MARKER=$PWD/data/m2rl/sandbox/sandboxfusion_preflight.json
+export HOST_ROOT=/mnt/data_from_server2/siqizhu4
+export DISK2_ROOT=/mnt/disk2_from_server2/siqizhu4/iclr2027
+export SLIME_REPO="$DISK2_ROOT/slime_opd_geometry"
+export TRAIN_CACHE="$DISK2_ROOT/.training-cache/root-cache"
+export SANDBOX_STATE="$HOME/.local/state/slime-opd-geometry/sandboxfusion"
+
+test -f "$SLIME_REPO/examples/optimizer_geometry/run_single_task_rl.sh"
+mkdir -p "$TRAIN_CACHE" "$SANDBOX_STATE"
+chmod 700 "$SANDBOX_STATE"
+cd "$SLIME_REPO"
+
+SANDBOXFUSION_PIN_FILE="$SANDBOX_STATE/sandboxfusion-image.env" \
+  bash examples/optimizer_geometry/build_sandboxfusion_cgroup2.sh
+SANDBOXFUSION_PIN_FILE="$SANDBOX_STATE/sandboxfusion-image.env" \
+SANDBOX_PREFLIGHT_MARKER="$SANDBOX_STATE/sandboxfusion_preflight.json" \
+  bash examples/optimizer_geometry/start_sandboxfusion.sh
 ```
 
 该流程要求 Linux 宿主机提供 cgroup v2、Docker daemon，以及经过白名单限定的 mount/netns
@@ -351,6 +366,14 @@ unshare，已确认会 fail closed；必须由服务器
 code cell 前应重跑主动探针，launcher 和 reward route 会校验 marker 的 URL、时效、patch
 hash、固定 upstream digest、cgroup v2 attestation 和 `safe=true`。启动前旧 marker 会先变为
 `safe=false`，任何失败都会关闭新服务。完整操作见 `SANDBOXFUSION_CGROUP2_zh.md`。
+
+训练容器必须通过 `--network host` 访问服务，并把上述状态目录只读挂载到
+`/workspace/sandboxfusion-state`。进入训练容器后使用：
+
+```bash
+export SANDBOXFUSION_BASE_URL=http://127.0.0.1:8080
+export M2RL_SANDBOX_PREFLIGHT_MARKER=/workspace/sandboxfusion-state/sandboxfusion_preflight.json
+```
 
 ## 5. 运行一个实验
 
