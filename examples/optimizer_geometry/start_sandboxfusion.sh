@@ -17,6 +17,9 @@ CGROUP_NAME="${SANDBOXFUSION_CGROUP_NAME:-sandboxfusion}"
 EXPECTED_BASE_IMAGE="volcengine/sandbox-fusion@sha256:dd7ff53d16132a8acad6d5da7f15154bb4a331381567a4cb21b3e97ce581f5f9"
 AGGREGATE_MEMORY_BYTES="${SANDBOXFUSION_AGGREGATE_MEMORY_BYTES:-34359738368}"
 AGGREGATE_PIDS="${SANDBOXFUSION_AGGREGATE_PIDS:-4096}"
+MAX_UPLOAD_BYTES="${SANDBOXFUSION_MAX_UPLOAD_BYTES:-150994944}"
+MIN_UPLOAD_BYTES="$((137 * 1024 * 1024))"
+LIVECODEBENCH_PARQUET="${SANDBOXFUSION_LIVECODEBENCH_PARQUET:-${SLIME_DIR}/data/m2rl/single_task/code/livecodebench_v5_online64.parquet}"
 
 write_unsafe_marker() {
   local marker_directory temporary_marker
@@ -84,6 +87,10 @@ if [[ ! "${AGGREGATE_MEMORY_BYTES}" =~ ^[1-9][0-9]*$ ]] \
   echo "Aggregate cgroup limits must be positive integers." >&2
   exit 2
 fi
+if [[ ! "${MAX_UPLOAD_BYTES}" =~ ^[1-9][0-9]*$ ]] || ((MAX_UPLOAD_BYTES < MIN_UPLOAD_BYTES)); then
+  echo "SandboxFusion upload limit must be at least ${MIN_UPLOAD_BYTES} bytes; got ${MAX_UPLOAD_BYTES}." >&2
+  exit 2
+fi
 
 CGROUP_VERSION="$(docker info --format '{{.CgroupVersion}}')"
 if [[ "${CGROUP_VERSION}" != "2" ]]; then
@@ -142,8 +149,26 @@ fi
 
 SANDBOXFUSION_CGROUP_PATH="/sys/fs/cgroup/${CGROUP_NAME}"
 SANDBOXFUSION_PORT="${PORT}"
-export SANDBOXFUSION_CGROUP_PATH SANDBOXFUSION_IMAGE SANDBOXFUSION_PORT
+SANDBOXFUSION_MAX_UPLOAD_BYTES="${MAX_UPLOAD_BYTES}"
+export SANDBOXFUSION_CGROUP_PATH SANDBOXFUSION_IMAGE SANDBOXFUSION_MAX_UPLOAD_BYTES SANDBOXFUSION_PORT
 docker compose -f "${COMPOSE_FILE}" config --quiet
+
+LIVECODEBENCH_MAX_STAGED_BYTES=0
+if [[ -f "${LIVECODEBENCH_PARQUET}" ]]; then
+  LIVECODEBENCH_REPORT="$(
+    python3 "${SCRIPT_DIR}/validate_livecodebench_upload.py" \
+      --parquet "${LIVECODEBENCH_PARQUET}" \
+      --max-upload-bytes "${MAX_UPLOAD_BYTES}"
+  )"
+  printf '%s\n' "${LIVECODEBENCH_REPORT}"
+  LIVECODEBENCH_MAX_STAGED_BYTES="$(
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["max_required_upload_bytes"])' \
+      <<<"${LIVECODEBENCH_REPORT}"
+  )"
+else
+  echo "LiveCodeBench payload scan requires the configured parquet: ${LIVECODEBENCH_PARQUET}" >&2
+  exit 2
+fi
 
 # A marker from an older container must never authorize the replacement while
 # its image, mount, and active probes are still being verified.
@@ -239,6 +264,14 @@ SERVICE_MEMORY_LIMIT="$(docker inspect --format '{{.HostConfig.Memory}}' "${CONT
 SERVICE_PIDS_LIMIT="$(docker inspect --format '{{.HostConfig.PidsLimit}}' "${CONTAINER_ID}")"
 if [[ "${SERVICE_MEMORY_LIMIT}" != "4294967296" ]] || [[ "${SERVICE_PIDS_LIMIT}" != "2048" ]]; then
   echo "SandboxFusion control-plane memory/PID limits differ from the audited profile." >&2
+  exit 1
+fi
+SERVICE_MAX_UPLOAD_BYTES="$(
+  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${CONTAINER_ID}" \
+    | awk -F= '$1 == "SANDBOX_MAX_UPLOAD_BYTES" {print $2}'
+)"
+if [[ "${SERVICE_MAX_UPLOAD_BYTES}" != "${MAX_UPLOAD_BYTES}" ]]; then
+  echo "SandboxFusion runtime upload limit differs from the requested value: ${SERVICE_MAX_UPLOAD_BYTES:-unset}." >&2
   exit 1
 fi
 EXPECTED_CAPABILITIES=$'DAC_OVERRIDE\nFOWNER\nKILL\nMKNOD\nNET_ADMIN\nSETGID\nSETPCAP\nSETUID\nSYS_ADMIN\nSYS_CHROOT'
@@ -452,6 +485,8 @@ python3 "${SCRIPT_DIR}/sandbox_preflight.py" \
   --base-image "${BASE_IMAGE}" \
   --aggregate-memory-max "${AGGREGATE_MEMORY_BYTES}" \
   --aggregate-pids-max "${AGGREGATE_PIDS}" \
+  --max-upload-bytes "${MAX_UPLOAD_BYTES}" \
+  --livecodebench-max-staged-bytes "${LIVECODEBENCH_MAX_STAGED_BYTES}" \
   --service-canary-path "${SERVICE_CANARY_PATH}" \
   --service-canary-token "${SERVICE_CANARY_TOKEN}" \
   --service-namespaces "${SERVICE_NAMESPACES}" \

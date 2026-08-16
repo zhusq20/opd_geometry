@@ -17,6 +17,7 @@ from typing import Any
 AUDITED_BASE_IMAGE = (
     "volcengine/sandbox-fusion@" "sha256:dd7ff53d16132a8acad6d5da7f15154bb4a331381567a4cb21b3e97ce581f5f9"
 )
+MIN_LIVECODEBENCH_UPLOAD_BYTES = 137 * 1024 * 1024
 
 
 def request_json(url: str, payload: dict[str, Any] | None, timeout: float) -> Any:
@@ -414,6 +415,11 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
             and int(args.aggregate_pids_max) > 0
             and image_reference_is_pinned(args.image_reference)
         ),
+        "livecodebench_upload_capacity": (
+            args.max_upload_bytes >= MIN_LIVECODEBENCH_UPLOAD_BYTES
+            and args.livecodebench_max_staged_bytes > 0
+            and args.livecodebench_max_staged_bytes <= args.max_upload_bytes
+        ),
     }
     marker = {
         "schema_version": 2,
@@ -436,6 +442,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
             "base_image": args.base_image,
             "aggregate_memory_max": args.aggregate_memory_max,
             "aggregate_pids_max": args.aggregate_pids_max,
+            "max_upload_bytes": args.max_upload_bytes,
             "control_plane_network_internal": args.control_plane_network_internal,
         },
         "diagnostics": {
@@ -467,6 +474,11 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
             "service_namespaces": service_namespace_report,
             "memory": response_diagnostic(memory),
             "timeout": response_diagnostic(timeout_result),
+            "livecodebench_upload": {
+                "minimum_contract_bytes": MIN_LIVECODEBENCH_UPLOAD_BYTES,
+                "max_staged_bytes": args.livecodebench_max_staged_bytes,
+                "runtime_limit_bytes": args.max_upload_bytes,
+            },
         },
         "notes": {
             "filesystem_probe": "A world-readable client-host canary was not visible to submitted code.",
@@ -477,6 +489,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
             "privilege_probe": "Submitted code ran as uid 1000 without effective capabilities and with no_new_privs.",
             "seccomp_probe": "Submitted code inherited the extra untrusted-code seccomp filter and user namespace creation returned EPERM.",
             "submit_probe": "The training /submit route executed a JSON LiveCodeBench case in the sandbox and rejected control-plane extraction code and legacy pickle input.",
+            "upload_probe": "The runtime upload limit covers the API contract and the largest staged row in the configured online LiveCodeBench parquet.",
             "namespace_probe": "Two executions each differed from the service mount, PID, network, IPC, and UTS namespaces.",
             "scope": "Active black-box checks; retain the pinned deployment config, patch hash, and image digest as provenance.",
         },
@@ -504,6 +517,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-image")
     parser.add_argument("--aggregate-memory-max", required=True)
     parser.add_argument("--aggregate-pids-max", required=True)
+    parser.add_argument("--max-upload-bytes", type=int, required=True)
+    parser.add_argument("--livecodebench-max-staged-bytes", type=int, required=True)
     parser.add_argument("--service-canary-path", required=True)
     parser.add_argument("--service-canary-token", required=True)
     parser.add_argument("--service-namespaces", required=True)

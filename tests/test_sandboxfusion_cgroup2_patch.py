@@ -651,6 +651,9 @@ def test_build_and_start_contract_is_fail_closed_and_content_addressed():
     assert "--cap-add DAC_OVERRIDE" in start
     assert "ps -q loopback_proxy" in start
     assert "--proxy-container-id" in start
+    assert "validate_livecodebench_upload.py" in start
+    assert "--max-upload-bytes" in start
+    assert "--livecodebench-max-staged-bytes" in start
     assert "image: ${SANDBOXFUSION_IMAGE:?" in compose
     assert "loopback_proxy:" in compose
     assert "SANDBOXFUSION_PROXY_UPSTREAM_HOST: sandboxfusion" in compose
@@ -666,3 +669,4 @@ def test_build_and_start_contract_is_fail_closed_and_content_addressed():
     assert "127.0.0.1:${SANDBOXFUSION_PORT:-8080}:8080" in compose
     assert "internal: true" in compose
     assert "isolation=none" not in compose
+    assert 'SANDBOX_MAX_UPLOAD_BYTES: "${SANDBOXFUSION_MAX_UPLOAD_BYTES:-150994944}"' in compose

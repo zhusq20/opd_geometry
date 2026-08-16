@@ -31,6 +31,8 @@ routes:
     dataset: m2rl_livecodebench
     run_timeout: 6
     request_timeout: 180
+    retry_attempts: 3
+    retry_backoff_seconds: 1
     # Official rows can carry up to roughly 102 MiB of private tests. Bounding
     # in-flight submissions prevents the 880 x 10 final protocol from retaining
     # every request body in the server at once.

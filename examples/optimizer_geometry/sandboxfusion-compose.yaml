@@ -37,7 +37,9 @@ services:
       SANDBOX_MAX_MEMORY_MB: "4096"
       SANDBOX_PIDS_LIMIT: "512"
       SANDBOX_RUN_UID: "1000"
-      SANDBOX_MAX_UPLOAD_BYTES: "67108864"
+      # 144 MiB covers the API contract of a 128 MiB test payload, an 8 MiB
+      # completion, and a 1 MiB reserve for the staged evaluator utility.
+      SANDBOX_MAX_UPLOAD_BYTES: "${SANDBOXFUSION_MAX_UPLOAD_BYTES:-150994944}"
       SANDBOX_MAX_FETCH_BYTES: "67108864"
     volumes:
       - type: bind

@@ -2,7 +2,10 @@
 
 import asyncio
 import json
+import pickle
 from types import SimpleNamespace
+
+import pytest
 
 from slime.utils.types import Sample
 from slime_plugins.m2rl import rewards
@@ -67,6 +70,97 @@ def test_livecodebench_diagnostics_expose_timeout():
 
     assert diagnostics["outcome"] == "timeout"
     assert diagnostics["timeouts"] == 1
+
+
+class _FakeResponse:
+    def __init__(self, status, *, payload=None, body=""):
+        self.status = status
+        self.payload = payload
+        self.body = body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def json(self):
+        return self.payload
+
+    async def text(self):
+        return self.body
+
+
+def _fake_client_session(responses, calls):
+    class FakeClientSession:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def post(self, url, *, json):
+            calls.append((url, json))
+            return responses.pop(0)
+
+    return FakeClientSession
+
+
+def _livecodebench_sample():
+    row = {
+        "id": "abc375_c",
+        "labels": "{}",
+        "content": "Rotate a grid.",
+        "test": json.dumps({"input_output": json.dumps({"inputs": ["1\n"], "outputs": ["1\n"]})}),
+    }
+    return Sample(
+        index=28,
+        response="```python\nprint(1)\n```",
+        metadata={"rm_type": "livecodebench", "question_id": "abc375_c", "sandboxfusion_row": row},
+    )
+
+
+def test_livecodebench_retries_transient_server_error(monkeypatch):
+    calls = []
+    responses = [
+        _FakeResponse(500, body="temporary failure"),
+        _FakeResponse(200, payload={"accepted": True, "tests": []}),
+    ]
+    monkeypatch.setattr(rewards.aiohttp, "ClientSession", _fake_client_session(responses, calls))
+    monkeypatch.setattr(rewards, "validate_preflight_marker", lambda *_args: None)
+
+    result = asyncio.run(
+        rewards.livecodebench_reward(
+            SimpleNamespace(),
+            _livecodebench_sample(),
+            {"url": "http://sandbox/submit", "retry_attempts": 2, "retry_backoff_seconds": 0},
+        )
+    )
+
+    assert result == 1.0
+    assert len(calls) == 2
+
+
+def test_livecodebench_http_error_is_serializable_and_identifies_problem(monkeypatch):
+    calls = []
+    responses = [_FakeResponse(500, body="sandbox uploads exceed 67108864 bytes")]
+    monkeypatch.setattr(rewards.aiohttp, "ClientSession", _fake_client_session(responses, calls))
+    monkeypatch.setattr(rewards, "validate_preflight_marker", lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="abc375_c.*HTTP 500.*uploads exceed") as error:
+        asyncio.run(
+            rewards.livecodebench_reward(
+                SimpleNamespace(),
+                _livecodebench_sample(),
+                {"url": "http://sandbox/submit", "retry_attempts": 1},
+            )
+        )
+
+    pickle.dumps(error.value)
+    assert len(calls) == 1
 
 
 def test_reward_accepts_batched_custom_rm_contract(monkeypatch):

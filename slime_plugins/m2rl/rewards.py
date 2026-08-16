@@ -265,11 +265,26 @@ async def livecodebench_reward(args: Any, sample: Sample, config: dict[str, Any]
     }
     timeout = aiohttp.ClientTimeout(total=float(config.get("request_timeout", 180)))
     concurrency = int(config.get("concurrency", 8))
+    retry_attempts = int(config.get("retry_attempts", 3))
+    retry_backoff_seconds = float(config.get("retry_backoff_seconds", 1))
+    if retry_attempts <= 0:
+        raise ValueError("LiveCodeBench retry_attempts must be positive.")
+    if retry_backoff_seconds < 0:
+        raise ValueError("LiveCodeBench retry_backoff_seconds must be non-negative.")
     async with _semaphore(concurrency):
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(str(url), json=payload) as response:
-                response.raise_for_status()
-                result = await response.json()
+            for attempt in range(retry_attempts):
+                async with session.post(str(url), json=payload) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        break
+                    body = (await response.text())[:4096]
+                    if response.status < 500 or attempt + 1 == retry_attempts:
+                        raise RuntimeError(
+                            f"SandboxFusion LiveCodeBench request failed for problem_id={problem_id!r}: "
+                            f"HTTP {response.status}: {body}"
+                        )
+                await asyncio.sleep(retry_backoff_seconds * 2**attempt)
     sample.metadata["sandbox_eval"] = _livecodebench_diagnostics(result, row)
     return float(result.get("accepted") is True)
 

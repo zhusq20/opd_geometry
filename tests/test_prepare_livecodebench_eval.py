@@ -12,6 +12,12 @@ import pytest
 
 from examples.optimizer_geometry import prepare_livecodebench_eval
 from examples.optimizer_geometry.prepare_livecodebench_eval import convert, decode_json, write_configs
+from examples.optimizer_geometry.validate_livecodebench_upload import (
+    MAX_COMPLETION_BYTES,
+    RUNNER_SUPPORT_BYTES,
+    max_required_upload_bytes,
+    required_upload_bytes,
+)
 
 
 NUM_GPUS = 0
@@ -57,6 +63,34 @@ def test_convert_preserves_private_tests_for_sandboxfusion():
 
     assert tests["inputs"] == ["1\n", "2\n"]
     assert tests["outputs"] == ["2\n", "4\n"]
+
+
+@pytest.mark.unit
+def test_livecodebench_upload_budget_includes_completion_and_runner_assets():
+    test_cases = {"input_output": json.dumps({"inputs": ["1\n"], "outputs": ["2\n"]})}
+    sandboxfusion_row = {"test": json.dumps(test_cases)}
+
+    assert required_upload_bytes(sandboxfusion_row) == (
+        len(json.dumps(test_cases).encode("utf-8")) + MAX_COMPLETION_BYTES + RUNNER_SUPPORT_BYTES
+    )
+
+
+@pytest.mark.unit
+def test_livecodebench_upload_scan_reports_largest_problem():
+    def row(problem_id, payload):
+        tests = {"input_output": json.dumps({"inputs": [payload], "outputs": [""]})}
+        sandboxfusion_row = {"test": json.dumps(tests)}
+        return {
+            "metadata": {
+                "question_id": problem_id,
+                "sandboxfusion_row": json.dumps(sandboxfusion_row),
+            }
+        }
+
+    maximum, problem_id = max_required_upload_bytes([row("small", "x"), row("large", "x" * 100)])
+
+    assert problem_id == "large"
+    assert maximum == required_upload_bytes(row("large", "x" * 100)["metadata"]["sandboxfusion_row"])
 
 
 @pytest.mark.unit
