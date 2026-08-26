@@ -121,5 +121,93 @@ def test_gpqa_conversion_is_seeded_and_preserves_all_choices():
     assert "Answer: $LETTER" in row["prompt"]
 
 
+@pytest.mark.unit
+def test_ifbench_conversion_preserves_official_constraint_metadata():
+    source = [
+        {
+            "key": "7",
+            "prompt": "Use the word geometry exactly twice.",
+            "instruction_id_list": ["count:keyword"],
+            "kwargs": [{"keyword": "geometry", "frequency": 2}],
+        }
+    ]
+
+    assert MODULE["ifbench_rows"](source) == [
+        {
+            "prompt": "Use the word geometry exactly twice.",
+            "label": None,
+            "data_source": "ifbench",
+            "metadata": {
+                "rm_type": "ifbench",
+                "record_id": 7,
+                "prompt_text": "Use the word geometry exactly twice.",
+                "instruction_id_list": ["count:keyword"],
+                "kwargs": [{"keyword": "geometry", "frequency": 2}],
+            },
+        }
+    ]
+
+
+@pytest.mark.unit
+def test_ifeval_conversion_preserves_official_constraint_metadata():
+    source = [
+        {
+            "key": 11,
+            "prompt": "Mention geometry.",
+            "instruction_id_list": ["keywords:existence"],
+            "kwargs": [{"keywords": ["geometry"]}],
+        }
+    ]
+
+    assert MODULE["ifeval_rows"](source) == [
+        {
+            "prompt": "Mention geometry.",
+            "label": None,
+            "data_source": "ifeval",
+            "metadata": {
+                "rm_type": "ifevalg",
+                "record_id": 11,
+                "prompt_text": "Mention geometry.",
+                "instruction_id_list": ["keywords:existence"],
+                "kwargs": [{"keywords": ["geometry"]}],
+            },
+        }
+    ]
+
+
+@pytest.mark.unit
+def test_instruction_following_eval_config_pairs_strict_ifeval_and_ifbench(tmp_path):
+    data_dir = tmp_path / "eval_data"
+    data_dir.mkdir()
+    (data_dir / "ifeval.parquet").touch()
+    (data_dir / "ifbench.parquet").touch()
+    config_dir = tmp_path / "if"
+
+    result = MODULE["write_instruction_following_eval_config"](data_dir, config_dir)
+
+    assert result["datasets"] == ["ifeval_strict_prompt", "ifbench_strict"]
+    assert result["mode"] == "strict_prompt_level"
+    config = yaml.safe_load((config_dir / "if_eval.yaml").read_text())
+    assert config["eval"]["defaults"] == {
+        "max_response_len": 32768,
+        "top_p": 1.0,
+        "n_samples_per_eval_prompt": 1,
+        "apply_chat_template": True,
+        "custom_rm_path": "slime_plugins.m2rl.rewards.reward",
+        "temperature": 0.0,
+    }
+    assert config["eval"]["datasets"] == [
+        {
+            "name": "ifeval_strict_prompt",
+            "path": str((data_dir / "ifeval.parquet").resolve()),
+            "rm_type": "ifevalg",
+        },
+        {
+            "name": "ifbench_strict",
+            "path": str((data_dir / "ifbench.parquet").resolve()),
+            "rm_type": "ifbench",
+        },
+    ]
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

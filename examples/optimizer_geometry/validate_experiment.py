@@ -36,6 +36,23 @@ def validate_url(value: str, label: str) -> None:
         raise ValueError(f"{label} must be an absolute HTTP(S) URL, got {value!r}.")
 
 
+def validate_nltk_resources() -> None:
+    import nltk
+
+    missing_resources = []
+    for resource in ("tokenizers/punkt", "tokenizers/punkt_tab"):
+        try:
+            nltk.data.find(resource)
+        except LookupError:
+            missing_resources.append(resource.rsplit("/", 1)[-1])
+    if missing_resources:
+        raise LookupError(
+            "Missing NLTK resources: "
+            + ", ".join(missing_resources)
+            + ". Run `python -m nltk.downloader punkt punkt_tab`."
+        )
+
+
 def validate_eval_config(
     path: Path | None,
     reward_config: dict,
@@ -70,6 +87,7 @@ def validate_eval_config(
         raise ValueError("eval.datasets must not be empty.")
 
     names: list[str] = []
+    uses_ifbench = False
     routes = reward_config.get("routes") or {}
     for raw in datasets:
         if not isinstance(raw, dict):
@@ -103,6 +121,7 @@ def validate_eval_config(
             raise ValueError(f"Evaluation dataset {name!r} has invalid temperature/top_p.")
 
         rm_type = str(entry.get("rm_type") or "").strip()
+        uses_ifbench = uses_ifbench or rm_type == "ifbench"
         if rm_type not in {"unit_test", "livecodebench"}:
             continue
         route = routes.get(rm_type) or (reward_config.get("code") if rm_type == "unit_test" else None) or {}
@@ -118,6 +137,19 @@ def validate_eval_config(
 
     if len(names) != len(set(names)):
         raise ValueError("Evaluation dataset names must be unique.")
+    if check_runtime_deps and uses_ifbench:
+        missing = [
+            module
+            for module in ("absl", "emoji", "immutabledict", "langdetect", "nltk", "syllapy", "unicodedata2")
+            if importlib.util.find_spec(module) is None
+        ]
+        if missing:
+            raise ImportError(
+                "Official IFBench dependencies are missing: "
+                + ", ".join(missing)
+                + ". Install examples/eval_multi_task/requirements_ifbench.txt."
+            )
+        validate_nltk_resources()
     return names
 
 
@@ -136,11 +168,13 @@ def validate(args: argparse.Namespace) -> dict:
             raise FileNotFoundError(f"{label} does not exist: {path}")
     if not (
         (args.load_checkpoint / "latest_checkpointed_iteration.txt").exists()
+        or (args.load_checkpoint / ".metadata").exists()
         or (args.load_checkpoint / "config.json").exists()
     ):
         raise FileNotFoundError(
-            "Megatron checkpoint must contain latest_checkpointed_iteration.txt "
-            f"(or be a supported HF directory with config.json): {args.load_checkpoint}"
+            "Megatron checkpoint must be a torch-dist root with latest_checkpointed_iteration.txt, "
+            "a resolved torch-dist iteration with .metadata, or a supported HF directory with "
+            f"config.json: {args.load_checkpoint}"
         )
 
     manifest = mapping_file(args.manifest)
@@ -264,20 +298,7 @@ def validate(args: argparse.Namespace) -> dict:
             raise ImportError(
                 "IFEvalG dependencies are missing: " + ", ".join(missing) + ". Rebuild the pinned environment."
             )
-        import nltk
-
-        missing_resources = []
-        for resource in ("tokenizers/punkt", "tokenizers/punkt_tab"):
-            try:
-                nltk.data.find(resource)
-            except LookupError:
-                missing_resources.append(resource.rsplit("/", 1)[-1])
-        if missing_resources:
-            raise LookupError(
-                "Missing NLTK resources: "
-                + ", ".join(missing_resources)
-                + ". Run `python -m nltk.downloader punkt punkt_tab`."
-            )
+        validate_nltk_resources()
 
     return {
         "optimizer": OPTIMIZERS[args.optimizer],

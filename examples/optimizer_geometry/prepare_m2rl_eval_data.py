@@ -2,9 +2,10 @@
 """Prepare the independent online-eval datasets used by the M2RL experiments.
 
 The optimizer-geometry study can evaluate math on AIME 2024, MATH-500, or both,
-and science on GPQA Diamond during training. GPQA is gated on Hugging Face;
-this script reads authentication only from ``HF_TOKEN`` (or the normal Hugging
-Face credential store) and never writes a credential.
+science on GPQA Diamond, and instruction following on official IFEval and
+IFBench during training. GPQA is gated on Hugging Face; this script reads
+authentication only from ``HF_TOKEN`` (or the normal Hugging Face credential
+store) and never writes a credential.
 """
 
 from __future__ import annotations
@@ -30,7 +31,13 @@ MATH500_ID = "HuggingFaceH4/MATH-500"
 # records this revision and the materialized Parquet SHA-256.
 MATH500_REVISION = "6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be"
 GPQA_ID = "Idavidrein/gpqa"
-EXPECTED_ROWS = {"aime24": 30, "math500": 500, "gpqa_diamond": 198}
+IFEVAL_ID = "google/IFEval"
+IFEVAL_REVISION = "966cd89545d6b6acfd7638bc708b98261ca58e84"
+IFBENCH_ID = "allenai/IFBench_test"
+IFBENCH_REVISION = "2e8a48de45ff3bf41242f927254ca81b59ca3ae2"
+IFBENCH_SCORER_REPOSITORY = "https://github.com/allenai/IFBench.git"
+IFBENCH_SCORER_REVISION = "1091c4c3de6c1f6ed12c012ed68f11ea450b0117"
+EXPECTED_ROWS = {"aime24": 30, "math500": 500, "gpqa_diamond": 198, "ifeval": 541, "ifbench": 300}
 MATH_EVAL_DATASETS = ("aime24", "math500")
 
 MATH_INSTRUCTION = (
@@ -123,6 +130,46 @@ def gpqa_diamond_rows(dataset: Any, seed: int) -> list[dict[str, Any]]:
             }
         )
     return output
+
+
+def ifbench_rows(dataset: Any) -> list[dict[str, Any]]:
+    """Convert the pinned official IFBench test split to Slime's eval schema."""
+
+    return [
+        {
+            "prompt": str(row["prompt"]),
+            "label": None,
+            "data_source": "ifbench",
+            "metadata": {
+                "rm_type": "ifbench",
+                "record_id": int(row["key"]),
+                "prompt_text": str(row["prompt"]),
+                "instruction_id_list": list(row["instruction_id_list"]),
+                "kwargs": list(row["kwargs"]),
+            },
+        }
+        for row in dataset
+    ]
+
+
+def ifeval_rows(dataset: Any) -> list[dict[str, Any]]:
+    """Convert the pinned official IFEval prompts to Slime's eval schema."""
+
+    return [
+        {
+            "prompt": str(row["prompt"]),
+            "label": None,
+            "data_source": "ifeval",
+            "metadata": {
+                "rm_type": "ifevalg",
+                "record_id": int(row["key"]),
+                "prompt_text": str(row["prompt"]),
+                "instruction_id_list": list(row["instruction_id_list"]),
+                "kwargs": list(row["kwargs"]),
+            },
+        }
+        for row in dataset
+    ]
 
 
 def atomic_write_parquet(rows: list[dict[str, Any]], path: Path) -> None:
@@ -220,6 +267,50 @@ def write_math_eval_configs(data_dir: Path, config_dir: Path, active_datasets: l
     }
 
 
+def write_instruction_following_eval_config(data_dir: Path, config_dir: Path) -> dict[str, Any]:
+    """Write the paired in-distribution and OOD strict-prompt evaluation config."""
+
+    dataset_configs = [
+        {
+            "name": "ifeval_strict_prompt",
+            "path": str((data_dir / "ifeval.parquet").resolve()),
+            "rm_type": "ifevalg",
+        },
+        {
+            "name": "ifbench_strict",
+            "path": str((data_dir / "ifbench.parquet").resolve()),
+            "rm_type": "ifbench",
+        },
+    ]
+    for dataset in dataset_configs:
+        data_path = Path(dataset["path"])
+        if not data_path.is_file():
+            raise FileNotFoundError(f"Instruction-following evaluation dataset is missing: {data_path}")
+
+    config_path = config_dir / "if_eval.yaml"
+    atomic_write_yaml(
+        {
+            "eval": {
+                "defaults": {
+                    "max_response_len": 32768,
+                    "top_p": 1.0,
+                    "n_samples_per_eval_prompt": 1,
+                    "apply_chat_template": True,
+                    "custom_rm_path": "slime_plugins.m2rl.rewards.reward",
+                    "temperature": 0.0,
+                },
+                "datasets": dataset_configs,
+            }
+        },
+        config_path,
+    )
+    return {
+        "config": str(config_path.resolve()),
+        "datasets": [dataset["name"] for dataset in dataset_configs],
+        "mode": "strict_prompt_level",
+    }
+
+
 def dataset_entry(name: str, path: Path, *, seed: int) -> dict[str, Any]:
     source = {
         "aime24": {
@@ -235,14 +326,38 @@ def dataset_entry(name: str, path: Path, *, seed: int) -> dict[str, Any]:
             "revision": MATH500_REVISION,
         },
         "gpqa_diamond": {"dataset_id": GPQA_ID, "config": "gpqa_diamond", "split": "train"},
+        "ifeval": {
+            "dataset_id": IFEVAL_ID,
+            "config": None,
+            "split": "train",
+            "revision": IFEVAL_REVISION,
+        },
+        "ifbench": {
+            "dataset_id": IFBENCH_ID,
+            "config": None,
+            "split": "train",
+            "revision": IFBENCH_REVISION,
+        },
     }[name]
-    return {
+    entry = {
         **source,
         "path": str(path.resolve()),
         "rows": parquet.ParquetFile(path).metadata.num_rows,
         "sha256": sha256_file(path),
         "seed": seed if name == "gpqa_diamond" else None,
     }
+    if name == "ifeval":
+        entry["scorer"] = {
+            "implementation": "slime_plugins.m2rl.ifevalg",
+            "mode": "strict_prompt_level",
+        }
+    elif name == "ifbench":
+        entry["scorer"] = {
+            "repository": IFBENCH_SCORER_REPOSITORY,
+            "revision": IFBENCH_SCORER_REVISION,
+            "mode": "strict_prompt_level",
+        }
+    return entry
 
 
 def prepare(args: argparse.Namespace) -> dict[str, Any]:
@@ -281,9 +396,27 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                         token=token,
                     )
                     rows = math500_rows(source)
-                else:
+                elif name == "gpqa_diamond":
                     source = load_dataset(GPQA_ID, "gpqa_diamond", split="train", token=token)
                     rows = gpqa_diamond_rows(source, args.seed)
+                elif name == "ifeval":
+                    source = load_dataset(
+                        IFEVAL_ID,
+                        split="train",
+                        revision=IFEVAL_REVISION,
+                        token=token,
+                    )
+                    rows = ifeval_rows(source)
+                elif name == "ifbench":
+                    source = load_dataset(
+                        IFBENCH_ID,
+                        split="train",
+                        revision=IFBENCH_REVISION,
+                        token=token,
+                    )
+                    rows = ifbench_rows(source)
+                else:
+                    raise AssertionError(f"Unhandled evaluation dataset: {name}")
             except Exception as exc:
                 if name == "gpqa_diamond":
                     raise RuntimeError("GPQA Diamond is gated. Accept its Hugging Face access terms, export HF_TOKEN in your shell, and rerun; the token is never stored by this script.") from exc
@@ -304,6 +437,11 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         )
         index_path.write_text(json.dumps(index, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+    if_eval_config_dir = getattr(args, "if_eval_config_dir", None)
+    if if_eval_config_dir is not None:
+        index["if_eval"] = write_instruction_following_eval_config(args.output_dir, if_eval_config_dir)
+        index_path.write_text(json.dumps(index, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
     return index
 
 
@@ -314,7 +452,7 @@ def parse_args() -> argparse.Namespace:
         "--datasets",
         nargs="+",
         choices=sorted(EXPECTED_ROWS),
-        default=["aime24", "math500", "gpqa_diamond"],
+        default=["aime24", "math500", "gpqa_diamond", "ifeval", "ifbench"],
     )
     parser.add_argument("--seed", type=int, default=42, help="Deterministic GPQA option-order seed.")
     parser.add_argument("--force", action="store_true")
@@ -329,6 +467,11 @@ def parse_args() -> argparse.Namespace:
         choices=MATH_EVAL_DATASETS,
         default=["math500"],
         help="Datasets included in the active math_eval.yaml alias.",
+    )
+    parser.add_argument(
+        "--if-eval-config-dir",
+        type=Path,
+        help="Write a paired IFEval-strict and IFBench-strict eval config in this directory.",
     )
     return parser.parse_args()
 

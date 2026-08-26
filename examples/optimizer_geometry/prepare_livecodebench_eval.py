@@ -21,6 +21,11 @@ from typing import Any
 import yaml
 from datasets import Dataset
 
+try:
+    from examples.optimizer_geometry.validate_livecodebench_upload import required_upload_bytes
+except ModuleNotFoundError:
+    from validate_livecodebench_upload import required_upload_bytes
+
 
 BASE_URL = "https://huggingface.co/datasets/livecodebench/code_generation_lite/resolve/main"
 VERSION_FILES = {
@@ -30,6 +35,7 @@ VERSION_FILES = {
     "release_v6": ["test.jsonl", "test2.jsonl", "test3.jsonl", "test4.jsonl", "test5.jsonl", "test6.jsonl"],
 }
 EXPECTED_ROWS = {"v5": 167, "v6": 175, "release_v5": 880, "release_v6": 1055}
+DEFAULT_ONLINE_MAX_UPLOAD_BYTES = 268_435_456
 
 
 def sha256_file(path: Path) -> str:
@@ -198,6 +204,31 @@ def balanced_subset(rows: list[dict[str, Any]], count: int, seed: int) -> list[d
     return sorted(selected, key=lambda item: item["metadata"]["question_id"])
 
 
+def upload_safe_candidates(
+    rows: list[dict[str, Any]],
+    max_upload_bytes: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Exclude online-eval rows that exceed the pinned SandboxFusion upload limit."""
+
+    if max_upload_bytes <= 0:
+        raise ValueError("--online-max-upload-bytes must be positive.")
+    safe = []
+    excluded = []
+    for row in rows:
+        metadata = row["metadata"]
+        required = required_upload_bytes(metadata["sandboxfusion_row"])
+        if required > max_upload_bytes:
+            excluded.append(
+                {
+                    "question_id": str(metadata["question_id"]),
+                    "required_upload_bytes": required,
+                }
+            )
+        else:
+            safe.append(row)
+    return safe, sorted(excluded, key=lambda item: item["question_id"])
+
+
 def atomic_parquet(rows: list[dict[str, Any]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.stem}.{os.getpid()}.tmp.parquet")
@@ -208,7 +239,16 @@ def atomic_parquet(rows: list[dict[str, Any]], path: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def write_configs(output_dir: Path, online_path: Path, final_path: Path) -> None:
+def write_configs(
+    output_dir: Path,
+    online_path: Path,
+    final_path: Path,
+    *,
+    config_suffix: str = "",
+) -> None:
+    dataset_suffix = config_suffix.removeprefix("_")
+    online_name = f"livecodebench_{dataset_suffix}_online" if dataset_suffix else "livecodebench_online"
+    final_name = f"livecodebench_{dataset_suffix}_final" if dataset_suffix else "livecodebench_final"
     common = {
         "apply_chat_template": True,
         "custom_rm_path": "slime_plugins.m2rl.rewards.reward",
@@ -218,17 +258,23 @@ def write_configs(output_dir: Path, online_path: Path, final_path: Path) -> None
     online = {
         "eval": {
             "defaults": {**common, "n_samples_per_eval_prompt": 1, "temperature": 0.0, "top_p": 1.0},
-            "datasets": [{"name": "livecodebench_online", "path": str(online_path.resolve()), "rm_type": "livecodebench"}],
+            "datasets": [{"name": online_name, "path": str(online_path.resolve()), "rm_type": "livecodebench"}],
         }
     }
     final = {
         "eval": {
             "defaults": {**common, "n_samples_per_eval_prompt": 10, "temperature": 0.2, "top_p": 0.95},
-            "datasets": [{"name": "livecodebench_final", "path": str(final_path.resolve()), "rm_type": "livecodebench"}],
+            "datasets": [{"name": final_name, "path": str(final_path.resolve()), "rm_type": "livecodebench"}],
         }
     }
-    (output_dir / "code_eval.yaml").write_text(yaml.safe_dump(online, sort_keys=False), encoding="utf-8")
-    (output_dir / "code_eval_final.yaml").write_text(yaml.safe_dump(final, sort_keys=False), encoding="utf-8")
+    (output_dir / f"code_eval{config_suffix}.yaml").write_text(
+        yaml.safe_dump(online, sort_keys=False),
+        encoding="utf-8",
+    )
+    (output_dir / f"code_eval_final{config_suffix}.yaml").write_text(
+        yaml.safe_dump(final, sort_keys=False),
+        encoding="utf-8",
+    )
 
 
 def load_version(
@@ -280,6 +326,9 @@ def load_version(
 
 
 def prepare(args: argparse.Namespace) -> dict[str, Any]:
+    config_suffix = getattr(args, "config_suffix", "")
+    if config_suffix and not re.fullmatch(r"_[a-z0-9]+", config_suffix):
+        raise ValueError("--config-suffix must be empty or match _[a-z0-9]+.")
     raw_dir = args.output_dir / "raw"
     online_version = args.online_version or args.version
     train_prompts = training_texts(args.training_data)
@@ -299,10 +348,23 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     final_path = args.output_dir / f"livecodebench_{args.version}.parquet"
     online_path = args.output_dir / f"livecodebench_{online_version}_online{args.online_samples}.parquet"
+    online_max_upload_bytes = getattr(args, "online_max_upload_bytes", None)
+    online_upload_exclusions: list[dict[str, Any]] = []
+    if online_max_upload_bytes is not None:
+        online_candidates, online_upload_exclusions = upload_safe_candidates(
+            online_candidates,
+            online_max_upload_bytes,
+        )
+    if args.online_samples <= 0:
+        raise ValueError("--online-samples must be positive.")
+    if args.online_samples > len(online_candidates):
+        raise ValueError(
+            f"Requested {args.online_samples} online rows, but only {len(online_candidates)} candidates remain."
+        )
     online_rows = balanced_subset(online_candidates, args.online_samples, args.seed)
     atomic_parquet(converted, final_path)
     atomic_parquet(online_rows, online_path)
-    write_configs(args.output_dir, online_path, final_path)
+    write_configs(args.output_dir, online_path, final_path, config_suffix=config_suffix)
     index = {
         "schema_version": 1,
         "dataset": "livecodebench/code_generation_lite",
@@ -314,6 +376,8 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         "online_exact_normalized_training_prompt_collisions": sorted(online_collisions),
         "online_rows": len(online_rows),
         "online_seed": args.seed,
+        "online_max_upload_bytes": online_max_upload_bytes,
+        "online_upload_exclusions": online_upload_exclusions,
         "sources": {"final": final_sources, "online": online_sources},
         "artifacts": {
             "final": {"path": str(final_path.resolve()), "sha256": sha256_file(final_path)},
@@ -324,28 +388,30 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             "final": {"n": 10, "temperature": 0.2, "top_p": 0.95, "purpose": "paper pass@k"},
         },
     }
-    benchmark_index_path = args.output_dir / "livecodebench_index.json"
+    benchmark_index_path = args.output_dir / f"livecodebench_index{config_suffix}.json"
     atomic_json(benchmark_index_path, index)
     single_task_index_path = args.output_dir.parent / "single_task_index.json"
     if single_task_index_path.is_file():
         single_task_index = json.loads(single_task_index_path.read_text(encoding="utf-8"))
         code = single_task_index.setdefault("tasks", {}).setdefault("code", {})
-        code.update(
-            {
-                "eval_config": str((args.output_dir / "code_eval.yaml").resolve()),
-                "eval_kind": "external_benchmark",
-                "eval_name": "livecodebench_online",
-                "eval_rm_type": "livecodebench",
-                "eval_rows": len(online_rows),
-                "eval_samples_per_prompt": 1,
-                "final_eval_config": str((args.output_dir / "code_eval_final.yaml").resolve()),
-                "final_eval_name": "livecodebench_final",
-                "final_eval_rows": len(converted),
-                "final_eval_samples_per_prompt": 10,
-                "benchmark_index": str(benchmark_index_path.resolve()),
-                "benchmark_index_sha256": sha256_file(benchmark_index_path),
-            }
-        )
+        evaluation = {
+            "eval_config": str((args.output_dir / f"code_eval{config_suffix}.yaml").resolve()),
+            "eval_kind": "external_benchmark",
+            "eval_name": f"livecodebench{config_suffix}_online",
+            "eval_rm_type": "livecodebench",
+            "eval_rows": len(online_rows),
+            "eval_samples_per_prompt": 1,
+            "final_eval_config": str((args.output_dir / f"code_eval_final{config_suffix}.yaml").resolve()),
+            "final_eval_name": f"livecodebench{config_suffix}_final",
+            "final_eval_rows": len(converted),
+            "final_eval_samples_per_prompt": 10,
+            "benchmark_index": str(benchmark_index_path.resolve()),
+            "benchmark_index_sha256": sha256_file(benchmark_index_path),
+        }
+        if config_suffix:
+            code.setdefault("additional_evaluations", {})[config_suffix.removeprefix("_")] = evaluation
+        else:
+            code.update(evaluation)
         atomic_json(single_task_index_path, single_task_index)
     return index
 
@@ -359,7 +425,18 @@ def parse_args() -> argparse.Namespace:
         choices=sorted(VERSION_FILES),
         help="Optional recent slice for checkpoint curves (for example v5 with final release_v5).",
     )
-    parser.add_argument("--online-samples", type=int, default=64)
+    parser.add_argument("--online-samples", type=int, default=128)
+    parser.add_argument(
+        "--online-max-upload-bytes",
+        type=int,
+        default=DEFAULT_ONLINE_MAX_UPLOAD_BYTES,
+        help="Exclude checkpoint-eval rows that exceed this SandboxFusion staging limit.",
+    )
+    parser.add_argument(
+        "--config-suffix",
+        default="",
+        help="Write an additional config/index family, for example _v6, without replacing the primary aliases.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--training-data", type=Path)
     return parser.parse_args()

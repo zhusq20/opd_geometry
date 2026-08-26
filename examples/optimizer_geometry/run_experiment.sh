@@ -23,6 +23,48 @@ export BATCH_PROFILE
 MODEL_CONFIG="${MODEL_CONFIG:-${SLIME_DIR}/scripts/models/qwen3-4B.sh}"
 HF_CHECKPOINT="${HF_CHECKPOINT:-/root/Qwen3-4B}"
 LOAD_CHECKPOINT="${LOAD_CHECKPOINT:-/root/Qwen3-4B_torch_dist}"
+LOAD_CHECKPOINT_STEP="${LOAD_CHECKPOINT_STEP:-}"
+if [[ -n "${LOAD_CHECKPOINT_STEP}" ]] && ! [[ "${LOAD_CHECKPOINT_STEP}" =~ ^[0-9]+$ ]]; then
+  echo "LOAD_CHECKPOINT_STEP must be a non-negative integer." >&2
+  exit 2
+fi
+if [[ -n "${LOAD_CHECKPOINT_STEP}" ]]; then
+  LOAD_CHECKPOINT_STEP="$((10#${LOAD_CHECKPOINT_STEP}))"
+fi
+if [[ -f "${LOAD_CHECKPOINT}/.metadata" ]]; then
+  checkpoint_iteration_name="$(basename -- "${LOAD_CHECKPOINT%/}")"
+  if [[ "${checkpoint_iteration_name}" =~ ^iter_([0-9]+)$ ]]; then
+    resolved_checkpoint_step="$((10#${BASH_REMATCH[1]}))"
+    if [[ -n "${LOAD_CHECKPOINT_STEP}" && "${LOAD_CHECKPOINT_STEP}" -ne "${resolved_checkpoint_step}" ]]; then
+      echo "LOAD_CHECKPOINT_STEP=${LOAD_CHECKPOINT_STEP} conflicts with ${LOAD_CHECKPOINT}." >&2
+      exit 2
+    fi
+    LOAD_CHECKPOINT_STEP="${resolved_checkpoint_step}"
+    LOAD_CHECKPOINT="$(cd -- "${LOAD_CHECKPOINT}/.." && pwd)"
+  elif [[ "${checkpoint_iteration_name}" == "release" ]]; then
+    if [[ -n "${LOAD_CHECKPOINT_STEP}" ]]; then
+      echo "LOAD_CHECKPOINT_STEP cannot be used with a release checkpoint: ${LOAD_CHECKPOINT}." >&2
+      exit 2
+    fi
+    checkpoint_save_root="$(cd -- "${LOAD_CHECKPOINT}/.." && pwd)"
+    checkpoint_marker="${checkpoint_save_root}/latest_checkpointed_iteration.txt"
+    if [[ ! -f "${checkpoint_marker}" || "$(<"${checkpoint_marker}")" != "release" ]]; then
+      echo "Release checkpoint is not selected by its save-root marker: ${LOAD_CHECKPOINT}." >&2
+      exit 2
+    fi
+    LOAD_CHECKPOINT="${checkpoint_save_root}"
+  else
+    echo "Resolved torch-dist checkpoint directory must be named iter_NNNNNNN or release: ${LOAD_CHECKPOINT}" >&2
+    exit 2
+  fi
+fi
+if [[ -n "${LOAD_CHECKPOINT_STEP}" ]]; then
+  fixed_checkpoint_dir="${LOAD_CHECKPOINT}/$(printf 'iter_%07d' "${LOAD_CHECKPOINT_STEP}")"
+  if [[ ! -f "${fixed_checkpoint_dir}/.metadata" || ! -f "${fixed_checkpoint_dir}/common.pt" ]]; then
+    echo "Fixed torch-dist checkpoint is incomplete: ${fixed_checkpoint_dir}" >&2
+    exit 2
+  fi
+fi
 DATA_MANIFEST="${DATA_MANIFEST:?Set DATA_MANIFEST to the generated multi-task manifest}"
 REWARD_CONFIG="${REWARD_CONFIG:-${EXAMPLE_DIR}/configs/rewards.example.yaml}"
 WORKPLACE_ASSISTANT_RESOURCES_SERVER_URL="${WORKPLACE_ASSISTANT_RESOURCES_SERVER_URL:-http://127.0.0.1:12000}"
@@ -31,7 +73,16 @@ PPO_CONFIG="${PPO_CONFIG:-${EXAMPLE_DIR}/configs/ppo_roles.yaml}"
 EVAL_CONFIG="${EVAL_CONFIG:-}"
 EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-}"
 EVAL_MAX_CONCURRENCY="${EVAL_MAX_CONCURRENCY:-}"
-if [[ "${TASK:-}" == "math" ]]; then
+DISABLE_EVAL="${DISABLE_EVAL:-0}"
+case "${DISABLE_EVAL}" in
+  0|1) ;;
+  *) echo "DISABLE_EVAL must be 0 or 1." >&2; exit 2 ;;
+esac
+if [[ "${DISABLE_EVAL}" == "1" ]]; then
+  EVAL_CONFIG=""
+  EVAL_MAX_RESPONSE_LEN=""
+  EVAL_MAX_CONCURRENCY=""
+elif [[ "${TASK:-}" == "math" ]]; then
   case "${ALGORITHM}" in
     grpo|ppo)
       EVAL_CONFIG="${EVAL_CONFIG:-${SLIME_DIR}/data/m2rl/single_task/math/math_eval_aime24_math500.yaml}"
@@ -238,9 +289,16 @@ GEOMETRY_MATRIX_SAMPLE_COUNT="${GEOMETRY_MATRIX_SAMPLE_COUNT:-1}"
 GEOMETRY_MATRIX_RANDOMIZED_RANK="${GEOMETRY_MATRIX_RANDOMIZED_RANK:-16}"
 GEOMETRY_CAPTURE_ROLLOUT_ENTROPY="${GEOMETRY_CAPTURE_ROLLOUT_ENTROPY:-1}"
 GEOMETRY_WANDB_GROUPS="${GEOMETRY_WANDB_GROUPS:-global,optimizer_branch/adam,optimizer_branch/sgd,optimizer_branch/muon_matrix,optimizer_branch/adam_fallback}"
+GEOMETRY_RAW_GRADIENT_PROBE_DIR="${GEOMETRY_RAW_GRADIENT_PROBE_DIR:-}"
+GEOMETRY_RAW_GRADIENT_PROBE_UPDATES="${GEOMETRY_RAW_GRADIENT_PROBE_UPDATES:-0}"
+GEOMETRY_RAW_GRADIENT_PROBE_ONLY="${GEOMETRY_RAW_GRADIENT_PROBE_ONLY:-0}"
 case "${GEOMETRY_CAPTURE_ROLLOUT_ENTROPY}" in
   0|1) ;;
   *) echo "GEOMETRY_CAPTURE_ROLLOUT_ENTROPY must be 0 or 1." >&2; exit 2 ;;
+esac
+case "${GEOMETRY_RAW_GRADIENT_PROBE_ONLY}" in
+  0|1) ;;
+  *) echo "GEOMETRY_RAW_GRADIENT_PROBE_ONLY must be 0 or 1." >&2; exit 2 ;;
 esac
 
 # These are protocol defaults for a launch that has not supplied the frozen
@@ -516,6 +574,9 @@ CKPT_ARGS=(
   --hf-checkpoint "${HF_CHECKPOINT}"
   --load "${LOAD_CHECKPOINT}"
 )
+if [[ -n "${LOAD_CHECKPOINT_STEP}" ]]; then
+  CKPT_ARGS+=(--ckpt-step "${LOAD_CHECKPOINT_STEP}")
+fi
 if [[ "${SAVE_CHECKPOINTS}" == "1" ]]; then
   CKPT_ARGS+=(--save "${RUN_DIR}/checkpoints" --save-interval "${SAVE_INTERVAL}")
 elif [[ "${FRESH_START}" == "0" ]]; then
@@ -590,6 +651,25 @@ GEOMETRY_ARGS=(
   --completion-marker-path "${COMPLETION_MARKER_PATH}"
   --custom-eval-rollout-log-function-path slime_plugins.geometry.forgetting.log_eval_and_forgetting
 )
+if [[ -n "${GEOMETRY_RAW_GRADIENT_PROBE_DIR}" ]]; then
+  if ! [[ "${GEOMETRY_RAW_GRADIENT_PROBE_UPDATES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "GEOMETRY_RAW_GRADIENT_PROBE_UPDATES must be positive when a probe directory is set." >&2
+    exit 2
+  fi
+  GEOMETRY_ARGS+=(
+    --geometry-raw-gradient-probe-dir "${GEOMETRY_RAW_GRADIENT_PROBE_DIR}"
+    --geometry-raw-gradient-probe-updates "${GEOMETRY_RAW_GRADIENT_PROBE_UPDATES}"
+  )
+  if [[ "${GEOMETRY_RAW_GRADIENT_PROBE_ONLY}" == "1" ]]; then
+    GEOMETRY_ARGS+=(--geometry-raw-gradient-probe-only)
+  fi
+elif [[ "${GEOMETRY_RAW_GRADIENT_PROBE_UPDATES}" != "0" ]]; then
+  echo "GEOMETRY_RAW_GRADIENT_PROBE_DIR is required when probe updates are non-zero." >&2
+  exit 2
+elif [[ "${GEOMETRY_RAW_GRADIENT_PROBE_ONLY}" == "1" ]]; then
+  echo "GEOMETRY_RAW_GRADIENT_PROBE_DIR is required in probe-only mode." >&2
+  exit 2
+fi
 if [[ "${GEOMETRY_CAPTURE_ROLLOUT_ENTROPY}" == "1" ]]; then
   GEOMETRY_ARGS+=(--use-rollout-entropy)
 fi
@@ -692,7 +772,7 @@ PROVENANCE_ARGS=(
   --input "${MODEL_CONFIG}"
   --input "${REWARD_CONFIG}"
   --checkpoint "${HF_CHECKPOINT}"
-  --checkpoint "${LOAD_CHECKPOINT}"
+  --checkpoint "${fixed_checkpoint_dir:-${LOAD_CHECKPOINT}}"
 )
 if [[ -n "${EVAL_CONFIG}" ]]; then
   PROVENANCE_ARGS+=(--input "${EVAL_CONFIG}")
@@ -707,7 +787,10 @@ fi
 if [[ -n "${EXPERIMENT_EVAL_INDEX:-}" && -f "${EXPERIMENT_EVAL_INDEX}" ]]; then
   PROVENANCE_ARGS+=(--input "${EXPERIMENT_EVAL_INDEX}")
 fi
-if [[ -f "${M2RL_SANDBOX_PREFLIGHT_MARKER}" ]]; then
+# Non-code runs do not depend on SandboxFusion. Record its attestation only when
+# the current launcher user can actually read it; code manifests already fail
+# closed in validate_experiment.py when the marker is missing or unreadable.
+if [[ -r "${M2RL_SANDBOX_PREFLIGHT_MARKER}" ]]; then
   PROVENANCE_ARGS+=(--input "${M2RL_SANDBOX_PREFLIGHT_MARKER}")
 fi
 if [[ -n "${TEACHER_CONFIG}" ]]; then
@@ -742,6 +825,11 @@ if [[ -z "${RAY_ADDRESS}" ]]; then
   fi
   MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
   RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
+  RAY_STORAGE_ARGS=()
+  if [[ -n "${RAY_OBJECT_SPILLING_DIR:-}" ]]; then
+    mkdir -p -- "${RAY_OBJECT_SPILLING_DIR}"
+    RAY_STORAGE_ARGS+=(--object-spilling-directory "${RAY_OBJECT_SPILLING_DIR}")
+  fi
   ray start \
     --head \
     --node-ip-address "${MASTER_ADDR}" \
@@ -749,6 +837,7 @@ if [[ -z "${RAY_ADDRESS}" ]]; then
     --disable-usage-stats \
     --dashboard-host 0.0.0.0 \
     --dashboard-port "${RAY_DASHBOARD_PORT}" \
+    "${RAY_STORAGE_ARGS[@]}" \
     --block &
   RAY_START_PID=$!
   RAY_ADDRESS="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}"
@@ -773,7 +862,7 @@ fi
 
 MEGATRON_DIR="${MEGATRON_DIR:-/root/Megatron-LM}"
 RUNTIME_PYTHONPATH="${SLIME_DIR}:${MEGATRON_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
-RUNTIME_ENV_JSON="$(python3 -c 'import json,os,sys; env={"PYTHONPATH": sys.argv[1], "CUDA_DEVICE_MAX_CONNECTIONS": "1", "PYTHONUNBUFFERED": "1"}; keys=("M2RL_EVAL_DIR", "OPD_TEACHER_URL", "QWEN3_8B_TEACHER_URL", "OPTIMIZER_GEOMETRY_CRITIC_LOAD", "OPTIMIZER_GEOMETRY_CRITIC_SAVE", "OPTIMIZER_GEOMETRY_CRITIC_LR", "OPTIMIZER_GEOMETRY_CRITIC_WEIGHT_DECAY", "OPTIMIZER_GEOMETRY_CRITIC_BETA2", "SANDBOXFUSION_BASE_URL", "M2RL_SANDBOX_PREFLIGHT_MARKER", "WANDB_API_KEY", "WANDB_BASE_URL"); env.update({key: os.environ[key] for key in keys if os.environ.get(key)}); print(json.dumps({"env_vars": env}))' "${RUNTIME_PYTHONPATH}")"
+RUNTIME_ENV_JSON="$(python3 -c 'import json,os,sys; env={"PYTHONPATH": sys.argv[1], "CUDA_DEVICE_MAX_CONNECTIONS": "1", "PYTHONUNBUFFERED": "1"}; keys=("M2RL_EVAL_DIR", "OPD_TEACHER_URL", "QWEN3_8B_TEACHER_URL", "OPTIMIZER_GEOMETRY_CRITIC_LOAD", "OPTIMIZER_GEOMETRY_CRITIC_SAVE", "OPTIMIZER_GEOMETRY_CRITIC_LR", "OPTIMIZER_GEOMETRY_CRITIC_WEIGHT_DECAY", "OPTIMIZER_GEOMETRY_CRITIC_BETA2", "SANDBOXFUSION_BASE_URL", "M2RL_SANDBOX_PREFLIGHT_MARKER", "SLIME_IFBENCH_REPO", "NLTK_DATA", "WANDB_API_KEY", "WANDB_BASE_URL"); env.update({key: os.environ[key] for key in keys if os.environ.get(key)}); print(json.dumps({"env_vars": env}))' "${RUNTIME_PYTHONPATH}")"
 
 set +e
 ray job submit \

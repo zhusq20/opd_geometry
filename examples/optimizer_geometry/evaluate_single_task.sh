@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Evaluate one Qwen3-1.7B checkpoint on a prepared math or code eval config.
+# Evaluate one Qwen3-1.7B checkpoint on a prepared single-task eval config.
 
 set -euo pipefail
 
@@ -7,14 +7,62 @@ EXAMPLE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SLIME_DIR="$(cd -- "${EXAMPLE_DIR}/../.." && pwd)"
 export PYTHONPATH="${SLIME_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 PROJECT_CHECKPOINT_ROOT="$(cd -- "${SLIME_DIR}/.." && pwd)/checkpoints"
+SHARED_CHECKPOINT_ROOT="$(cd -- "${SLIME_DIR}/../.." && pwd)/checkpoints"
 export SANDBOXFUSION_BASE_URL="${SANDBOXFUSION_BASE_URL:-http://127.0.0.1:8080}"
 SANDBOXFUSION_BASE_URL="${SANDBOXFUSION_BASE_URL%/}"
 export SANDBOXFUSION_BASE_URL
 export M2RL_SANDBOX_PREFLIGHT_MARKER="${M2RL_SANDBOX_PREFLIGHT_MARKER:-${SLIME_DIR}/data/m2rl/sandbox/sandboxfusion_preflight.json}"
 
+if [[ -d "${PROJECT_CHECKPOINT_ROOT}/Qwen3-1.7B" ]]; then
+  DEFAULT_CHECKPOINT_ROOT="${PROJECT_CHECKPOINT_ROOT}"
+else
+  DEFAULT_CHECKPOINT_ROOT="${SHARED_CHECKPOINT_ROOT}"
+fi
 MODEL_CONFIG="${MODEL_CONFIG:-${SLIME_DIR}/scripts/models/qwen3-1.7B.sh}"
-HF_CHECKPOINT="${HF_CHECKPOINT:-${PROJECT_CHECKPOINT_ROOT}/Qwen3-1.7B}"
+HF_CHECKPOINT="${HF_CHECKPOINT:-${DEFAULT_CHECKPOINT_ROOT}/Qwen3-1.7B}"
 LOAD_CHECKPOINT="${LOAD_CHECKPOINT:?Set LOAD_CHECKPOINT to the trained torch_dist checkpoint directory}"
+LOAD_CHECKPOINT_STEP="${LOAD_CHECKPOINT_STEP:-}"
+if [[ -n "${LOAD_CHECKPOINT_STEP}" ]] && ! [[ "${LOAD_CHECKPOINT_STEP}" =~ ^[0-9]+$ ]]; then
+  echo "LOAD_CHECKPOINT_STEP must be a non-negative integer." >&2
+  exit 2
+fi
+if [[ -n "${LOAD_CHECKPOINT_STEP}" ]]; then
+  LOAD_CHECKPOINT_STEP="$((10#${LOAD_CHECKPOINT_STEP}))"
+fi
+if [[ -f "${LOAD_CHECKPOINT}/.metadata" ]]; then
+  checkpoint_iteration_name="$(basename -- "${LOAD_CHECKPOINT%/}")"
+  if [[ "${checkpoint_iteration_name}" =~ ^iter_([0-9]+)$ ]]; then
+    resolved_checkpoint_step="$((10#${BASH_REMATCH[1]}))"
+    if [[ -n "${LOAD_CHECKPOINT_STEP}" && "${LOAD_CHECKPOINT_STEP}" -ne "${resolved_checkpoint_step}" ]]; then
+      echo "LOAD_CHECKPOINT_STEP=${LOAD_CHECKPOINT_STEP} conflicts with ${LOAD_CHECKPOINT}." >&2
+      exit 2
+    fi
+    LOAD_CHECKPOINT_STEP="${resolved_checkpoint_step}"
+    LOAD_CHECKPOINT="$(cd -- "${LOAD_CHECKPOINT}/.." && pwd)"
+  elif [[ "${checkpoint_iteration_name}" == "release" ]]; then
+    if [[ -n "${LOAD_CHECKPOINT_STEP}" ]]; then
+      echo "LOAD_CHECKPOINT_STEP cannot be used with a release checkpoint: ${LOAD_CHECKPOINT}." >&2
+      exit 2
+    fi
+    checkpoint_save_root="$(cd -- "${LOAD_CHECKPOINT}/.." && pwd)"
+    checkpoint_marker="${checkpoint_save_root}/latest_checkpointed_iteration.txt"
+    if [[ ! -f "${checkpoint_marker}" || "$(<"${checkpoint_marker}")" != "release" ]]; then
+      echo "Release checkpoint is not selected by its save-root marker: ${LOAD_CHECKPOINT}." >&2
+      exit 2
+    fi
+    LOAD_CHECKPOINT="${checkpoint_save_root}"
+  else
+    echo "Resolved torch-dist checkpoint directory must be named iter_NNNNNNN or release: ${LOAD_CHECKPOINT}" >&2
+    exit 2
+  fi
+fi
+if [[ -n "${LOAD_CHECKPOINT_STEP}" ]]; then
+  fixed_checkpoint_dir="${LOAD_CHECKPOINT}/$(printf 'iter_%07d' "${LOAD_CHECKPOINT_STEP}")"
+  if [[ ! -f "${fixed_checkpoint_dir}/.metadata" || ! -f "${fixed_checkpoint_dir}/common.pt" ]]; then
+    echo "Invalid fixed torch-dist checkpoint step: ${LOAD_CHECKPOINT_STEP}." >&2
+    exit 2
+  fi
+fi
 DATA_MANIFEST="${DATA_MANIFEST:?Set DATA_MANIFEST to the task on-policy manifest}"
 EVAL_CONFIG="${EVAL_CONFIG:?Set EVAL_CONFIG to the task eval YAML}"
 REWARD_CONFIG="${REWARD_CONFIG:-${EXAMPLE_DIR}/configs/rewards.example.yaml}"
@@ -27,9 +75,14 @@ COMPLETION_MARKER_PATH="${COMPLETION_MARKER_PATH:-${OUTPUT_DIR}/run_complete.jso
 USE_WANDB="${USE_WANDB:-1}"
 FRESH_EVAL="${FRESH_EVAL:-1}"
 DRY_RUN="${DRY_RUN:-0}"
-case "${USE_WANDB}:${FRESH_EVAL}:${DRY_RUN}" in
-  [01]:[01]:[01]) ;;
-  *) echo "USE_WANDB, FRESH_EVAL, and DRY_RUN must each be 0 or 1." >&2; exit 2 ;;
+ALLOW_MIXED_EVAL_RESPONSE_LEN="${ALLOW_MIXED_EVAL_RESPONSE_LEN:-0}"
+APPLY_CHAT_TEMPLATE_KWARGS="${APPLY_CHAT_TEMPLATE_KWARGS:-}"
+if [[ -z "${APPLY_CHAT_TEMPLATE_KWARGS}" ]]; then
+  APPLY_CHAT_TEMPLATE_KWARGS='{"enable_thinking":false}'
+fi
+case "${USE_WANDB}:${FRESH_EVAL}:${DRY_RUN}:${ALLOW_MIXED_EVAL_RESPONSE_LEN}" in
+  [01]:[01]:[01]:[01]) ;;
+  *) echo "USE_WANDB, FRESH_EVAL, DRY_RUN, and ALLOW_MIXED_EVAL_RESPONSE_LEN must each be 0 or 1." >&2; exit 2 ;;
 esac
 
 NUM_GPUS="${NUM_GPUS:-4}"
@@ -42,6 +95,7 @@ MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-9216}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-44}"
 case "${TASK:-evaluation}" in
   math) DEFAULT_EVAL_MAX_RESPONSE_LEN=32768 ;;
+  logic|logic_kk|kk) DEFAULT_EVAL_MAX_RESPONSE_LEN=8192 ;;
   *) DEFAULT_EVAL_MAX_RESPONSE_LEN=16384 ;;
 esac
 EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-${DEFAULT_EVAL_MAX_RESPONSE_LEN}}"
@@ -72,8 +126,10 @@ VALIDATE_ARGS=(
   --load-checkpoint "${LOAD_CHECKPOINT}"
   --reward-config "${REWARD_CONFIG}"
   --eval-config "${EVAL_CONFIG}"
-  --expected-eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}"
 )
+if [[ "${ALLOW_MIXED_EVAL_RESPONSE_LEN}" == "0" ]]; then
+  VALIDATE_ARGS+=(--expected-eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}")
+fi
 if [[ "${CHECK_RUNTIME_DEPS:-1}" == "1" ]]; then
   VALIDATE_ARGS+=(--check-runtime-deps)
 fi
@@ -112,10 +168,13 @@ TRAIN_CMD=(
   --metadata-key metadata
   --tool-key tools
   --apply-chat-template
+  --apply-chat-template-kwargs "${APPLY_CHAT_TEMPLATE_KWARGS}"
   --num-rollout 0
-  --rollout-batch-size 1
+  --rollout-batch-size "${NUM_GPUS}"
   --n-samples-per-prompt 1
-  --global-batch-size 1
+  # Evaluation still initializes the data-parallel training actors, so this
+  # placeholder batch must be divisible by their world size.
+  --global-batch-size "${NUM_GPUS}"
   --eval-config "${EVAL_CONFIG}"
   --eval-interval 1
   --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}"
@@ -157,6 +216,9 @@ TRAIN_CMD=(
   --sglang-enable-deterministic-inference
   --log-passrate
 )
+if [[ -n "${LOAD_CHECKPOINT_STEP}" ]]; then
+  TRAIN_CMD+=(--ckpt-step "${LOAD_CHECKPOINT_STEP}")
+fi
 if [[ "${TP_SIZE}" -gt 1 ]]; then
   TRAIN_CMD+=(--sequence-parallel)
 fi
@@ -199,7 +261,7 @@ PROVENANCE_ARGS=(
   --input "${MODEL_CONFIG}"
   --input "${REWARD_CONFIG}"
   --checkpoint "${HF_CHECKPOINT}"
-  --checkpoint "${LOAD_CHECKPOINT}"
+  --checkpoint "${fixed_checkpoint_dir:-${LOAD_CHECKPOINT}}"
 )
 AUTO_EVAL_INDEX="$(dirname -- "${EVAL_CONFIG}")/livecodebench_index.json"
 if [[ -f "${AUTO_EVAL_INDEX}" ]]; then
@@ -211,7 +273,9 @@ fi
 if [[ -n "${EXPERIMENT_EVAL_INDEX:-}" && -f "${EXPERIMENT_EVAL_INDEX}" ]]; then
   PROVENANCE_ARGS+=(--input "${EXPERIMENT_EVAL_INDEX}")
 fi
-if [[ -f "${M2RL_SANDBOX_PREFLIGHT_MARKER}" ]]; then
+# Sandbox-free eval configs must not acquire an unreadable code-sandbox
+# attestation as an unrelated provenance dependency.
+if [[ -r "${M2RL_SANDBOX_PREFLIGHT_MARKER}" ]]; then
   PROVENANCE_ARGS+=(--input "${M2RL_SANDBOX_PREFLIGHT_MARKER}")
 fi
 if [[ "${FRESH_EVAL}" == "0" ]]; then
@@ -233,6 +297,11 @@ trap cleanup EXIT
 if [[ -z "${RAY_ADDRESS}" ]]; then
   MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
   RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
+  RAY_STORAGE_ARGS=()
+  if [[ -n "${RAY_OBJECT_SPILLING_DIR:-}" ]]; then
+    mkdir -p -- "${RAY_OBJECT_SPILLING_DIR}"
+    RAY_STORAGE_ARGS+=(--object-spilling-directory "${RAY_OBJECT_SPILLING_DIR}")
+  fi
   ray start \
     --head \
     --node-ip-address "${MASTER_ADDR}" \
@@ -240,6 +309,7 @@ if [[ -z "${RAY_ADDRESS}" ]]; then
     --disable-usage-stats \
     --dashboard-host 0.0.0.0 \
     --dashboard-port "${RAY_DASHBOARD_PORT}" \
+    "${RAY_STORAGE_ARGS[@]}" \
     --block &
   RAY_START_PID=$!
   RAY_ADDRESS="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}"

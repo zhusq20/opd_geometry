@@ -218,7 +218,9 @@ def create_training_models(args, pgs, rollout_manager, actor_cls=None):
     if args.start_rollout_id is None:
         args.start_rollout_id = start_rollout_ids[0]
 
-    if args.rollout_global_dataset:
+    # Eval-only runs retain the checkpoint-derived rollout id for metric
+    # versioning, but they never consume or advance the training prompt cursor.
+    if args.rollout_global_dataset and args.num_rollout != 0:
         ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
 
     return actor_model, critic_model

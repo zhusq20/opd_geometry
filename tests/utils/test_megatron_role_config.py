@@ -226,3 +226,37 @@ class TestMegatronRoleConfig:
         assert actor_model.args.lr == 1e-6
         assert actor_model.create_calls[0]["args"].lr == 1e-6
         assert args.start_rollout_id == 7
+
+    @pytest.mark.parametrize(("num_rollout", "expected_load_ids"), [(0, []), (301, [299])])
+    def test_global_dataset_sampler_load_is_skipped_only_for_eval_only(
+        self, monkeypatch, num_rollout, expected_load_ids
+    ):
+        from slime.ray import placement_group as placement_group_module
+
+        args = _base_args(rollout_global_dataset=True, num_rollout=num_rollout)
+        actor_model = object()
+        load_ids = []
+
+        class RemoteLoad:
+            def remote(self, rollout_id):
+                load_ids.append(rollout_id)
+                return rollout_id
+
+        rollout_manager = Namespace(load=RemoteLoad())
+        monkeypatch.setattr(
+            placement_group_module,
+            "create_actor_model",
+            lambda *args, **kwargs: (actor_model, [300]),
+        )
+        monkeypatch.setattr(placement_group_module.ray, "get", lambda value: value)
+
+        created_actor, critic_model = placement_group_module.create_training_models(
+            args,
+            {"actor": None, "critic": None},
+            rollout_manager,
+        )
+
+        assert created_actor is actor_model
+        assert critic_model is None
+        assert args.start_rollout_id == 300
+        assert load_ids == expected_load_ids

@@ -19,6 +19,8 @@ MIXED_LOSS_SWEEP = REPO / "examples" / "optimizer_geometry" / "run_mixed_loss_sw
 SINGLE_TASK_RL = REPO / "examples" / "optimizer_geometry" / "run_single_task_rl.sh"
 SINGLE_TASK_OPD = REPO / "examples" / "optimizer_geometry" / "run_single_task_opd.sh"
 SINGLE_TASK_MATRIX = REPO / "examples" / "optimizer_geometry" / "run_single_task_matrix.sh"
+IF_GRPO = REPO / "examples" / "optimizer_geometry" / "run_if_grpo.sh"
+IF_PPO = REPO / "examples" / "optimizer_geometry" / "run_if_ppo.sh"
 OPD_CELL_SCRIPTS = [
     (task, optimizer, REPO / "examples" / "optimizer_geometry" / f"run_opd_{task}_{optimizer}.sh")
     for task in ("math", "code", "science")
@@ -142,6 +144,34 @@ def test_launcher_dry_run_covers_full_matrix(tmp_path, optimizer, algorithm):
         assert "--custom-loss-function-path slime_plugins.m2rl.hybrid.hybrid_loss_function" in result.stdout
         assert "--loss-mask-type qwen3" in result.stdout
         assert "--n-samples-per-prompt 1" in result.stdout
+
+
+@pytest.mark.unit
+def test_launcher_accepts_direct_release_checkpoint(tmp_path):
+    env = os.environ.copy()
+    env.update(_fixtures(tmp_path))
+    checkpoint_root = Path(env["LOAD_CHECKPOINT"])
+    release = checkpoint_root / "release"
+    release.mkdir()
+    (release / ".metadata").write_bytes(b"synthetic-metadata")
+    (release / "common.pt").write_bytes(b"synthetic-common")
+    (checkpoint_root / "latest_checkpointed_iteration.txt").write_text("release\n")
+    env.update(
+        {
+            "LOAD_CHECKPOINT": str(release),
+            "OPTIMIZER": "adamw",
+            "ALGORITHM": "grpo",
+            "DRY_RUN": "1",
+            "CHECK_RUNTIME_DEPS": "0",
+            "RUN_NAME": "release_checkpoint",
+        }
+    )
+
+    result = subprocess.run(["bash", str(LAUNCHER)], env=env, text=True, capture_output=True)
+
+    assert result.returncode == 0, result.stderr
+    assert f"--load {checkpoint_root}" in result.stdout
+    assert "--ckpt-step" not in result.stdout
 
 
 @pytest.mark.unit
@@ -508,7 +538,10 @@ def test_qwen_preset_rejects_overlapping_student_and_teacher_gpus(tmp_path):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(("task", "eval_max_response_len"), [(None, 16384), ("math", 32768)])
+@pytest.mark.parametrize(
+    ("task", "eval_max_response_len"),
+    [(None, 16384), ("math", 32768), ("logic", 8192)],
+)
 def test_single_task_eval_launcher_dry_run(tmp_path, task, eval_max_response_len):
     env = os.environ.copy()
     env.update(_fixtures(tmp_path))
@@ -545,10 +578,56 @@ def test_single_task_eval_launcher_dry_run(tmp_path, task, eval_max_response_len
     assert result.returncode == 0, result.stderr
     assert "Evaluation command:" in result.stdout
     assert "--num-rollout 0" in result.stdout
+    assert r"--apply-chat-template-kwargs \{\"enable_thinking\":false\}" in result.stdout
+    assert "--rollout-batch-size 2" in result.stdout
+    assert "--global-batch-size 2" in result.stdout
     assert f"--eval-config {eval_config}" in result.stdout
     assert f"--eval-max-response-len {eval_max_response_len}" in result.stdout
     assert "--eval-max-concurrency 48" in result.stdout
     assert "--sglang-max-running-requests 44" in result.stdout
+
+
+@pytest.mark.unit
+def test_eval_launcher_accepts_direct_release_checkpoint(tmp_path):
+    env = os.environ.copy()
+    env.update(_fixtures(tmp_path))
+    checkpoint_root = Path(env["LOAD_CHECKPOINT"])
+    release = checkpoint_root / "release"
+    release.mkdir()
+    (release / ".metadata").write_bytes(b"synthetic-metadata")
+    (release / "common.pt").write_bytes(b"synthetic-common")
+    (checkpoint_root / "latest_checkpointed_iteration.txt").write_text("release\n")
+    eval_config = tmp_path / "eval.yaml"
+    eval_config.write_text(
+        yaml.safe_dump(
+            {
+                "eval": {
+                    "defaults": {"max_response_len": 16384},
+                    "datasets": [
+                        {
+                            "name": "math",
+                            "path": str(tmp_path / "math.jsonl"),
+                            "rm_type": "deepscaler",
+                        }
+                    ],
+                }
+            }
+        )
+    )
+    env.update(
+        {
+            "LOAD_CHECKPOINT": str(release),
+            "EVAL_CONFIG": str(eval_config),
+            "DRY_RUN": "1",
+            "CHECK_RUNTIME_DEPS": "0",
+        }
+    )
+
+    result = subprocess.run(["bash", str(EVAL_LAUNCHER)], env=env, text=True, capture_output=True)
+
+    assert result.returncode == 0, result.stderr
+    assert f"--load {checkpoint_root}" in result.stdout
+    assert "--ckpt-step" not in result.stdout
 
 
 @pytest.mark.unit
@@ -734,6 +813,7 @@ def test_single_task_three_optimizer_wrappers(tmp_path, script, expected_algorit
         ({"MAX_TOKENS_PER_GPU": "10239"}, "must be at least prompt+response=10240"),
         ({"EVAL_INTERVAL": "320"}, "require EVAL_INTERVAL=50"),
         ({"SAVE_INTERVAL": "320"}, "require SAVE_INTERVAL=100"),
+        ({"ADAMW_LR": "2.5e-7"}, "require ADAMW_LR=1e-6"),
     ],
 )
 def test_single_task_rl_rejects_non_frozen_seed_or_run_length(tmp_path, invalid_env, expected_error):
@@ -756,6 +836,7 @@ def test_single_task_rl_rejects_non_frozen_seed_or_run_length(tmp_path, invalid_
         "MAX_TOKENS_PER_GPU",
         "EVAL_INTERVAL",
         "SAVE_INTERVAL",
+        "ADAMW_LR",
     ):
         env.pop(name, None)
     env.update(
@@ -772,6 +853,174 @@ def test_single_task_rl_rejects_non_frozen_seed_or_run_length(tmp_path, invalid_
 
     assert result.returncode == 2
     assert expected_error in result.stderr
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("task", "algorithm", "expected_lr", "expected_samples"),
+    [
+        ("math", "grpo", "1e-6", ""),
+        ("code", "grpo", "1e-6", "16"),
+        ("code", "ppo", "", ""),
+        ("science", "grpo", "1e-6", ""),
+        ("if", "grpo", "1e-6", "16"),
+        ("if", "ppo", "", ""),
+        ("logic", "grpo", "1e-6", "16"),
+        ("logic", "ppo", "", ""),
+    ],
+)
+def test_single_task_rl_freezes_grpo_adamw_lr_and_sparse_reward_samples(
+    tmp_path,
+    task,
+    algorithm,
+    expected_lr,
+    expected_samples,
+):
+    config_root = tmp_path / "single_task"
+    task_dir = config_root / task
+    task_dir.mkdir(parents=True)
+    (task_dir / f"{task}_on_policy.yaml").write_text("sources: []\n")
+    eval_name = "math_eval_aime24_math500.yaml" if task == "math" else f"{task}_eval.yaml"
+    (task_dir / eval_name).write_text("eval: {}\n")
+    (config_root / "single_task_index.json").write_text("{}\n")
+    fake_launcher = tmp_path / "launcher.sh"
+    fake_launcher.write_text(
+        'printf "%s|%s|%s|%s\n" "$TASK" "$ALGORITHM" "${ADAMW_LR:-}" ' '"${N_SAMPLES_PER_PROMPT:-}"\n'
+    )
+    env = os.environ.copy()
+    env.pop("ADAMW_LR", None)
+    env.pop("N_SAMPLES_PER_PROMPT", None)
+    env.update(
+        {
+            "TASK": task,
+            "RL_ALGORITHM": algorithm,
+            "SINGLE_TASK_CONFIG_ROOT": str(config_root),
+            "EXPERIMENT_LAUNCHER": str(fake_launcher),
+            "OPTIMIZERS": "adamw",
+        }
+    )
+
+    result = subprocess.run(["bash", str(SINGLE_TASK_RL)], env=env, text=True, capture_output=True)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == f"{task}|{algorithm}|{expected_lr}|{expected_samples}"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("task", ["code", "if", "logic"])
+def test_single_task_sparse_reward_grpo_rejects_non_frozen_sample_count(tmp_path, task):
+    config_root = tmp_path / "single_task"
+    task_dir = config_root / task
+    task_dir.mkdir(parents=True)
+    (task_dir / f"{task}_on_policy.yaml").write_text("sources: []\n")
+    (task_dir / f"{task}_eval.yaml").write_text("eval: {}\n")
+    (config_root / "single_task_index.json").write_text("{}\n")
+    fake_launcher = tmp_path / "launcher.sh"
+    fake_launcher.write_text("exit 0\n")
+    env = os.environ.copy()
+    env.update(
+        {
+            "TASK": task,
+            "RL_ALGORITHM": "grpo",
+            "N_SAMPLES_PER_PROMPT": "4",
+            "SINGLE_TASK_CONFIG_ROOT": str(config_root),
+            "EXPERIMENT_LAUNCHER": str(fake_launcher),
+            "OPTIMIZERS": "adamw",
+        }
+    )
+
+    result = subprocess.run(["bash", str(SINGLE_TASK_RL)], env=env, text=True, capture_output=True)
+
+    assert result.returncode == 2
+    assert "requires N_SAMPLES_PER_PROMPT=16" in result.stderr
+
+
+@pytest.mark.unit
+def test_single_task_logic_rl_forwards_pinned_data_index_to_provenance(tmp_path):
+    config_root = tmp_path / "single_task"
+    task_dir = config_root / "logic"
+    task_dir.mkdir(parents=True)
+    (task_dir / "logic_on_policy.yaml").write_text("sources: []\n")
+    (task_dir / "logic_eval.yaml").write_text("eval: {}\n")
+    (config_root / "single_task_index.json").write_text("{}\n")
+    data_index = tmp_path / "logic_kk" / "logic_data_index.json"
+    data_index.parent.mkdir()
+    data_index.write_text("{}\n")
+    fake_launcher = tmp_path / "launcher.sh"
+    fake_launcher.write_text('printf "%s|%s\n" "$TASK" "$EXPERIMENT_EVAL_INDEX"\n')
+    env = os.environ.copy()
+    env.pop("EXPERIMENT_EVAL_INDEX", None)
+    env.update(
+        {
+            "TASK": "logic_kk",
+            "SINGLE_TASK_CONFIG_ROOT": str(config_root),
+            "EXPERIMENT_LAUNCHER": str(fake_launcher),
+            "OPTIMIZERS": "adamw",
+        }
+    )
+
+    result = subprocess.run(["bash", str(SINGLE_TASK_RL)], env=env, text=True, capture_output=True)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == f"logic|{config_root / '../logic_kk/logic_data_index.json'}"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("script", "algorithm", "samples", "global_batch", "actor_lr"),
+    [
+        (IF_GRPO, "grpo", "16", "256", "1e-6"),
+        (IF_PPO, "ppo", "4", "64", "2.5e-7"),
+    ],
+)
+def test_frozen_if_grpo_and_ppo_entrypoints(
+    tmp_path,
+    script,
+    algorithm,
+    samples,
+    global_batch,
+    actor_lr,
+):
+    config_root = tmp_path / "single_task"
+    task_dir = config_root / "if"
+    task_dir.mkdir(parents=True)
+    (task_dir / "if_on_policy.yaml").write_text("sources: []\n")
+    eval_config = task_dir / "if_eval.yaml"
+    eval_config.write_text("eval: {}\n")
+    (config_root / "single_task_index.json").write_text("{}\n")
+    fake_launcher = tmp_path / "launcher.sh"
+    fake_launcher.write_text(
+        'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\n" '
+        '"$TASK" "$ALGORITHM" "$OPTIMIZER" "$SEED" "$BATCH_PROFILE" '
+        '"$ROLLOUT_BATCH_SIZE" "$N_SAMPLES_PER_PROMPT" "$GLOBAL_BATCH_SIZE" "$NUM_EPOCH" '
+        '"$MAX_PROMPT_LEN" "$MAX_RESPONSE_LEN" "$MAX_TOKENS_PER_GPU" "$EVAL_CONFIG" '
+        '"$EVAL_MAX_RESPONSE_LEN" "$SGLANG_MAX_RUNNING_REQUESTS" "$ADAMW_LR" '
+        '"$APPLY_CHAT_TEMPLATE_KWARGS" "$REQUIRE_EVAL"\n'
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "TASK": "science",
+            "RL_ALGORITHM": "ppo" if algorithm == "grpo" else "grpo",
+            "OPTIMIZERS": "adamw sgd muon",
+            "SEED": "99",
+            "SEEDS": "98 99",
+            "NUM_ROLLOUT": "10",
+            "TARGET_PROMPT_BUDGET": "160",
+            "BATCH_PROFILE": "reference256",
+            "SINGLE_TASK_CONFIG_ROOT": str(config_root),
+            "EXPERIMENT_LAUNCHER": str(fake_launcher),
+        }
+    )
+
+    result = subprocess.run(["bash", str(script)], env=env, text=True, capture_output=True)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == (
+        f"if|{algorithm}|adamw|42|responsive16|16|{samples}|{global_batch}|1|2048|8192|10240|"
+        f"{eval_config}|32768|12|{actor_lr}|"
+        '{"enable_thinking":false}|1'
+    )
 
 
 @pytest.mark.unit
@@ -807,6 +1056,34 @@ def test_single_task_matrix_defaults_to_seed_42_and_one_dataset_epoch(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert f"math|grpo|42|1|{combined_eval}|8192|10240|12" in result.stdout
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("task", ["code", "logic"])
+def test_single_task_matrix_sparse_grpo_uses_requested_lr_and_group_size(tmp_path, task):
+    config_root = tmp_path / "single_task"
+    task_dir = config_root / task
+    task_dir.mkdir(parents=True)
+    (task_dir / f"{task}_on_policy.yaml").write_text("sources: []\n")
+    (task_dir / f"{task}_eval.yaml").write_text("eval: {}\n")
+    fake_launcher = tmp_path / "launcher.sh"
+    fake_launcher.write_text('printf "%s|%s|%s|%s\n" "$TASK" "$ALGORITHM" "$ADAMW_LR" ' '"$N_SAMPLES_PER_PROMPT"\n')
+    env = os.environ.copy()
+    env.update(
+        {
+            "SINGLE_TASK_CONFIG_ROOT": str(config_root),
+            "EXPERIMENT_LAUNCHER": str(fake_launcher),
+            "TASKS": task,
+            "TEACHERS": "qwen3-8b",
+            "ALGORITHMS": "grpo",
+            "OPTIMIZERS": "adamw",
+        }
+    )
+
+    result = subprocess.run(["bash", str(SINGLE_TASK_MATRIX)], env=env, text=True, capture_output=True)
+
+    assert result.returncode == 0, result.stderr
+    assert f"{task}|grpo|1e-6|16" in result.stdout
 
 
 @pytest.mark.unit
@@ -848,9 +1125,7 @@ def test_single_task_math_rl_uses_8k_train_and_32k_combined_eval_rollouts(tmp_pa
     result = subprocess.run(["bash", str(SINGLE_TASK_RL)], env=env, text=True, capture_output=True)
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[-1] == (
-        f"{algorithm}|{combined_eval}|8192|10240|12|32768|48|50|100"
-    )
+    assert result.stdout.splitlines()[-1] == (f"{algorithm}|{combined_eval}|8192|10240|12|32768|48|50|100")
 
 
 @pytest.mark.unit

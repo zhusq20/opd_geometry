@@ -14,7 +14,9 @@ from examples.optimizer_geometry import prepare_livecodebench_eval
 from examples.optimizer_geometry.prepare_livecodebench_eval import convert, decode_json, write_configs
 from examples.optimizer_geometry.validate_livecodebench_upload import (
     MAX_COMPLETION_BYTES,
+    MAX_TEST_PAYLOAD_BYTES,
     RUNNER_SUPPORT_BYTES,
+    encoded_test_payload_bytes,
     max_required_upload_bytes,
     required_upload_bytes,
 )
@@ -73,6 +75,8 @@ def test_livecodebench_upload_budget_includes_completion_and_runner_assets():
     assert required_upload_bytes(sandboxfusion_row) == (
         len(json.dumps(test_cases).encode("utf-8")) + MAX_COMPLETION_BYTES + RUNNER_SUPPORT_BYTES
     )
+    assert encoded_test_payload_bytes(sandboxfusion_row) == len(sandboxfusion_row["test"].encode("utf-8"))
+    assert MAX_TEST_PAYLOAD_BYTES == 192 * 1024 * 1024
 
 
 @pytest.mark.unit
@@ -111,6 +115,45 @@ def test_eval_configs_use_online_greedy_and_final_pass_at_k_protocol(tmp_path):
     assert final["eval"]["defaults"]["temperature"] == 0.2
     assert final["eval"]["defaults"]["top_p"] == 0.95
     assert final["eval"]["defaults"]["top_k"] == -1
+
+    write_configs(
+        tmp_path,
+        tmp_path / "online-v6.parquet",
+        tmp_path / "final-v6.parquet",
+        config_suffix="_v6",
+    )
+    online_v6 = yaml.safe_load((tmp_path / "code_eval_v6.yaml").read_text())
+    final_v6 = yaml.safe_load((tmp_path / "code_eval_final_v6.yaml").read_text())
+    assert online_v6["eval"]["datasets"][0]["name"] == "livecodebench_v6_online"
+    assert final_v6["eval"]["datasets"][0]["name"] == "livecodebench_v6_final"
+
+
+@pytest.mark.unit
+def test_online_candidates_respect_sandboxfusion_upload_limit():
+    def row(question_id, payload):
+        test_cases = {"input_output": json.dumps({"inputs": [payload], "outputs": [""]})}
+        sandboxfusion_row = {"test": json.dumps(test_cases)}
+        return {
+            "metadata": {
+                "difficulty": "easy",
+                "question_id": question_id,
+                "sandboxfusion_row": json.dumps(sandboxfusion_row),
+            }
+        }
+
+    small = row("small", "x")
+    large = row("large", "x" * 100)
+    limit = required_upload_bytes(small["metadata"]["sandboxfusion_row"])
+
+    safe, excluded = prepare_livecodebench_eval.upload_safe_candidates([small, large], limit)
+
+    assert safe == [small]
+    assert excluded == [
+        {
+            "question_id": "large",
+            "required_upload_bytes": required_upload_bytes(large["metadata"]["sandboxfusion_row"]),
+        }
+    ]
 
 
 @pytest.mark.unit
@@ -153,4 +196,22 @@ def test_prepare_updates_single_task_index_with_code_eval_provenance(tmp_path, m
     assert code["final_eval_rows"] == 2
     assert code["benchmark_index_sha256"] == prepare_livecodebench_eval.sha256_file(
         output / "livecodebench_index.json"
+    )
+
+    prepare_livecodebench_eval.prepare(
+        SimpleNamespace(
+            output_dir=output,
+            version="v5",
+            online_version="v5",
+            online_samples=1,
+            seed=42,
+            training_data=None,
+            config_suffix="_v6",
+        )
+    )
+    code = json.loads(single_index.read_text())["tasks"]["code"]
+    assert code["eval_config"] == str(output / "code_eval.yaml")
+    assert code["additional_evaluations"]["v6"]["eval_config"] == str(output / "code_eval_v6.yaml")
+    assert code["additional_evaluations"]["v6"]["benchmark_index"] == str(
+        output / "livecodebench_index_v6.json"
     )

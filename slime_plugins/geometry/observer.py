@@ -28,6 +28,7 @@ from .matrix_metrics import matrix_diagnostics, matrix_macro_summary, selected_v
 from .metrics import geometry_metrics
 from .optimizer_views import OptimizerParameterView, build_optimizer_parameter_views
 from .projection import count_sketch_many
+from .raw_gradient_probe import RawGradientProbeAccumulator
 from .support import SupportWindowSketch
 
 
@@ -279,6 +280,7 @@ class GeometryObserver:
         self._support_sketch: SupportWindowSketch | None = None
         self._matrix_view_ids: set[int] = set()
         self._semantic_layouts: dict[int, tuple[str, tuple[int, ...]]] = {}
+        self._raw_gradient_probe: RawGradientProbeAccumulator | None = None
         self._entries = self._build_entries(model)
         self.group_names = self._build_group_names(self._entries)
         self.group_index = {name: index for index, name in enumerate(self.group_names)}
@@ -865,6 +867,17 @@ class GeometryObserver:
         if optimizer is not None:
             self._ensure_optimizer_views(optimizer)
         self._before = None
+        if optimizer is not None:
+            if self._raw_gradient_probe is None:
+                self._raw_gradient_probe = RawGradientProbeAccumulator(self.args, self._optimizer_views)
+            self._raw_gradient_probe.add(
+                observation_id=observation_id,
+                source_names=self._pending_source_names,
+                actual_batch_size=self._pending_batch_size,
+                effective_token_count=self._pending_effective_tokens,
+            )
+            if bool(getattr(self.args, "geometry_raw_gradient_probe_only", False)):
+                return
         if self._sketch_active:
             self._before = self._snapshot(include_gradient=True)
             if self._initial_weight is None:

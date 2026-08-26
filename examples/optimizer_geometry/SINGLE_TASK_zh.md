@@ -1,6 +1,7 @@
 # OPD 单任务参数几何：研究设计与运行说明
 
-本目录把基础任务落实为 Qwen3-1.7B student 在 math/code/science 上的可复现实验。用户侧的
+本目录把基础任务落实为 Qwen3-1.7B student 在 math/code/science 上的可复现实验，并提供 IF 与
+Logic-RL Knights-and-Knaves 任务的 plain GRPO/PPO 入口。用户侧的
 `coding` 在 M2RL manifest 中统一写成 `code`。支持的 teacher 是：
 
 - `Qwen/Qwen3-8B`
@@ -30,26 +31,38 @@ checkpoint，再找共享的 `/workspace/dev/checkpoints`，无需手工改脚�
 
 ```text
 data/m2rl/single_task/
-  math/     22,051 train（已去除 benchmark 重合）+ MATH-500 online eval
-  code/     19,169 train + LiveCodeBench v5 64 题 online eval + 880 题 final eval
+  math/     18,231 train（已去重并去除 benchmark 重合）+ MATH-500 online eval
+  code/     19,169 train + LiveCodeBench v5/v6 各 128 题 online eval
+            + release_v5 880 题 / release_v6 1,055 题 final eval
   science/  19,670 train + GPQA-Diamond online eval
+  if/       16,575 train + 官方 IFEval 541 题、IFBench 300 题 online eval
+  logic/     4,500 train + Logic-RL 3--7 人难度 500 题 online validation
   single_task_index.json
 
 data/m2rl/eval/m2rl_online/
   aime24.parquet        30 problems
   math500.parquet       500 problems
   gpqa_diamond.parquet  198 problems（HF gated，需先取得访问权限）
+  ifeval.parquet        541 prompts（固定 revision）
+  ifbench.parquet       300 prompts（固定 revision）
 ```
 
-Frozen OPD 保留 `MAX_PROMPT_LEN=2048` 过滤。用正式 Qwen3 tokenizer 复核后，三份数据的
-raw/usable 数分别为 Math 22,051/22,050、Code 19,169/19,125、Science 19,670/19,668；长度过滤数
-分别为 1 / 44 / 2。Math 原始 22,056 行中另有 5 行包含 4 道 MATH-500 题，准备脚本会先将其从
-单任务训练视图剔除；完整的 500 道 benchmark 题全部保留。下文“一轮数据”均指这批过滤后的
-usable prompts。
+Frozen OPD 和 IF GRPO/PPO 保留 `MAX_PROMPT_LEN=2048` 过滤。用正式 Qwen3 tokenizer 复核后，四份数据的
+raw/usable 数分别为 Math 18,231/18,230、Code 19,169/19,125、Science 19,670/19,668、IF
+16,575/16,568；长度过滤数分别为 1 / 44 / 2 / 7。Math 原始 22,056 行中有 5 行包含 4 道
+MATH-500 题，另有 3,820 条重复
+prompt；准备脚本会先剔除 overlap，再按 prompt 保留第一条同 label 样本。完整的 500 道
+benchmark 题全部保留。下文“一轮数据”均指这批过滤后的 usable prompts。
 
-当前环境已落盘固定 revision 的 AIME'24、MATH-500 与 GPQA-Diamond；GPQA 使用 seed 42 固定选项顺序，文件行数与
+当前环境已落盘固定 revision 的 AIME'24、MATH-500、GPQA-Diamond、IFEval 与 IFBench；GPQA 使用 seed 42 固定选项顺序，文件行数与
 SHA-256 记录在 `data/m2rl/eval/m2rl_online/eval_data_index.json`。Science online eval 已标成
 `external_benchmark`，不会回退到训练集 holdout。
+
+Logic 准备脚本固定 Logic-RL commit `9d2c457525ec14639e85afa12d49bb16efb053a4`，把 3--7 人难度的
+5 份 900-row train 合并成 4,500 题，把对应 5 份 100-row test 作为 500 题 online validation。
+它从原始 `quiz` 重建普通 chat messages，不复用上游已经写入 Qwen special tokens 的 prompt；来源、逐文件
+SHA-256、输出 hash 与 `CC-BY-NC-SA-4.0` 许可记录在
+`data/m2rl/logic_kk/logic_data_index.json`。
 
 如需重建：
 
@@ -57,6 +70,19 @@ SHA-256 记录在 `data/m2rl/eval/m2rl_online/eval_data_index.json`。Science on
 # 首次使用需先在 GPQA 页面同意 gated 条款，然后二选一：hf auth login 或 export HF_TOKEN=...
 FORCE_REBUILD=1 REQUIRE_GPQA=1 \
   bash examples/optimizer_geometry/prepare_single_task_dataset.sh
+
+# Code 默认在线曲线与 v5 final
+python3 examples/optimizer_geometry/prepare_livecodebench_eval.py \
+  --output-dir data/m2rl/single_task/code \
+  --version release_v5 --online-version v5 --online-samples 128 \
+  --training-data data/m2rl/train/code.jsonl
+
+# 独立的 v6 在线曲线与 final；不覆盖上面的默认别名
+python3 examples/optimizer_geometry/prepare_livecodebench_eval.py \
+  --output-dir data/m2rl/single_task/code \
+  --version release_v6 --online-version v6 --online-samples 128 \
+  --config-suffix _v6 \
+  --training-data data/m2rl/train/code.jsonl
 ```
 
 Math eval 会同时准备三个可复用配置：`math_eval_aime24.yaml`、`math_eval_math500.yaml` 和
@@ -75,30 +101,56 @@ MATH_EVAL_DATASETS="aime24 math500" bash examples/optimizer_geometry/run_opd_mat
 ```
 
 显式 `EVAL_CONFIG=/path/to/config.yaml` 的优先级更高。无论运行时选哪种 Math eval，训练 manifest
-都固定使用去掉 5 条 MATH-500 重合行的同一份训练视图，避免评测选择反过来改变 optimizer 对照的
-训练数据。
+都固定使用去掉 5 条 MATH-500 重合行和 3,820 条重复 prompt 的同一份训练视图，避免评测选择
+反过来改变 optimizer 对照的训练数据。
 
 Plain GRPO/PPO 的正式 Math 入口默认不使用单数据集别名，而是选择
 `math_eval_aime24_math500.yaml`，同时报告 AIME'24（每题 8 次采样）和 MATH-500（每题 1 次 greedy
 采样）。训练 rollout response cap 固定为 8,192，`max_tokens_per_gpu=10,240`；evaluation 独立使用
-32,768-token cap。两阶段共用 SGLang engine，因此当前 96 GiB Qwen3-1.7B 部署按更长的 eval cap
+32,768-token cap。Math/Code/Science/IF/Logic 的 single-task GRPO AdamW LR 固定为 `1e-6`，其中
+Code/IF/Logic GRPO 固定每个 prompt 采样 `n=16`。两阶段共用 SGLang engine，因此当前 96 GiB Qwen3-1.7B 部署按更长的 eval cap
 限制为每个 engine 12 个并发请求。Plain GRPO/PPO 还固定使用 `enable_thinking=false`；response-cap
 pilot 仍是显式的校准例外。
 
-默认快捷准备不再切 256 条训练 holdout；Code/Science 使用全量训练数据，Math 只去掉上述 5 条
-benchmark 重合行。OPD Math 默认使用 MATH-500（每题 1 次 greedy 采样），也可改为 AIME'24
+IF 使用训练源内的 IFEvalG strict verifier。独立评测同时报告官方 IFEval strict prompt
+`eval/ifeval_strict_prompt`（观察学习进展）和官方 IFBench strict `eval/ifbench_strict`（观察 OOD 泛化）；
+IFBench 仍走其独立 constraint registry，不能拿 IFEvalG 规则代替。两个 verifier 在评分前只清理响应末尾生成的
+Qwen termination special token，不改正文或训练 token 序列。`run_if_grpo.sh` 固定 `responsive16`、每个 prompt 采样 `n=16`（即每次更新 256 responses）和
+AdamW LR `1e-6`；`run_if_ppo.sh` 固定 `n=4`（64 responses/update）和 actor AdamW LR `2.5e-7`，critic
+继续使用 `configs/ppo_roles.yaml` 中独立的固定 AdamW 配置。两者均为 seed 42、一轮数据、关闭 thinking、
+8,192-token 训练和 32,768-token IFEval/IFBench greedy 评测。这里给 GRPO 用 `n=16`，是因为 Qwen3-1.7B
+首个 seed-42 batch 的实测中只有 4/16 个 prompt group 具有非零 strict reward 方差。
+
+```bash
+python -m pip install -r examples/eval_multi_task/requirements_ifbench.txt
+python -m nltk.downloader punkt punkt_tab
+bash examples/optimizer_geometry/prepare_single_task_dataset.sh
+
+export AVAILABLE_CUDA_DEVICES=1,4,6,8
+bash examples/optimizer_geometry/run_if_grpo.sh
+bash examples/optimizer_geometry/run_if_ppo.sh
+```
+
+默认快捷准备不再切 256 条训练 holdout；Code/Science/Logic 使用全量训练数据，Math 去掉上述 5 条
+benchmark 重合行和 3,820 条重复 prompt。OPD Math 默认使用 MATH-500（每题 1 次 greedy 采样），也可改为 AIME'24
 （每题 8 次采样）或同时运行两者；Science
 使用 GPQA-Diamond（每题 4 次），Code 使用固定且与
-训练 prompt 零重合的 LiveCodeBench v5 64 题子集（greedy pass@1）。Code 最终评测另用完整
-release_v5 的 880 题，每题 10 次采样，报告 pass@1/5/10。`HF_TOKEN` 仅从环境读取，不会写入
+训练 prompt 零重合的 LiveCodeBench v5 128 题子集（greedy pass@1）。另有独立的
+`code_eval_v6.yaml`，提供 v6 128 题曲线，但默认不把两版绑在每个 checkpoint 上重复执行。
+Code 最终评测分别用完整 release_v5 的 880 题和 release_v6 的 1,055 题，每题 10 次采样，报告
+pass@1/5/10。`HF_TOKEN` 仅从环境读取，不会写入
 脚本或索引；若 GPQA 尚未获权，准备脚本
 会明确把 science eval 标为 disabled，而 science 快捷启动器默认拒绝在缺少独立 eval 时启动。
+在线子集还会按 256 MiB SandboxFusion staging 上限校验；该上限覆盖当前固定 v5/v6 的大测试
+payload，同时保留逐请求 aggregate decoded-file 检查。
 
 M2RL 论文最终表格使用另一套 benchmark suite：Math 为 AIME'24/25，Coding
 为 LiveCodeBench v5/v6，Science 为 HLE/GPQA-Diamond，并额外报告 MMLU-Redux。它们不是从
 训练集切出的 holdout，也不等同于当前 OPD 脚本使用的 MATH-500 online eval。当前 online eval
 每 50 个 optimizer updates（满批时 3,200 个训练 prompts）执行；在线与最终 eval 的 response cap
-按任务固定为 Math 32,768、Code/Science 16,384。旧的 256 holdout 方式仍
+按任务固定为 Math 32,768、Code/Science 16,384、Logic 8,192。Logic reward 仅在唯一终态
+`<answer>` block 中每个名字恰好出现一次且全部身份正确时返回 1，否则返回 0；格式诊断另存于 metadata。
+旧的 256 holdout 方式仍
 可通过 `prepare_single_task_data.py` 显式使用，仅用于 pipeline/smoke test。
 
 W&B 已默认开启，entity 为 `zsqzz`，project 为 `iclr2027-opd-geometry`。密钥只从环境
@@ -122,6 +174,7 @@ export AVAILABLE_CUDA_DEVICES=1,4,6,8
 TASK=math bash examples/optimizer_geometry/run_single_task_rl.sh
 TASK=code bash examples/optimizer_geometry/run_single_task_rl.sh
 TASK=science bash examples/optimizer_geometry/run_single_task_rl.sh
+TASK=logic bash examples/optimizer_geometry/run_single_task_rl.sh
 ```
 
 OPD 再给 Qwen3-8B teacher 一张卡（默认前 4 张为 student、最后 1 张为 teacher）。单轮数据集
@@ -179,7 +232,7 @@ optimizer 的性能”，同时可将这里列出的统一文献起点作为严�
 
 | 类别 | 固定值 |
 | --- | --- |
-| 训练预算 | `NUM_EPOCH=1`；去重并过滤后 Math 22,050、Code 19,125、Science 19,668 usable prompts，各题恰好一次 |
+| 训练预算 | `NUM_EPOCH=1`；去重并过滤后 Math 18,230、Code 19,125、Science 19,668 usable prompts，各题恰好一次 |
 | 采样与 batch | `BATCH_PROFILE=opd64x1`；每个满 rollout 为 64 prompts × 1 response，`GLOBAL_BATCH_SIZE=64`；末尾不足 64 的题使用真实尾批，不丢弃、不回卷 |
 | token/采样 | frozen OPD cell 显式使用 `apply_chat_template_kwargs={"enable_thinking":false}`；student 用 non-thinking 模板生成，teacher 对同一串 token 打分且不自行生成；训练 prompt/response 上限为 2048/4096，packing cap 10240；evaluation response cap 独立固定为 Math 32768、Code/Science 16384；temperature 1，top-p 1，top-k -1 |
 | 公共训练项 | constant LR、warmup 0、global grad clip 1、dropout 0、weight decay 0 |
@@ -222,7 +275,7 @@ optimizer 的性能”，同时可将这里列出的统一文献起点作为严�
 response 上限用 `run_response_cap_pilot.sh` + `select_response_cap.py` 冻结；统一终点用
 `run_budget_pilot.sh` + `select_training_budget.py` 在只观察 AdamW 的情况下决定。
 
-这里的 `step` 指 rollout/optimizer update。64-prompt 满批下，Math 为 345 steps（尾批 34），Code
+这里的 `step` 指 rollout/optimizer update。64-prompt 满批下，Math 为 285 steps（尾批 54），Code
 为 299 steps（尾批 53），Science 为 308 steps（尾批 20）。论文曲线必须同时报告 update 和累计
 prompt/token，最后一步的真实 global batch 不能误记成 64。
 脚本默认检查 `GLOBAL_BATCH_SIZE = ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT`，避免一次
@@ -293,7 +346,7 @@ PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
 
 启动器在真正训练前运行 `validate_tokenizers.py`，逐项比较 student/teacher 的 token→ID 映射。当前官方三个 checkpoint 的 151,669 项词表、added tokens 与 special-token IDs 已核验一致；启动时仍会基于本地实际文件重检。这个检查不可省略：OPD teacher 评分的是 student 的原始 token IDs。
 
-## 4. 准备现有 math/code/science 数据
+## 4. 准备现有 math/code/science/IF 数据
 
 先把 `nvidia/Nemotron-3-Nano-RL-Training-Blend` 转成 M2RL 格式：
 
@@ -313,7 +366,7 @@ python examples/optimizer_geometry/prepare_m2rl_data.py \
 python examples/optimizer_geometry/prepare_single_task_data.py \
   --rl-manifest /data/m2rl_rl/multitask_manifest.yaml \
   --output-dir /data/opd_single \
-  --tasks math code science \
+  --tasks math code science if \
   --sft math=/data/m2rl_sft/Nemotron-Math-v2.parquet \
   --sft code=/data/m2rl_sft/Nemotron-Competitive-Programming-v1.parquet \
   --sft-ratio 0.5 \
@@ -326,6 +379,13 @@ python examples/optimizer_geometry/prepare_single_task_data.py \
   --eval science=/data/eval/gpqa_diamond.parquet \
   --eval-name science=gpqa \
   --eval-samples science=4 \
+  --eval if=/data/eval/ifbench.parquet \
+  --eval-name if=ifbench \
+  --eval-rm-type if=ifbench \
+  --eval-samples if=1 \
+  --eval-max-response-len-override if=32768 \
+  --eval-temperature if=0 \
+  --eval-top-p-override if=1 \
   --skip-eval code \
   --seed 42
 ```
@@ -474,14 +534,16 @@ Math eval pilot 前，Math 按每个 48-request cap-hit wave 约 12--16 分钟�
 | Math / AIME'24 online | 30 | 8 | 240 | 5 | 约 1--1.3 小时 |
 | Math / MATH-500 online | 500 | 1 | 500 | 11 | 约 2.2--3.0 小时 |
 | Math / AIME'24 + MATH-500 | 530 | 各自配置 | 740 | 16 | 约 3.2--4.3 小时 |
-| Code / LiveCodeBench online | 64 | 1 | 64 | 2 | 约 12--16 分钟，另加 sandbox |
+| Code / LiveCodeBench online | 128 | 1 | 128 | 3 | 约 18--24 分钟，另加 sandbox |
+| Code / LiveCodeBench v6 online | 128 | 1 | 128 | 3 | 约 18--24 分钟，另加 sandbox |
 | Science / GPQA-Diamond online | 198 | 4 | 792 | 17 | 约 1.7--2.3 小时 |
 | Code / LiveCodeBench final | 880 | 10 | 8,800 | 184 | 约 18--25 小时，另加 sandbox |
+| Code / LiveCodeBench v6 final | 1,055 | 10 | 10,550 | 220 | 约 22--30 小时，另加 sandbox |
 
 这是所有 response 都接近各自 cap 的容量排程，不是已实测的 eval wall-clock；若实际平均 response
 长度为 `L`，Math 生成部分可先近似乘以 `L/32768`，其他任务乘以 `L/16384`。Code 的 eval semaphore 覆盖生成和 reward，且
 SandboxFusion 另有并发 8，所以代码执行会增加长尾。按当前单轮步数，Math 的 eval 点为
-`0,50,...,300,345`（8 次），Code 为 `0,50,...,250,299`（7 次），
+`0,50,...,250,285`（7 次），Code 为 `0,50,...,250,299`（7 次），
 Science 为 `0,50,...,300,308`（8 次）；首次 pre-train eval 应作为后续排程的实测校准值。
 
 ```bash
@@ -494,8 +556,9 @@ CUDA_VISIBLE_DEVICES=1,4,6,8 NUM_GPUS=4 \
   bash examples/optimizer_geometry/evaluate_single_task.sh
 ```
 
-Code 最终表应把 `EVAL_CONFIG` 换成 `code_eval_final.yaml`。结果除聚合曲线外，还会写逐样本
-response、label、reward、status、长度和版本信息；final eval 完成后运行产物校验器。
+Code 最终表分别把 `EVAL_CONFIG` 换成 `code_eval_final.yaml`（v5）和
+`code_eval_final_v6.yaml`（v6）。结果除聚合曲线外，还会写逐样本 response、label、reward、status、
+长度和版本信息；final eval 完成后运行产物校验器。
 
 ## 9. 几何与 reward 汇总
 

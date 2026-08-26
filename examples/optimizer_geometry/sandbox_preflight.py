@@ -419,6 +419,9 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
             args.max_upload_bytes >= MIN_LIVECODEBENCH_UPLOAD_BYTES
             and args.livecodebench_max_staged_bytes > 0
             and args.livecodebench_max_staged_bytes <= args.max_upload_bytes
+            and args.max_test_payload_bytes > 0
+            and args.livecodebench_max_test_payload_bytes > 0
+            and args.livecodebench_max_test_payload_bytes <= args.max_test_payload_bytes
         ),
     }
     marker = {
@@ -443,6 +446,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
             "aggregate_memory_max": args.aggregate_memory_max,
             "aggregate_pids_max": args.aggregate_pids_max,
             "max_upload_bytes": args.max_upload_bytes,
+            "max_test_payload_bytes": args.max_test_payload_bytes,
             "control_plane_network_internal": args.control_plane_network_internal,
         },
         "diagnostics": {
@@ -478,6 +482,8 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
                 "minimum_contract_bytes": MIN_LIVECODEBENCH_UPLOAD_BYTES,
                 "max_staged_bytes": args.livecodebench_max_staged_bytes,
                 "runtime_limit_bytes": args.max_upload_bytes,
+                "max_test_payload_bytes": args.livecodebench_max_test_payload_bytes,
+                "test_payload_limit_bytes": args.max_test_payload_bytes,
             },
         },
         "notes": {
@@ -489,7 +495,7 @@ def preflight(args: argparse.Namespace) -> dict[str, Any]:
             "privilege_probe": "Submitted code ran as uid 1000 without effective capabilities and with no_new_privs.",
             "seccomp_probe": "Submitted code inherited the extra untrusted-code seccomp filter and user namespace creation returned EPERM.",
             "submit_probe": "The training /submit route executed a JSON LiveCodeBench case in the sandbox and rejected control-plane extraction code and legacy pickle input.",
-            "upload_probe": "The runtime upload limit covers the API contract and the largest staged row in the configured online LiveCodeBench parquet.",
+            "upload_probe": "The runtime upload and test-field limits cover the largest row in the configured online LiveCodeBench parquet.",
             "namespace_probe": "Two executions each differed from the service mount, PID, network, IPC, and UTS namespaces.",
             "scope": "Active black-box checks; retain the pinned deployment config, patch hash, and image digest as provenance.",
         },
@@ -518,7 +524,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aggregate-memory-max", required=True)
     parser.add_argument("--aggregate-pids-max", required=True)
     parser.add_argument("--max-upload-bytes", type=int, required=True)
+    parser.add_argument("--max-test-payload-bytes", type=int, required=True)
     parser.add_argument("--livecodebench-max-staged-bytes", type=int, required=True)
+    parser.add_argument("--livecodebench-max-test-payload-bytes", type=int, required=True)
     parser.add_argument("--service-canary-path", required=True)
     parser.add_argument("--service-canary-token", required=True)
     parser.add_argument("--service-namespaces", required=True)

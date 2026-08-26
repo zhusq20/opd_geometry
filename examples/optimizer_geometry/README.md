@@ -2,6 +2,8 @@
 
 严谨的 optimizer 比较、超参数选择和 51,200/102,400 prompt 预算判定规则见
 [`OPTIMIZER_COMPARISON_PROTOCOL_zh.md`](OPTIMIZER_COMPARISON_PROTOCOL_zh.md)。
+以 raw task gradient 为局部理论主线、并分析 RLVR/OPD 全程 optimization path 与端到端任务效果的实验计划见
+[`RAW_GRADIENT_INTERFERENCE_EXPERIMENT_PLAN_zh.md`](RAW_GRADIENT_INTERFERENCE_EXPERIMENT_PLAN_zh.md)。
 当前服务器的真实 GPU/ECC、峰值显存、耗时与截断证据见
 [`BATCH_FEASIBILITY_2026-08-13_zh.md`](BATCH_FEASIBILITY_2026-08-13_zh.md)。
 
@@ -30,8 +32,9 @@ restores both optimizer states without collisions.
   `sequential` task schedules, with independent source cursors and checkpointed
 RNG state. `unit: batch` makes every optimizer step task-homogeneous, which is
 useful for cross-task gradient cosine estimates.
-- Rule rewards for math/science, a vendored IFEvalG evaluator, and external
-  sandbox code rewards.
+- Rule rewards for math/science, a vendored IFEvalG evaluator, a pinned
+  Logic-RL Knights-and-Knaves binary verifier, and external sandbox code
+  rewards.
 - Per-task SGLang teacher routing for OPD. Teachers can differ in size,
   checkpoint, and endpoint, but must share the actor's tokenizer/vocabulary
   because token-level OPD scores the actor's token IDs.
@@ -47,8 +50,8 @@ useful for cross-task gradient cosine estimates.
 - A single-cell launcher, full matrix launcher, validation command, and offline
   geometry analyzer.
 
-For the Qwen3-1.7B math/code/science single-task study (including Qwen3-8B versus
-Qwen3-4B-Thinking-2507 teachers and a true mixed-batch SFT+OPD loss), follow
+For the Qwen3-1.7B math/code/science single-task study and the IF/Logic GRPO/PPO
+entrypoints (including Qwen3-8B versus Qwen3-4B-Thinking-2507 teachers and a true mixed-batch SFT+OPD loss), follow
 [`SINGLE_TASK_zh.md`](SINGLE_TASK_zh.md). The older multi-task instructions
 below remain valid.
 
@@ -316,19 +319,33 @@ for the candidates, stability exclusions, and one-standard-error rule.
 Frozen `run_opd_*` does not use that 51,200-prompt default: it exports
 `BATCH_PROFILE=opd64x1`, `N_SAMPLES_PER_PROMPT=1`, and `NUM_EPOCH=1`.
 After the retained 2,048-token prompt filter, Math/Code/Science train
-22,050/19,125/19,668 prompts and take 345/299/308 updates; their final batches
-contain 34/53/20 prompts. The Math count is after removing the five raw rows
-that overlap MATH-500.
+18,230/19,125/19,668 prompts and take 285/299/308 updates; their final batches
+contain 54/53/20 prompts. The Math count is after removing five raw rows that
+overlap MATH-500 and 3,820 duplicate prompts.
 
 The single-task reward-RL entry point `run_single_task_rl.sh` and the
 single-task factorial launcher `run_single_task_matrix.sh` also override the
 generic fixed-prompt budget with `NUM_EPOCH=1`, include the final partial
 batch, and admit only seed 42. They retain their selected batch profile (the
-RL entry point defaults to `responsive16` with four responses per prompt), so
+RL entry point defaults to `responsive16`), so
 their update counts are derived from each task's usable prompt count rather
-than fixed at 3,200. Plain Math GRPO/PPO trains with an 8,192-token rollout cap,
+than fixed at 3,200. The Math/Code/Science/IF/Logic GRPO cells fix the AdamW LR at
+`1e-6`; Code, IF, and Logic GRPO use 16 responses per prompt, while PPO and the other
+GRPO tasks retain their selected profile's sample count. Plain Math GRPO/PPO trains with an 8,192-token rollout cap,
 evaluates the pinned AIME'24 plus MATH-500 config with a separate 32,768-token
 cap, disables Qwen3 thinking, and records both caps in the run name.
+The standalone `run_if_grpo.sh` and `run_if_ppo.sh` scripts use the 16,575-row
+IFEvalG training source (16,568 prompts after the 2,048-token filter) and the
+pinned 541-row official IFEval plus 300-row official IFBench test sets. IF
+training is capped at 8,192 response tokens; deterministic strict prompt-level
+evaluation reports `eval/ifeval_strict_prompt` for learning progress and
+`eval/ifbench_strict` for OOD generalization with a separate 32,768-token cap.
+The instruction verifiers remove generated Qwen end tokens only at the end of
+the response before scoring.
+The Logic entry uses the pinned public Logic-RL 3--7-person K&K split: 4,500
+training puzzles for one exact dataset epoch and 500 held-out validation
+puzzles. Its local `kk` reward is binary exact match and requires one final
+assignment line per inhabitant inside a unique terminal `<answer>` block.
 
 The batch profiles are deliberately explicit:
 
@@ -557,3 +574,23 @@ They compare gradients observed at the successive parameter states visited by
 training; they are not same-checkpoint probe gradients. If the paper needs the
 latter causal control, evaluate a fixed probe batch from every task at each
 saved checkpoint and keep that analysis separate from the online records.
+
+## 8. Sandbox-free sequential GRPO from the existing Code checkpoint
+
+The continual-learning launcher reuses the current Code specialist and trains
+Math, Knowledge/Science, then instruction following. To avoid a runtime
+SandboxFusion dependency, Code training, boundary evaluation, and raw-gradient
+probes are omitted. The run records stage-local online geometry, exact
+three-task same-checkpoint raw-gradient probes, sandbox-free boundary evaluation,
+and exact stage/cumulative checkpoint deltas. Consequently this run does not
+measure Code forgetting after the warm start:
+
+```bash
+PLAN_ONLY=1 bash examples/optimizer_geometry/run_sequential_grpo.sh
+
+AVAILABLE_CUDA_DEVICES=0,1,2,3 \
+  bash examples/optimizer_geometry/run_sequential_grpo.sh
+```
+
+See `SEQUENTIAL_GRPO_zh.md` for the frozen optimizer-reset semantics, speed
+switches, resume behavior, and artifact layout.

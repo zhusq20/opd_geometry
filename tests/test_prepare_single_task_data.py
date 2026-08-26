@@ -195,6 +195,11 @@ def test_external_benchmark_can_remove_training_overlap_and_override_sampling(tm
             "label": "2",
             "metadata": {"rm_type": "deepscaler", "original_dataset": "source-b", "original_index": 8},
         },
+        {
+            "prompt": [{"role": "user", "content": "A different problem."}],
+            "label": "2",
+            "metadata": {"rm_type": "deepscaler", "original_dataset": "source-c", "original_index": 9},
+        },
     ]
     train_path = tmp_path / "math.jsonl"
     train_path.write_text("".join(json.dumps(row) + "\n" for row in train_rows))
@@ -240,6 +245,7 @@ def test_external_benchmark_can_remove_training_overlap_and_override_sampling(tm
         eval_temperature=["math=0"],
         eval_top_p_override=["math=1"],
         exclude_eval_overlap=["math"],
+        deduplicate=["math"],
         skip_eval=[],
         holdout_count=1,
         holdout_mode="tail_view",
@@ -256,6 +262,7 @@ def test_external_benchmark_can_remove_training_overlap_and_override_sampling(tm
     math = summary["tasks"]["math"]
     assert math["train_rows"] == 1
     assert math["excluded_eval_overlap_rows"] == 1
+    assert math["excluded_duplicate_rows"] == 1
     assert math["excluded_eval_overlaps"] == [
         {
             "train_row": 0,

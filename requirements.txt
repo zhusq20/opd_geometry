@@ -6,6 +6,7 @@ blobfile
 datasets
 e2b
 emerging_optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.1.0
+emoji
 httpx[http2]
 immutabledict
 langdetect
@@ -24,8 +25,10 @@ ray[default]
 ring_flash_attn
 safetensors
 sglang-router>=0.3.0
+syllapy
 tensorboard
 transformers
+unicodedata2
 wandb
 xxhash  # disk delta weight sync (checksum + codec)
 zstandard

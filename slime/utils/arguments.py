@@ -1642,6 +1642,32 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Store scalar JSONL only; omit projected-vector .pt files.",
             )
             group.add_argument(
+                "--geometry-raw-gradient-probe-dir",
+                type=str,
+                default=None,
+                help=(
+                    "Optional output directory for exact FP32 pre-clipping raw-gradient shards. "
+                    "Use only in a fixed-checkpoint probe run together with "
+                    "--geometry-raw-gradient-probe-updates."
+                ),
+            )
+            group.add_argument(
+                "--geometry-raw-gradient-probe-updates",
+                type=int,
+                default=0,
+                help=(
+                    "Number of equal-sized probe backward batches to average before writing raw-gradient shards."
+                ),
+            )
+            group.add_argument(
+                "--geometry-raw-gradient-probe-only",
+                action="store_true",
+                help=(
+                    "Run fixed-checkpoint raw-gradient probing without optimizer or scheduler steps. "
+                    "Requires --geometry-raw-gradient-probe-dir."
+                ),
+            )
+            group.add_argument(
                 "--geometry-wandb-groups",
                 type=str,
                 default=(
@@ -2305,6 +2331,17 @@ def slime_validate_args(args):
             raise ValueError("--geometry-matrix-sample-count must be positive.")
         if args.geometry_matrix_randomized_rank <= 0:
             raise ValueError("--geometry-matrix-randomized-rank must be positive.")
+        if bool(args.geometry_raw_gradient_probe_dir) != bool(args.geometry_raw_gradient_probe_updates):
+            raise ValueError(
+                "--geometry-raw-gradient-probe-dir and "
+                "--geometry-raw-gradient-probe-updates must be set together."
+            )
+        if args.geometry_raw_gradient_probe_updates < 0:
+            raise ValueError("--geometry-raw-gradient-probe-updates must be non-negative.")
+        if args.geometry_raw_gradient_probe_only and not args.geometry_raw_gradient_probe_dir:
+            raise ValueError(
+                "--geometry-raw-gradient-probe-only requires --geometry-raw-gradient-probe-dir."
+            )
         try:
             re.compile(args.geometry_parameter_include)
             if args.geometry_parameter_exclude:

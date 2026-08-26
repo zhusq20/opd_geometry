@@ -57,7 +57,7 @@ for task in "${TASK_LIST[@]}"; do
         case "${algorithm}" in
           grpo|ppo)
             response_suffix="_trainr8192"
-            if [[ "${task}" == "math" ]]; then
+            if [[ "${task}" == "math" || "${task}" == "if" ]]; then
               response_suffix+="_evalr32768"
             fi
             ;;
@@ -89,7 +89,13 @@ for task in "${TASK_LIST[@]}"; do
                 MAX_RESPONSE_LEN=8192
                 MAX_TOKENS_PER_GPU=10240
               )
-              if [[ "${task}" == "math" ]]; then
+              if [[ "${algorithm}" == "grpo" ]]; then
+                launch_env+=(ADAMW_LR=1e-6)
+                if [[ "${task}" == "code" || "${task}" == "if" || "${task}" == "logic" ]]; then
+                  launch_env+=(N_SAMPLES_PER_PROMPT=16)
+                fi
+              fi
+              if [[ "${task}" == "math" || "${task}" == "if" ]]; then
                 launch_env+=(EVAL_MAX_RESPONSE_LEN=32768 EVAL_MAX_CONCURRENCY=48 SGLANG_MAX_RUNNING_REQUESTS=12)
               fi
               ;;

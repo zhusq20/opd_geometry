@@ -154,6 +154,7 @@ def test_online_judge_accepts_only_bounded_json_livecodebench_rows(monkeypatch):
     dataset = type("LiveCodeBenchDataset", (), {})
 
     module._validate_livecodebench_submit(_livecodebench_submit_request(), dataset)
+    assert module.MAX_TEST_PAYLOAD_BYTES == 192 * 1024 * 1024
 
 
 @pytest.mark.unit
@@ -653,7 +654,11 @@ def test_build_and_start_contract_is_fail_closed_and_content_addressed():
     assert "--proxy-container-id" in start
     assert "validate_livecodebench_upload.py" in start
     assert "--max-upload-bytes" in start
+    assert "--max-test-payload-bytes" in start
     assert "--livecodebench-max-staged-bytes" in start
+    assert "--livecodebench-max-test-payload-bytes" in start
+    assert 'MAX_UPLOAD_BYTES="${SANDBOXFUSION_MAX_UPLOAD_BYTES:-268435456}"' in start
+    assert 'MAX_TEST_PAYLOAD_BYTES="$((192 * 1024 * 1024))"' in start
     assert "image: ${SANDBOXFUSION_IMAGE:?" in compose
     assert "loopback_proxy:" in compose
     assert "SANDBOXFUSION_PROXY_UPSTREAM_HOST: sandboxfusion" in compose
@@ -669,4 +674,4 @@ def test_build_and_start_contract_is_fail_closed_and_content_addressed():
     assert "127.0.0.1:${SANDBOXFUSION_PORT:-8080}:8080" in compose
     assert "internal: true" in compose
     assert "isolation=none" not in compose
-    assert 'SANDBOX_MAX_UPLOAD_BYTES: "${SANDBOXFUSION_MAX_UPLOAD_BYTES:-150994944}"' in compose
+    assert 'SANDBOX_MAX_UPLOAD_BYTES: "${SANDBOXFUSION_MAX_UPLOAD_BYTES:-268435456}"' in compose

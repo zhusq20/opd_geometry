@@ -17,9 +17,10 @@ CGROUP_NAME="${SANDBOXFUSION_CGROUP_NAME:-sandboxfusion}"
 EXPECTED_BASE_IMAGE="volcengine/sandbox-fusion@sha256:dd7ff53d16132a8acad6d5da7f15154bb4a331381567a4cb21b3e97ce581f5f9"
 AGGREGATE_MEMORY_BYTES="${SANDBOXFUSION_AGGREGATE_MEMORY_BYTES:-34359738368}"
 AGGREGATE_PIDS="${SANDBOXFUSION_AGGREGATE_PIDS:-4096}"
-MAX_UPLOAD_BYTES="${SANDBOXFUSION_MAX_UPLOAD_BYTES:-150994944}"
+MAX_UPLOAD_BYTES="${SANDBOXFUSION_MAX_UPLOAD_BYTES:-268435456}"
+MAX_TEST_PAYLOAD_BYTES="$((192 * 1024 * 1024))"
 MIN_UPLOAD_BYTES="$((137 * 1024 * 1024))"
-LIVECODEBENCH_PARQUET="${SANDBOXFUSION_LIVECODEBENCH_PARQUET:-${SLIME_DIR}/data/m2rl/single_task/code/livecodebench_v5_online64.parquet}"
+LIVECODEBENCH_PARQUET="${SANDBOXFUSION_LIVECODEBENCH_PARQUET:-${SLIME_DIR}/data/m2rl/single_task/code/livecodebench_v5_online128.parquet}"
 
 write_unsafe_marker() {
   local marker_directory temporary_marker
@@ -154,15 +155,21 @@ export SANDBOXFUSION_CGROUP_PATH SANDBOXFUSION_IMAGE SANDBOXFUSION_MAX_UPLOAD_BY
 docker compose -f "${COMPOSE_FILE}" config --quiet
 
 LIVECODEBENCH_MAX_STAGED_BYTES=0
+LIVECODEBENCH_MAX_TEST_PAYLOAD_BYTES=0
 if [[ -f "${LIVECODEBENCH_PARQUET}" ]]; then
   LIVECODEBENCH_REPORT="$(
     python3 "${SCRIPT_DIR}/validate_livecodebench_upload.py" \
       --parquet "${LIVECODEBENCH_PARQUET}" \
-      --max-upload-bytes "${MAX_UPLOAD_BYTES}"
+      --max-upload-bytes "${MAX_UPLOAD_BYTES}" \
+      --max-test-payload-bytes "${MAX_TEST_PAYLOAD_BYTES}"
   )"
   printf '%s\n' "${LIVECODEBENCH_REPORT}"
   LIVECODEBENCH_MAX_STAGED_BYTES="$(
     python3 -c 'import json,sys; print(json.load(sys.stdin)["max_required_upload_bytes"])' \
+      <<<"${LIVECODEBENCH_REPORT}"
+  )"
+  LIVECODEBENCH_MAX_TEST_PAYLOAD_BYTES="$(
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["max_observed_test_payload_bytes"])' \
       <<<"${LIVECODEBENCH_REPORT}"
   )"
 else
@@ -486,7 +493,9 @@ python3 "${SCRIPT_DIR}/sandbox_preflight.py" \
   --aggregate-memory-max "${AGGREGATE_MEMORY_BYTES}" \
   --aggregate-pids-max "${AGGREGATE_PIDS}" \
   --max-upload-bytes "${MAX_UPLOAD_BYTES}" \
+  --max-test-payload-bytes "${MAX_TEST_PAYLOAD_BYTES}" \
   --livecodebench-max-staged-bytes "${LIVECODEBENCH_MAX_STAGED_BYTES}" \
+  --livecodebench-max-test-payload-bytes "${LIVECODEBENCH_MAX_TEST_PAYLOAD_BYTES}" \
   --service-canary-path "${SERVICE_CANARY_PATH}" \
   --service-canary-token "${SERVICE_CANARY_TOKEN}" \
   --service-namespaces "${SERVICE_NAMESPACES}" \

@@ -31,7 +31,7 @@ if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
   exit 2
 fi
 
-echo "[1/2] 重建包含 LiveCodeBench 128 MiB/16 MiB 边界修复的固定镜像"
+echo "[1/2] 重建包含 LiveCodeBench 192 MiB/16 MiB 边界修复的固定镜像"
 SANDBOXFUSION_PIN_FILE="${pin_file}" \
   bash examples/optimizer_geometry/build_sandboxfusion_cgroup2.sh 2>&1 | tee "${build_log}"
 

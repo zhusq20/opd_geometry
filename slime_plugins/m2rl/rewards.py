@@ -1,9 +1,11 @@
-"""Reward router for the five M2RL domains.
+"""Reward router for the optimizer-geometry task suite.
 
-Math and science reuse Slime's tested rule rewards. Instruction following uses
-IFBench (its metadata schema is compatible with the IFEvalG blend). Code is
-executed only by an external sandbox service. WorkBench trajectories already
-contain their environment reward and are passed through unchanged.
+Math and science reuse Slime's tested rule rewards. Instruction-following
+training uses the vendored IFEvalG verifier, while official IFBench evaluation
+uses IFBench's distinct constraint registry. Code is executed only by an
+external sandbox service. WorkBench trajectories already contain their
+environment reward and are passed through unchanged. Logic-RL
+Knights-and-Knaves uses a local strict binary verifier.
 """
 
 from __future__ import annotations
@@ -33,6 +35,15 @@ from .sandbox_security import validate_preflight_marker
 
 _CONFIG_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _SEMAPHORES: dict[tuple[int, int], asyncio.Semaphore] = {}
+_TERMINAL_INSTRUCTION_SPECIAL_TOKENS = re.compile(r"(?:<\|im_end\|>|<\|endoftext\|>)+(\s*)\Z")
+
+
+def _instruction_verifier_response(response: str | None) -> str | None:
+    """Remove generated end tokens only when they terminate the response."""
+
+    if response is None:
+        return None
+    return _TERMINAL_INSTRUCTION_SPECIAL_TOKENS.sub(r"\1", response)
 
 
 def _semaphore(concurrency: int) -> asyncio.Semaphore:
@@ -137,8 +148,12 @@ async def code_reward(args: Any, sample: Sample, config: dict[str, Any]) -> floa
 
     max_cases = int(config.get("max_cases", 20))
     if len(inputs) > max_cases:
-        # Per-sample deterministic selection avoids reward noise across reruns.
-        rng = random.Random(int(getattr(sample, "index", 0) or 0) + int(config.get("seed", 0)))
+        # Every response for one prompt must be graded on the same cases so
+        # GRPO's within-group comparison does not include evaluator noise.
+        # ``group_index`` is checkpointed by the rollout data source; retain
+        # ``index`` as the deterministic fallback for ungrouped/eval samples.
+        selection_index = sample.group_index if sample.group_index is not None else sample.index
+        rng = random.Random(int(selection_index or 0) + int(config.get("seed", 0)))
         chosen = sorted(rng.sample(range(len(inputs)), max_cases))
         inputs = [inputs[index] for index in chosen]
         outputs = [outputs[index] for index in chosen]
@@ -326,10 +341,28 @@ async def reward(
         return await remote_reward(args, sample, route_config)
     if rm_type == "unit_test":
         return await code_reward(args, sample, route_config or config.get("code", {}))
-    if rm_type in {"ifevalg", "ifbench"}:
+    if rm_type == "ifevalg":
         from slime_plugins.m2rl.ifevalg import compute_ifevalg_reward
 
-        return compute_ifevalg_reward(sample.response, sample.label, metadata=metadata)
+        return compute_ifevalg_reward(
+            _instruction_verifier_response(sample.response),
+            sample.label,
+            metadata=metadata,
+        )
+    if rm_type == "ifbench":
+        from slime.rollout.rm_hub.ifbench import compute_ifbench_reward
+
+        return compute_ifbench_reward(
+            _instruction_verifier_response(sample.response),
+            sample.label,
+            metadata=metadata,
+        )
+    if rm_type == "kk":
+        from slime_plugins.m2rl.kk import compute_kk_reward
+
+        if sample.metadata is not metadata:
+            sample.metadata = metadata
+        return compute_kk_reward(sample.response, sample.label, metadata=metadata)
     if rm_type == "workbench":
         return float(metadata.get("workbench_reward", sample.reward or 0.0))
     # Do not call rm_hub.async_rm here: args.custom_rm_path and the per-sample

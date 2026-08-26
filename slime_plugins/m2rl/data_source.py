@@ -263,6 +263,11 @@ class MultiTaskRolloutDataSource(DataSource):
             if "path" not in config:
                 raise ValueError(f"Manifest source {name!r} is missing `path`.")
             config["path"] = _expand_path(str(config["path"]), base)
+            try:
+                shuffle_seed = int(config.get("shuffle_seed", args.rollout_seed + source_index * 100_003))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Manifest source {name!r} has a non-integer shuffle_seed.") from exc
+            config["shuffle_seed"] = shuffle_seed
             dataset = Dataset(
                 config["path"],
                 tokenizer=tokenizer,
@@ -275,8 +280,21 @@ class MultiTaskRolloutDataSource(DataSource):
                 tool_key=config.get("tool_key", args.tool_key),
                 apply_chat_template=config.get("apply_chat_template", args.apply_chat_template),
                 apply_chat_template_kwargs=config.get("apply_chat_template_kwargs", args.apply_chat_template_kwargs),
-                seed=args.rollout_seed + source_index * 100_003,
+                seed=shuffle_seed,
             )
+            required_samples = config.get("required_samples")
+            if required_samples is not None:
+                if (
+                    isinstance(required_samples, bool)
+                    or not isinstance(required_samples, int)
+                    or required_samples <= 0
+                ):
+                    raise ValueError(f"Manifest source {name!r} required_samples must be a positive integer.")
+                if len(dataset) < required_samples:
+                    raise ValueError(
+                        f"Manifest source {name!r} requires {required_samples} usable prompts, "
+                        f"but only {len(dataset)} remain after prompt-length filtering."
+                    )
             if args.rollout_shuffle:
                 dataset.shuffle(0)
             self.sources.append(_Source(config=config, dataset=dataset))
@@ -290,6 +308,7 @@ class MultiTaskRolloutDataSource(DataSource):
             [len(source.dataset) for source in self.sources],
             sampling,
         )
+        self.repeat_sources = self.sampler.repeat
         self.strict_single_epoch = bool(
             len(self.sources) == 1
             and getattr(args, "include_epoch_tail", False)
@@ -302,9 +321,9 @@ class MultiTaskRolloutDataSource(DataSource):
     def _next_prompt(self, source_index: int) -> Sample:
         source = self.sources[source_index]
         if source.offset >= len(source.dataset):
-            if self.strict_single_epoch:
+            if self.strict_single_epoch or not self.repeat_sources:
                 raise RuntimeError(
-                    "Exact single-dataset epoch exhausted; refusing to wrap and repeat prompts. "
+                    "Non-repeating multi-task source exhausted; refusing to wrap and repeat prompts. "
                     "A rollout requested more prompts than the filtered dataset contains."
                 )
             source.epoch += 1
@@ -362,6 +381,7 @@ class MultiTaskRolloutDataSource(DataSource):
             {
                 "source_names": [source.config["name"] for source in self.sources],
                 "source_lengths": [len(source.dataset) for source in self.sources],
+                "source_shuffle_seeds": [source.config["shuffle_seed"] for source in self.sources],
                 "source_offsets": [source.offset for source in self.sources],
                 "source_epochs": [source.epoch for source in self.sources],
                 "sample_group_index": self.sample_group_index,
@@ -385,6 +405,9 @@ class MultiTaskRolloutDataSource(DataSource):
         current_lengths = [len(source.dataset) for source in self.sources]
         if state.get("source_lengths", current_lengths) != current_lengths:
             raise ValueError("Saved multi-task source lengths do not match the current datasets.")
+        current_shuffle_seeds = [source.config["shuffle_seed"] for source in self.sources]
+        if state.get("source_shuffle_seeds", current_shuffle_seeds) != current_shuffle_seeds:
+            raise ValueError("Saved multi-task source shuffle seeds do not match the current manifest.")
         if len(state["source_offsets"]) != len(self.sources):
             raise ValueError("Saved multi-task source count does not match the current manifest.")
         for source, offset, epoch in zip(self.sources, state["source_offsets"], state["source_epochs"], strict=True):

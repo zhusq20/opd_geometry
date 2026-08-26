@@ -3,6 +3,8 @@ routes:
   deepscaler: {}
   gpqa: {}
   ifevalg: {}
+  ifbench: {}
+  kk: {}
   workbench: {}
   unit_test:
     url: ${SANDBOXFUSION_BASE_URL}/run_code
@@ -33,7 +35,7 @@ routes:
     request_timeout: 180
     retry_attempts: 3
     retry_backoff_seconds: 1
-    # Official rows can carry up to roughly 102 MiB of private tests. Bounding
+    # Official rows can carry up to roughly 163 MiB of private tests. Bounding
     # in-flight submissions prevents the 880 x 10 final protocol from retaining
     # every request body in the server at once.
     concurrency: 8

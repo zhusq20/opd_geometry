@@ -226,6 +226,11 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     # plateau slightly early or late. Pass ``--lr-decay-iters`` explicitly if you
     # need exact decay control.
     args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    # Eval-only runs still construct an optimizer before loading actor weights,
+    # while their training loop remains empty. Megatron requires a positive
+    # scheduler horizon even though that scheduler is never stepped.
+    if args.num_rollout == 0 and args.eval_interval is not None:
+        args.train_iters = 1
     if args.lr_decay_iters is None:
         args.lr_decay_iters = args.train_iters
     lr_decay_steps = args.lr_decay_iters * args.global_batch_size
@@ -728,15 +733,20 @@ def train_one_step(
 
         check_mtp_only_grad(model, step_id)
 
+    probe_only = bool(getattr(args, "geometry_raw_gradient_probe_only", False))
     update_successful = False
     num_zeros_in_grad = None
-    if valid_step:
+    if valid_step and not probe_only:
         # Update parameters.
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
         if not update_successful:
             failure_reason = "optimizer_step_rejected"
 
-    if args.geometry_output_dir and args._slime_model_role in args.geometry_roles:
+    if (
+        args.geometry_output_dir
+        and args._slime_model_role in args.geometry_roles
+        and not probe_only
+    ):
         from slime_plugins.geometry.observer import after_optimizer_step
 
         after_optimizer_step(
@@ -754,7 +764,7 @@ def train_one_step(
 
     # Preserve Slime's established behavior for an optimizer-side rejection.
     # Geometry has already durably recorded the failed event before this abort.
-    if valid_step:
+    if valid_step and not probe_only:
         assert update_successful
 
     # Advance the scheduler only after geometry has read the optimizer groups:
@@ -764,7 +774,7 @@ def train_one_step(
     if update_successful:
         opt_param_scheduler.step(increment=step_global_batch_size)
 
-    if args.custom_megatron_after_train_step_hook_path:
+    if args.custom_megatron_after_train_step_hook_path and not probe_only:
         from slime.utils.misc import load_function
 
         custom_after_train_step_hook = load_function(args.custom_megatron_after_train_step_hook_path)

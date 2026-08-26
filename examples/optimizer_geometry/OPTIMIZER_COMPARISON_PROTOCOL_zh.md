@@ -121,7 +121,7 @@ scale=0.2，以及 vanilla SGD momentum=0 是 optimizer 定义的一部分；变
 
 | task | prompts = responses | updates (`ceil(N/64)`) | final batch |
 | --- | ---: | ---: | ---: |
-| Math | 22,050 | 345 | 34 |
+| Math | 18,230 | 285 | 54 |
 | Code | 19,125 | 299 | 53 |
 | Science | 19,668 | 308 | 20 |
 
@@ -193,10 +193,10 @@ teacher 的算法特有路径都真实执行过；没有把耗时数小时的 81
 ## 评测和 coding
 
 - Math/Science 在线 eval 使用固定独立集合；最终点必须保存逐样本 response/reward/status。
-- Coding 在线曲线使用 LiveCodeBench recent slice 的固定 64 题、greedy pass@1；它只用于曲线，
-  不冒充官方 full benchmark。
-- Coding 最终表使用官方 `release_v5`，`n=10, temperature=0.2, top_p=0.95`，由保存的逐样本
-  结果离线计算 pass@1/pass@5/pass@10。
+- Coding 默认在线曲线使用 LiveCodeBench v5 recent slice 的固定 128 题、greedy pass@1；v6 另有
+  独立 128 题配置，两者都只用于曲线，不冒充官方 full benchmark。
+- Coding 最终表分别使用官方 `release_v5` 和 `release_v6`，均设
+  `n=10, temperature=0.2, top_p=0.95`，由保存的逐样本结果离线计算 pass@1/pass@5/pass@10。
 - 所有模型生成代码只能发送到通过 `sandbox_preflight.py` 的 SandboxFusion endpoint；
   `isolation=none`、可见 host/service canary、可访问公网、缺少逐请求 namespace/cgroup/seccomp、
   内存或 timeout 未实际执行的服务一律 fail closed。

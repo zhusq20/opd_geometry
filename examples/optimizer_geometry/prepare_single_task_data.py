@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build reproducible math/code/science single-task manifests from prepared M2RL data.
+"""Build reproducible math/code/science/IF/Logic single-task manifests from prepared data.
 
 The input is the manifest emitted by ``prepare_m2rl_data.py``.  For each
 selected task this script writes an on-policy manifest, an optional SFT+OPD
@@ -8,7 +8,8 @@ benchmark file is preferred. Without one, ``tail_view`` makes a disjoint
 smoke-test holdout without copying the full training corpus; ``seeded_copy``
 retains the older exact-random split mode. For benchmarks that preserve the
 raw question in ``metadata.problem``, ``--exclude-eval-overlap`` can also
-materialize a benchmark-disjoint training view.
+materialize a benchmark-disjoint training view. ``--deduplicate`` removes
+repeated prompts from that materialized view.
 """
 
 from __future__ import annotations
@@ -150,8 +151,10 @@ def filter_eval_overlap_jsonl(
     benchmark_path: Path,
     *,
     input_key: str,
-) -> tuple[int, list[dict[str, Any]]]:
-    """Materialize a training JSONL view with benchmark problems removed."""
+    label_key: str,
+    deduplicate: bool,
+) -> tuple[int, list[dict[str, Any]], int]:
+    """Materialize a training JSONL view with overlaps and duplicate prompts removed."""
 
     if input_path.suffix.lower() != ".jsonl":
         raise ValueError("--exclude-eval-overlap currently supports prepared JSONL training sources only.")
@@ -160,6 +163,8 @@ def filter_eval_overlap_jsonl(
     temporary = output_path.with_name(f".{output_path.name}.tmp.{os.getpid()}")
     kept = 0
     removed: list[dict[str, Any]] = []
+    duplicate_count = 0
+    seen_prompts: dict[str, tuple[str, int]] = {}
     completed = False
     try:
         with input_path.open(encoding="utf-8") as source, temporary.open("w", encoding="utf-8") as output:
@@ -196,6 +201,32 @@ def filter_eval_overlap_jsonl(
                         }
                     )
                     continue
+                if deduplicate:
+                    if input_key not in row:
+                        raise ValueError(f"Training row {row_index} in {input_path} has no {input_key!r} field.")
+                    prompt_identity = json.dumps(
+                        prompt,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    label_identity = json.dumps(
+                        row.get(label_key),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    previous = seen_prompts.get(prompt_identity)
+                    if previous is not None:
+                        previous_label, previous_row = previous
+                        if previous_label != label_identity:
+                            raise ValueError(
+                                f"Conflicting labels for duplicate prompts at {input_path} rows "
+                                f"{previous_row} and {row_index}."
+                            )
+                        duplicate_count += 1
+                        continue
+                    seen_prompts[prompt_identity] = (label_identity, row_index)
                 output.write(line if line.endswith("\n") else line + "\n")
                 kept += 1
         if kept == 0:
@@ -205,7 +236,7 @@ def filter_eval_overlap_jsonl(
     finally:
         if not completed:
             temporary.unlink(missing_ok=True)
-    return kept, removed
+    return kept, removed, duplicate_count
 
 
 def split_jsonl(input_path: Path, train_path: Path, eval_path: Path, count: int, seed: int) -> tuple[int, int]:
@@ -350,6 +381,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     if invalid_top_p:
         raise ValueError(f"--eval-top-p-override values must be in (0, 1]: {invalid_top_p}.")
     exclude_eval_overlap = set(getattr(args, "exclude_eval_overlap", []))
+    deduplicate = set(getattr(args, "deduplicate", []))
     skip_eval = set(getattr(args, "skip_eval", []))
     configured_tasks = (
         set(sft_paths)
@@ -361,6 +393,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         | set(eval_temperatures)
         | set(eval_top_p_overrides)
         | exclude_eval_overlap
+        | deduplicate
     )
     unknown = (configured_tasks | skip_eval) - set(args.tasks)
     if unknown:
@@ -368,6 +401,12 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     conflicts = skip_eval & set(eval_paths)
     if conflicts:
         raise ValueError(f"Tasks cannot use both --eval and --skip-eval: {sorted(conflicts)}.")
+    deduplicate_without_materialized_view = deduplicate - exclude_eval_overlap
+    if deduplicate_without_materialized_view:
+        raise ValueError(
+            "--deduplicate currently requires --exclude-eval-overlap for tasks: "
+            f"{sorted(deduplicate_without_materialized_view)}."
+        )
     eval_metadata_without_data = (
         set(eval_names)
         | set(eval_rm_types)
@@ -397,6 +436,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         task_dir = args.output_dir / task
         external_eval = eval_paths.get(task)
         excluded_overlap_rows: list[dict[str, Any]] = []
+        excluded_duplicate_rows = 0
         eval_value: str | None
         if task in skip_eval:
             train_value = original_path
@@ -436,11 +476,13 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 if "@[" in original_path or "@[" in eval_value:
                     raise ValueError("--exclude-eval-overlap does not accept sliced training or evaluation paths.")
                 filtered_train_path = task_dir / f"{task}_train_eval_disjoint.jsonl"
-                train_count, excluded_overlap_rows = filter_eval_overlap_jsonl(
+                train_count, excluded_overlap_rows, excluded_duplicate_rows = filter_eval_overlap_jsonl(
                     real_path(original_path),
                     filtered_train_path,
                     real_path(eval_value),
                     input_key=str(original.get("input_key") or "prompt"),
+                    label_key=str(original.get("label_key") or "label"),
+                    deduplicate=task in deduplicate,
                 )
                 train_value = str(filtered_train_path.resolve())
             else:
@@ -533,6 +575,8 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         if task in exclude_eval_overlap:
             summary["tasks"][task]["excluded_eval_overlap_rows"] = len(excluded_overlap_rows)
             summary["tasks"][task]["excluded_eval_overlaps"] = excluded_overlap_rows
+        if task in deduplicate:
+            summary["tasks"][task]["excluded_duplicate_rows"] = excluded_duplicate_rows
 
     summary_path = args.output_dir / "single_task_index.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -543,7 +587,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rl-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--tasks", nargs="+", default=["math", "code", "science"])
+    parser.add_argument("--tasks", nargs="+", default=["math", "code", "science", "if", "logic"])
     parser.add_argument(
         "--sft",
         action="append",
@@ -616,6 +660,13 @@ def parse_args() -> argparse.Namespace:
             "Materialize a training JSONL view with rows containing external benchmark metadata.problem "
             "removed; may be repeated."
         ),
+    )
+    parser.add_argument(
+        "--deduplicate",
+        action="append",
+        default=[],
+        metavar="TASK",
+        help="Remove repeated prompts while materializing an --exclude-eval-overlap training view.",
     )
     parser.add_argument("--holdout-count", type=int, default=256)
     parser.add_argument(
