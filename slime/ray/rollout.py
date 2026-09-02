@@ -472,6 +472,133 @@ class RolloutServer:
         return ray.get(handles) if handles else []
 
 
+def _assemble_mopd_feedback(args: Any, rollout_metrics: dict[str, Any], trainer_feedback: dict[str, Any]):
+    """Combine end-to-end wall time with auditable stage-level MOPD costs."""
+
+    feedback = dict(trainer_feedback or {})
+    if not feedback.get("mopd"):
+        raise ValueError(f"Trainer did not return MOPD feedback: {feedback!r}")
+
+    operation = str(feedback["operation"])
+    for unit in feedback["task_units"]:
+        task = str(unit["task"])
+        prefix = f"mopd/task/{task}/"
+        rollout_seconds = float(rollout_metrics[prefix + "student_rollout_seconds"])
+        ready_seconds = float(rollout_metrics[prefix + "teacher_ready_seconds"])
+        scoring_seconds = float(rollout_metrics[prefix + "teacher_scoring_seconds"])
+        switch_seconds = float(rollout_metrics[prefix + "teacher_switch_seconds"])
+        switched = bool(rollout_metrics[prefix + "switched"])
+        backward_seconds = float(unit["actor_forward_backward_wall_seconds"])
+        capture_seconds = float(unit["optimizer_wall_seconds"])
+        resident_readiness_tail = 0.0 if switched else max(ready_seconds - rollout_seconds, 0.0)
+        service_seconds = (
+            rollout_seconds
+            + resident_readiness_tail
+            + scoring_seconds
+            + backward_seconds
+            + capture_seconds
+        )
+        if operation == "probe":
+            predicted_full = 8.0 * service_seconds
+        else:
+            predicted_full = service_seconds
+        unit.update(
+            {
+                "predicted_full_task_seconds": predicted_full,
+                "teacher_switch_seconds": switch_seconds,
+                "teacher_load_seconds": float(rollout_metrics[prefix + "teacher_load_seconds"]),
+                "teacher_offload_seconds": float(rollout_metrics[prefix + "teacher_offload_seconds"]),
+                "teacher_ready_seconds": ready_seconds,
+                "student_rollout_seconds": rollout_seconds,
+                "teacher_scoring_seconds": scoring_seconds,
+                "prompt_count": int(rollout_metrics[prefix + "prompt_count"]),
+                "attempted_responses": int(rollout_metrics[prefix + "attempted_responses"]),
+                "valid_response_tokens": int(rollout_metrics[prefix + "valid_response_tokens"]),
+                "teacher_scored_tokens": int(rollout_metrics[prefix + "teacher_scored_tokens"]),
+                "completed_responses": int(rollout_metrics[prefix + "completed_responses"]),
+                "truncated_responses": int(rollout_metrics[prefix + "truncated_responses"]),
+                "invalid_responses": int(rollout_metrics[prefix + "invalid_responses"]),
+                "empty_responses": int(rollout_metrics[prefix + "empty_responses"]),
+                "teacher_scoring_failures": int(rollout_metrics[prefix + "teacher_scoring_failures"]),
+                "teacher_memory_mib": float(rollout_metrics[prefix + "teacher_memory_mib"]),
+                "teacher_transfer_tail_seconds": float(
+                    rollout_metrics[prefix + "teacher_transfer_tail_seconds"]
+                ),
+                "switched": switched,
+            }
+        )
+
+    active_component_costs = {
+        "rollout_gpu_seconds": float(rollout_metrics["mopd/student_rollout_gpu_seconds"]),
+        "teacher_gpu_seconds": float(rollout_metrics["mopd/teacher_gpu_seconds"]),
+        "actor_forward_backward_gpu_seconds": float(feedback["actor_forward_backward_gpu_seconds"]),
+        "optimizer_gpu_seconds": float(feedback["optimizer_gpu_seconds"]),
+    }
+    feedback.update(active_component_costs)
+    rollout_and_teacher_wall_seconds = float(
+        rollout_metrics["mopd/rollout_and_teacher_wall_seconds"]
+    )
+    component_wall_seconds = float(
+        rollout_and_teacher_wall_seconds
+        + rollout_metrics["mopd/reward_wall_seconds"]
+        + feedback["actor_forward_backward_wall_seconds"]
+        + feedback["optimizer_wall_seconds"]
+    )
+    total_step_seconds = float(feedback.pop("driver_step_wall_seconds"))
+    if not math.isfinite(total_step_seconds) or total_step_seconds <= 0:
+        raise ValueError(f"Invalid end-to-end MOPD step time: {total_step_seconds}.")
+    if total_step_seconds + 1e-6 < component_wall_seconds:
+        raise ValueError(
+            "End-to-end MOPD step time is shorter than its measured critical-path stages: "
+            f"total={total_step_seconds}, stages={component_wall_seconds}."
+        )
+
+    student_pool_gpu_count = max(
+        int(args.rollout_num_gpus),
+        int(args.actor_num_nodes) * int(args.actor_num_gpus_per_node),
+    )
+    teacher_pool_gpu_count = int(rollout_metrics["mopd/teacher_pool_gpu_count"])
+    if student_pool_gpu_count <= 0 or teacher_pool_gpu_count <= 0:
+        raise ValueError("MOPD resident student and teacher GPU pools must both be positive.")
+    allocated_gpu_count = student_pool_gpu_count + teacher_pool_gpu_count
+    feedback.update(
+        {
+            "rollout_wall_seconds": float(rollout_metrics["mopd/student_rollout_wall_seconds"]),
+            "teacher_wall_seconds": float(rollout_metrics["mopd/teacher_wall_seconds"]),
+            "rollout_and_teacher_wall_seconds": rollout_and_teacher_wall_seconds,
+            "reward_wall_seconds": float(rollout_metrics["mopd/reward_wall_seconds"]),
+            "actor_forward_backward_wall_seconds": float(feedback["actor_forward_backward_wall_seconds"]),
+            "optimizer_wall_seconds": float(feedback["optimizer_wall_seconds"]),
+            "valid_response_tokens": int(rollout_metrics["mopd/valid_response_tokens"]),
+            "teacher_scored_tokens": int(rollout_metrics["mopd/teacher_scored_tokens"]),
+            "prompt_count": int(rollout_metrics["mopd/prompt_count"]),
+            "completed_responses": int(rollout_metrics["mopd/completed_responses"]),
+            "truncated_responses": int(rollout_metrics["mopd/truncated_responses"]),
+            "invalid_responses": int(rollout_metrics["mopd/invalid_responses"]),
+            "student_pool_gpu_count": student_pool_gpu_count,
+            "teacher_pool_gpu_count": teacher_pool_gpu_count,
+            "allocated_gpu_count": allocated_gpu_count,
+            "active_gpu_seconds": float(sum(active_component_costs.values())),
+            "component_wall_seconds": component_wall_seconds,
+            # GPU hours account for every resident GPU over the full operation,
+            # including idle time in the colocated student pool and one teacher slot.
+            "total_gpu_seconds": total_step_seconds * allocated_gpu_count,
+            "total_step_seconds": total_step_seconds,
+            "total_wall_seconds": total_step_seconds,
+            "peak_hbm_bytes": int(feedback.get("peak_hbm_bytes", 0)),
+            "teacher_peak_memory_mib": float(rollout_metrics["mopd/teacher_peak_memory_mib"]),
+            "resident_teacher_after": (
+                None
+                if int(rollout_metrics["mopd/resident_teacher_after_index"]) < 0
+                else ("math", "code", "if", "science")[
+                    int(rollout_metrics["mopd/resident_teacher_after_index"])
+                ]
+            ),
+        }
+    )
+    return feedback
+
+
 @ray.remote
 class RolloutManager:
     """The class to run rollout and convert rollout data to training data."""
@@ -537,6 +664,7 @@ class RolloutManager:
             runtime_env={"env_vars": add_default_ray_env_vars()},
         ).remote()
         self.rollout_id = -1
+        self._mopd_rollout_metrics: dict[int, dict[str, Any]] = {}
 
         self._health_monitors = []
         if not self.args.debug_train_only and self.args.use_fault_tolerance:
@@ -632,7 +760,13 @@ class RolloutManager:
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         metrics = dict(metrics or {})
-        model_version = num_updates_before_rollout(self.args, rollout_id)
+        if getattr(self.args, "mopd_enabled", False):
+            pending = self.data_source.controller.pending
+            if pending is None:
+                raise RuntimeError("MOPD rollout lost its pending response-clock plan")
+            model_version = int(pending["optimizer_updates_before"])
+        else:
+            model_version = num_updates_before_rollout(self.args, rollout_id)
         metrics.update(
             {
                 "rollout/id": int(rollout_id),
@@ -640,6 +774,10 @@ class RolloutManager:
                 "rollout/model_version": model_version,
             }
         )
+        if getattr(self.args, "mopd_enabled", False):
+            self._mopd_rollout_metrics[int(rollout_id)] = {
+                key: value for key, value in metrics.items() if key.startswith("mopd/")
+            }
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         if self.args.debug_rollout_only:
             # if debug rollout only, we don't convert samples to train data and directly return
@@ -680,6 +818,91 @@ class RolloutManager:
 
     def save(self, rollout_id):
         self.data_source.save(rollout_id)
+
+    def mopd_budget_status(self):
+        if not getattr(self.args, "mopd_enabled", False):
+            raise RuntimeError("mopd_budget_status requires --mopd-enabled")
+        return self.data_source.budget_status()
+
+    def complete_mopd_update(self, rollout_id: int, trainer_feedback: dict[str, Any]):
+        """Join rollout/teacher and trainer stage costs, then advance the sampler."""
+
+        if not getattr(self.args, "mopd_enabled", False):
+            raise RuntimeError("complete_mopd_update was called without --mopd-enabled.")
+        rollout_metrics = self._mopd_rollout_metrics.pop(int(rollout_id), None)
+        if rollout_metrics is None:
+            raise RuntimeError(f"Missing staged rollout metrics for MOPD update {rollout_id}.")
+        feedback = _assemble_mopd_feedback(self.args, rollout_metrics, trainer_feedback)
+        record = self.data_source.complete_update(int(rollout_id), feedback)
+        log_values = {
+            "mopd/operation_index": int(record["operation_index"]),
+            "mopd/update": int(record["operation_index"]),
+            "mopd/operation_train": int(record["operation"] == "train"),
+            "mopd/operation_probe": int(record["operation"] == "probe"),
+            "mopd/operation_bank": int(record["operation"] == "bank"),
+            "mopd/task_width": int(record["task_width"]),
+            "mopd/attempted_responses_before": int(record["attempted_responses_before"]),
+            "mopd/attempted_responses": int(record["attempted_responses_after"]),
+            "mopd/processed_task_units": int(record["processed_task_units_after"]),
+            "mopd/optimizer_updates": int(record["optimizer_updates_after"]),
+            "mopd/probe_count": int(record["probe_count_after"]),
+            "mopd/checkpoint_due": int(record["checkpoint_due"]),
+            "mopd/budget_complete": int(record["budget_complete"]),
+            "mopd/valid_response_tokens": int(feedback["valid_response_tokens"]),
+            "mopd/teacher_scored_tokens": int(feedback["teacher_scored_tokens"]),
+            "mopd/prompt_count": int(feedback["prompt_count"]),
+            "mopd/completed_responses": int(feedback["completed_responses"]),
+            "mopd/truncated_responses": int(feedback["truncated_responses"]),
+            "mopd/invalid_responses": int(feedback["invalid_responses"]),
+            "mopd/rollout_gpu_seconds": float(feedback["rollout_gpu_seconds"]),
+            "mopd/teacher_gpu_seconds": float(feedback["teacher_gpu_seconds"]),
+            "mopd/actor_forward_backward_gpu_seconds": float(feedback["actor_forward_backward_gpu_seconds"]),
+            "mopd/optimizer_gpu_seconds": float(feedback["optimizer_gpu_seconds"]),
+            "mopd/total_gpu_seconds": float(feedback["total_gpu_seconds"]),
+            "mopd/active_gpu_seconds": float(feedback["active_gpu_seconds"]),
+            "mopd/allocated_gpu_count": int(feedback["allocated_gpu_count"]),
+            "mopd/rollout_wall_seconds": float(feedback["rollout_wall_seconds"]),
+            "mopd/teacher_wall_seconds": float(feedback["teacher_wall_seconds"]),
+            "mopd/rollout_and_teacher_wall_seconds": float(
+                feedback["rollout_and_teacher_wall_seconds"]
+            ),
+            "mopd/reward_wall_seconds": float(feedback["reward_wall_seconds"]),
+            "mopd/actor_forward_backward_wall_seconds": float(feedback["actor_forward_backward_wall_seconds"]),
+            "mopd/optimizer_wall_seconds": float(feedback["optimizer_wall_seconds"]),
+            "mopd/total_step_seconds": float(feedback["total_step_seconds"]),
+            "mopd/component_wall_seconds": float(feedback["component_wall_seconds"]),
+            "mopd/total_wall_seconds": float(feedback["total_wall_seconds"]),
+            "mopd/peak_hbm_bytes": int(feedback["peak_hbm_bytes"]),
+            "mopd/teacher_peak_memory_mib": float(feedback["teacher_peak_memory_mib"]),
+            "mopd/overflow_flag": int(bool(feedback["overflow_flag"])),
+        }
+        for task, probability in record["inclusion_probabilities"].items():
+            log_values[f"mopd/inclusion/{task}"] = float(probability)
+            log_values[f"mopd/score_age/{task}"] = int(record["score_ages_after"][task])
+            log_values[f"mopd/raw_gradient_rms/{task}"] = float(record["raw_gradient_rms_after"][task])
+            log_values[f"mopd/adam_gradient_rms/{task}"] = float(record["adam_gradient_rms_after"][task])
+            log_values[f"mopd/task_seconds_ema/{task}"] = float(record["task_seconds_after"][task])
+            log_values[f"mopd/switch_seconds_ema/{task}"] = float(record["switch_seconds_after"][task])
+        for subset, probability in record["set_distribution"].items():
+            log_values[f"mopd/set_probability/{subset}"] = float(probability)
+        for unit in feedback["task_units"]:
+            task = str(unit["task"])
+            for key in (
+                "raw_score", "adam_score", "raw_teacher_loss", "relative_teacher_loss",
+                "importance_correction", "inclusion_probability", "predicted_full_task_seconds",
+                "teacher_switch_seconds", "teacher_load_seconds", "teacher_offload_seconds",
+                "teacher_ready_seconds", "teacher_transfer_tail_seconds", "student_rollout_seconds",
+                "teacher_scoring_seconds", "actor_forward_backward_wall_seconds",
+                "actor_forward_backward_gpu_seconds", "optimizer_wall_seconds",
+                "optimizer_gpu_seconds", "teacher_memory_mib", "student_peak_hbm_bytes",
+                "attempted_responses", "valid_response_tokens", "teacher_scored_tokens",
+                "completed_responses", "truncated_responses", "invalid_responses",
+                "empty_responses", "teacher_scoring_failures",
+            ):
+                log_values[f"mopd/task/{task}/{key}"] = float(unit[key])
+            log_values[f"mopd/task/{task}/clip_flag"] = int(bool(unit["clip_flag"]))
+        logging_utils.log(self.args, log_values, step_key="mopd/update")
+        return record
 
     def load(self, rollout_id=None):
         self.data_source.load(rollout_id)
@@ -745,7 +968,10 @@ class RolloutManager:
                 logger.info(
                     f"Subsample loaded debug rollout data using {ratio=} and change num rows {original_num_rows} -> {len(data)}"
                 )
-            metrics = None
+            if getattr(self.args, "mopd_enabled", False):
+                raise ValueError("MOPD does not accept cached rollout batches.")
+            else:
+                metrics = None
         else:
             data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
             metrics = data.metrics
@@ -936,10 +1162,32 @@ class RolloutManager:
         if samples[0].metadata is not None:
             train_data["source_names"] = [get_source(sample) for sample in samples]
 
+        if getattr(self.args, "mopd_enabled", False):
+            metadata_fields = {
+                "mopd_tasks": "mopd_task",
+                "mopd_operations": "mopd_operation",
+                "mopd_operation_indices": "mopd_operation_index",
+                "mopd_inclusion_probabilities": "mopd_inclusion_probability",
+                "mopd_target_weights": "mopd_target_weight",
+                "mopd_importance_corrections": "mopd_importance_correction",
+                "mopd_relative_loss_scales": "mopd_relative_loss_scale",
+                "mopd_failure_penalties": "mopd_failure_penalty",
+                "mopd_processed_task_units_before": "mopd_processed_task_units_before",
+                "mopd_adamw_states": "mopd_adamw_state",
+                "mopd_step_global_batch_sizes": "mopd_step_global_batch_size",
+            }
+            for output_key, metadata_key in metadata_fields.items():
+                if any(metadata_key not in (sample.metadata or {}) for sample in samples):
+                    raise ValueError(f"Every MOPD sample must carry metadata field {metadata_key!r}.")
+                train_data[output_key] = [sample.metadata[metadata_key] for sample in samples]
+
         return train_data
 
     def set_train_parallel_config(self, config: dict):
         self.train_parallel_config = config
+        setter = getattr(self.data_source, "set_train_parallel_config", None)
+        if setter is not None:
+            setter(config)
 
     def _split_train_data_by_dp(self, data):
         """Compute the DP/mbs schedule and package each rank's rollout_data
@@ -958,6 +1206,21 @@ class RolloutManager:
         data["total_lengths"] = total_lengths
 
         schedule_global_batch_size = self.args.global_batch_size
+        if getattr(self.args, "mopd_enabled", False):
+            if len(set(data["rollout_ids"])) != len(data["rollout_ids"]):
+                raise ValueError("MOPD requires one independently normalized training sample per response")
+            step_sizes = set(map(int, data["mopd_step_global_batch_sizes"]))
+            if len(step_sizes) != 1:
+                raise ValueError("one MOPD operation contains multiple backward-slice sizes")
+            schedule_global_batch_size = step_sizes.pop()
+            if len(data["rollout_ids"]) % schedule_global_batch_size:
+                raise ValueError("MOPD operation cannot be partitioned into complete backward slices")
+            for start in range(0, len(data["rollout_ids"]), schedule_global_batch_size):
+                stop = start + schedule_global_batch_size
+                if len(set(data["mopd_tasks"][start:stop])) != 1:
+                    raise ValueError("one MOPD backward slice contains responses from multiple tasks")
+                if len(set(data["mopd_operations"][start:stop])) != 1:
+                    raise ValueError("one MOPD backward slice contains multiple operation types")
         if hasattr(self.args, "rollout_prompts_per_epoch"):
             # A dataset epoch can end with fewer prompt groups than the normal
             # global batch.  Use every returned rollout exactly once and let
@@ -1003,6 +1266,17 @@ class RolloutManager:
                 "metadata",
                 "prompt",
                 "teacher_log_probs",
+                "mopd_tasks",
+                "mopd_operations",
+                "mopd_operation_indices",
+                "mopd_inclusion_probabilities",
+                "mopd_target_weights",
+                "mopd_importance_corrections",
+                "mopd_relative_loss_scales",
+                "mopd_failure_penalties",
+                "mopd_processed_task_units_before",
+                "mopd_adamw_states",
+                "mopd_step_global_batch_sizes",
             ]:
                 if key not in data:
                     continue
@@ -1557,14 +1831,6 @@ def _save_eval_artifacts(args, rollout_id: int, data: dict[str, dict[str, Any]],
 
 
 def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
-    if getattr(args, "geometry_output_dir", None) and not getattr(args, "load_debug_rollout_data", None):
-        # Keep prompt/response serialization and durable I/O entirely off the
-        # normal training path.  Import lazily so geometry has zero import cost
-        # when it is disabled.
-        from slime_plugins.geometry.rollout_samples import persist_rollout_samples
-
-        persist_rollout_samples(rollout_id, args, samples)
-
     if args.custom_rollout_log_function_path is not None:
         custom_log_func = load_function(args.custom_rollout_log_function_path)
         if custom_log_func(rollout_id, args, samples, rollout_extra_metrics, rollout_time):

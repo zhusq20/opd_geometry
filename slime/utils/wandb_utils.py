@@ -144,6 +144,40 @@ def _log_provenance_artifact(args) -> None:
     wandb.log_artifact(artifact)
 
 
+def log_run_data_artifact(args) -> None:
+    """Upload compact, lossless plotting inputs after a successful run."""
+
+    if wandb.run is None:
+        return
+    artifact = wandb.Artifact(
+        name=f"{wandb.run.id}-plot-data",
+        type="experiment-data",
+        description="Lossless JSONL metrics, allocation decisions, and completion metadata.",
+    )
+    added = 0
+    metrics_value = getattr(args, "metrics_output_dir", None)
+    if metrics_value:
+        metrics = Path(os.path.expandvars(os.path.expanduser(metrics_value)))
+        if metrics.is_dir():
+            for path in sorted(metrics.glob("*.jsonl")):
+                artifact.add_file(str(path), name=f"metrics/{path.name}")
+                added += 1
+    allocation_value = getattr(args, "mopd_output_dir", None)
+    if allocation_value:
+        allocation = Path(os.path.expandvars(os.path.expanduser(allocation_value))) / "allocation.jsonl"
+        if allocation.is_file():
+            artifact.add_file(str(allocation), name="allocation/allocation.jsonl")
+            added += 1
+    marker_value = getattr(args, "completion_marker_path", None)
+    if marker_value:
+        marker = Path(os.path.expandvars(os.path.expanduser(marker_value)))
+        if marker.is_file():
+            artifact.add_file(str(marker), name="run_complete.json")
+            added += 1
+    if added:
+        wandb.log_artifact(artifact)
+
+
 def _compute_config_for_logging(args):
     output = _args_to_config_dict(args)
 
@@ -243,7 +277,5 @@ def _init_wandb_common():
     wandb.define_metric("eval/step")
     wandb.define_metric("eval/*", step_metric="eval/step")
     wandb.define_metric("perf/*", step_metric="rollout/step")
-    wandb.define_metric("geometry/step")
-    wandb.define_metric("geometry/*", step_metric="geometry/step")
-    wandb.define_metric("forgetting/step")
-    wandb.define_metric("forgetting/*", step_metric="forgetting/step")
+    wandb.define_metric("mopd/update")
+    wandb.define_metric("mopd/*", step_metric="mopd/update")

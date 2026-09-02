@@ -1549,139 +1549,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
-        def add_geometry_arguments(parser):
-            group = parser.add_argument_group("parameter geometry")
-            group.add_argument(
-                "--geometry-output-dir",
-                type=str,
-                default=None,
-                help="Enable parameter-geometry observations and write them under this directory.",
-            )
-            group.add_argument(
-                "--geometry-interval",
-                type=int,
-                default=1,
-                help=(
-                    "Run low-frequency CountSketch/vector observations every N optimizer steps. "
-                    "Required exact scalar geometry is still recorded for every attempted update."
-                ),
-            )
-            group.add_argument(
-                "--geometry-projection-dim",
-                type=int,
-                default=256,
-                help="CountSketch dimension used for update/displacement/cosine measurements.",
-            )
-            group.add_argument("--geometry-seed", type=int, default=1234)
-            group.add_argument(
-                "--geometry-parameter-include",
-                type=str,
-                default=".*",
-                help="Regular expression selecting named trainable parameters.",
-            )
-            group.add_argument(
-                "--geometry-parameter-exclude",
-                type=str,
-                default=None,
-                help="Optional regular expression excluding named parameters.",
-            )
-            group.add_argument(
-                "--geometry-group-by",
-                choices=["global", "layer", "module"],
-                default="layer",
-                help="Granularity of stored geometry metrics.",
-            )
-            group.add_argument(
-                "--geometry-roles",
-                nargs="+",
-                choices=["actor", "critic"],
-                default=["actor"],
-                help="Model roles to observe. PPO critics are excluded by default.",
-            )
-            group.add_argument(
-                "--geometry-sketch-chunk-size",
-                type=int,
-                default=1_048_576,
-                help="Maximum parameter elements hashed in one projection chunk.",
-            )
-            group.add_argument(
-                "--geometry-support-sample-size",
-                type=int,
-                default=1024,
-                help=(
-                    "Deterministic coordinates retained per optimizer-owned parameter range for "
-                    "low-frequency support Jaccard/window estimates."
-                ),
-            )
-            group.add_argument(
-                "--geometry-support-window",
-                type=int,
-                default=8,
-                help="Number of successful updates in the sampled-coordinate support window.",
-            )
-            group.add_argument(
-                "--geometry-matrix-sample-count",
-                type=int,
-                default=1,
-                help=(
-                    "Fixed full optimizer-owned matrices sampled per real optimizer branch and rank for low-frequency "
-                    "spectral/orthogonality diagnostics."
-                ),
-            )
-            group.add_argument(
-                "--geometry-matrix-randomized-rank",
-                type=int,
-                default=16,
-                help="Deterministic randomized-SVD rank for sampled matrices larger than 256.",
-            )
-            group.add_argument(
-                "--no-geometry-save-vectors",
-                action="store_false",
-                dest="geometry_save_vectors",
-                default=True,
-                help="Store scalar JSONL only; omit projected-vector .pt files.",
-            )
-            group.add_argument(
-                "--geometry-raw-gradient-probe-dir",
-                type=str,
-                default=None,
-                help=(
-                    "Optional output directory for exact FP32 pre-clipping raw-gradient shards. "
-                    "Use only in a fixed-checkpoint probe run together with "
-                    "--geometry-raw-gradient-probe-updates."
-                ),
-            )
-            group.add_argument(
-                "--geometry-raw-gradient-probe-updates",
-                type=int,
-                default=0,
-                help=(
-                    "Number of equal-sized probe backward batches to average before writing raw-gradient shards."
-                ),
-            )
-            group.add_argument(
-                "--geometry-raw-gradient-probe-only",
-                action="store_true",
-                help=(
-                    "Run fixed-checkpoint raw-gradient probing without optimizer or scheduler steps. "
-                    "Requires --geometry-raw-gradient-probe-dir."
-                ),
-            )
-            group.add_argument(
-                "--geometry-wandb-groups",
-                type=str,
-                default=(
-                    "global,optimizer_branch/adam,optimizer_branch/sgd,"
-                    "optimizer_branch/muon_matrix,optimizer_branch/adam_fallback"
-                ),
-                help=(
-                    "Comma-separated geometry groups mirrored to W&B when --use-wandb is enabled. "
-                    "Optimizer branches come from actual optimizer membership, never tensor shape. "
-                    "Use `all` for every stored group or an empty value to disable geometry W&B metrics."
-                ),
-            )
-            return parser
-
         def add_m2rl_experiment_arguments(parser):
             group = parser.add_argument_group("M2RL multi-task experiments")
             group.add_argument(
@@ -1733,12 +1600,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="WorkBench resource/environment server used by the multi-turn agent rollout.",
             )
             group.add_argument(
-                "--forgetting-output-dir",
-                type=str,
-                default=None,
-                help="Directory for per-task eval curves and max-so-far forgetting metrics.",
-            )
-            group.add_argument(
                 "--metrics-output-dir",
                 type=str,
                 default=None,
@@ -1768,6 +1629,55 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             group.add_argument("--experiment-name", type=str, default=None)
             group.add_argument("--experiment-optimizer", type=str, default=None)
             group.add_argument("--experiment-data-index", type=str, default=None)
+            return parser
+
+        def add_mopd_arguments(parser):
+            group = parser.add_argument_group("Exact-set four-task MOPD experiment")
+            group.add_argument("--mopd-enabled", action="store_true", default=False)
+            group.add_argument(
+                "--mopd-run-mode", choices=["warm", "train", "bank"], default="train"
+            )
+            group.add_argument(
+                "--mopd-allocation",
+                choices=["uniform", "gpas", "cost_gpas", "all"],
+                default="uniform",
+            )
+            group.add_argument("--mopd-task-width", type=int, choices=[1, 2, 4], default=1)
+            group.add_argument(
+                "--mopd-adamw-state", choices=["conventional", "taskwise"], default="taskwise"
+            )
+            group.add_argument("--mopd-seed", type=int, default=42)
+            group.add_argument("--mopd-ema-decay", type=float, default=0.95)
+            group.add_argument("--mopd-inclusion-floor", type=float, default=0.05)
+            group.add_argument("--mopd-score-max-age", type=int, default=50)
+            group.add_argument("--mopd-response-budget", type=int, default=64_000)
+            group.add_argument(
+                "--mopd-checkpoint-responses", type=str, default="16384,32768,64000"
+            )
+            group.add_argument(
+                "--mopd-eval-responses",
+                type=str,
+                default="2048,4096,8192,16384,32768,49152,64000",
+                help="Comma-separated attempted-response milestones for held-out teacher-loss evaluation.",
+            )
+            group.add_argument("--mopd-failure-penalty", type=float, default=10.0)
+            group.add_argument(
+                "--mopd-output-dir",
+                type=str,
+                default=None,
+                help="Directory for exact-set allocation.jsonl and response-clock records.",
+            )
+            group.add_argument("--mopd-score-chunk-size", type=int, default=1_048_576)
+            group.add_argument("--mopd-reset-sampler", action="store_true", default=False)
+            group.add_argument(
+                "--mopd-eval-on-start",
+                action="store_true",
+                default=False,
+                help="Recreate a missing evaluation immediately after loading a resumable checkpoint.",
+            )
+            group.add_argument("--mopd-bank-dir", type=str, default=None)
+            group.add_argument("--mopd-bank-coordinates", type=int, default=65_536)
+            group.add_argument("--mopd-bank-units-per-task", type=int, default=8)
             return parser
 
         def add_mtp_training_arguments(parser):
@@ -1834,8 +1744,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_mtp_training_arguments(parser)
         parser = add_ci_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
-        parser = add_geometry_arguments(parser)
         parser = add_m2rl_experiment_arguments(parser)
+        parser = add_mopd_arguments(parser)
         reset_arg(
             parser,
             "--custom-config-path",
@@ -2309,45 +2219,166 @@ def slime_validate_args(args):
 
             configure_optimizer_runtime(args)
 
-    if getattr(args, "geometry_output_dir", None) is not None:
-        if getattr(args, "overlap_param_gather", False) or getattr(
-            args, "overlap_param_gather_with_optimizer_step", False
+    if getattr(args, "mopd_enabled", False):
+        required_paths = {
+            "data_source_path": "slime_plugins.mopd.data_source.MOPDRolloutDataSource",
+            "rollout_function_path": "slime_plugins.mopd.rollout.generate_rollout",
+        }
+        for attribute, expected in required_paths.items():
+            observed = getattr(args, attribute, None)
+            if observed != expected:
+                raise ValueError(f"Allocation runs require --{attribute.replace('_', '-')} {expected}.")
+        if not args.rollout_global_dataset:
+            raise ValueError("Task allocation requires --rollout-global-dataset.")
+        if str(args.optimizer).lower() != "adam":
+            raise ValueError("MOPD requires AdamW.")
+        if not bool(getattr(args, "decoupled_weight_decay", True)):
+            raise ValueError("MOPD requires decoupled AdamW weight decay semantics.")
+        if args.n_samples_per_prompt != 4:
+            raise ValueError("MOPD task units require --n-samples-per-prompt 4.")
+        if not args.use_rollout_logprobs:
+            raise ValueError(
+                "MOPD requires --use-rollout-logprobs so sampled OPD uses the on-policy SGLang "
+                "log-probabilities without an extra actor forward pass."
+            )
+        if args.calculate_per_token_loss:
+            raise ValueError("MOPD uses one response-normalized gradient per selected task.")
+        if args.use_critic:
+            raise ValueError("MOPD does not use a critic.")
+        if args.partial_rollout or args.dynamic_sampling_filter_path is not None:
+            raise ValueError("Fixed-token task batches cannot use partial rollout or dynamic filtering.")
+        if args.custom_generate_function_path is not None:
+            raise ValueError("The staged allocation rollout uses the standard single-turn SGLang generator.")
+        if float(args.clip_grad) <= 0:
+            raise ValueError("A positive shared pre-correction gradient clip is required.")
+        if any(
+            bool(getattr(args, flag, False))
+            for flag in ("overlap_param_gather", "overlap_param_gather_with_optimizer_step")
         ):
-            raise ValueError(
-                "Parameter geometry requires synchronous post-step parameters; disable "
-                "--overlap-param-gather and --overlap-param-gather-with-optimizer-step."
-            )
-        if args.geometry_interval <= 0:
-            raise ValueError("--geometry-interval must be positive.")
-        if args.geometry_projection_dim <= 0:
-            raise ValueError("--geometry-projection-dim must be positive.")
-        if args.geometry_sketch_chunk_size <= 0:
-            raise ValueError("--geometry-sketch-chunk-size must be positive.")
-        if args.geometry_support_sample_size <= 0:
-            raise ValueError("--geometry-support-sample-size must be positive.")
-        if args.geometry_support_window <= 0:
-            raise ValueError("--geometry-support-window must be positive.")
-        if args.geometry_matrix_sample_count <= 0:
-            raise ValueError("--geometry-matrix-sample-count must be positive.")
-        if args.geometry_matrix_randomized_rank <= 0:
-            raise ValueError("--geometry-matrix-randomized-rank must be positive.")
-        if bool(args.geometry_raw_gradient_probe_dir) != bool(args.geometry_raw_gradient_probe_updates):
-            raise ValueError(
-                "--geometry-raw-gradient-probe-dir and "
-                "--geometry-raw-gradient-probe-updates must be set together."
-            )
-        if args.geometry_raw_gradient_probe_updates < 0:
-            raise ValueError("--geometry-raw-gradient-probe-updates must be non-negative.")
-        if args.geometry_raw_gradient_probe_only and not args.geometry_raw_gradient_probe_dir:
-            raise ValueError(
-                "--geometry-raw-gradient-probe-only requires --geometry-raw-gradient-probe-dir."
-            )
+            raise ValueError("Clip/score/correction ordering requires synchronous parameter gather and step.")
+        if not args.colocate:
+            raise ValueError("MOPD cost accounting requires the actor and rollout engines to be colocated.")
+        if bool(getattr(args, "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False)):
+            raise ValueError("MOPD requires FP32 Adam moments; disable precision-aware optimizer state.")
+        if not args.use_opd or args.opd_type != "sglang" or not args.opd_teacher_router_config:
+            raise ValueError("MOPD requires the frozen teachers through one SGLang slot router.")
+        if args.custom_rm_path != "slime_plugins.m2rl.opd.teacher_reward":
+            raise ValueError("MOPD requires the multi-teacher reward adapter.")
+        if args.custom_reward_post_process_path != "slime_plugins.m2rl.opd.post_process_rewards":
+            raise ValueError("MOPD requires the teacher-logprob reward postprocessor.")
+        if args.opd_task_reward_weight != 0:
+            raise ValueError("MOPD is pure teacher distillation with task-reward weight zero.")
+
+        if not 0 <= args.mopd_ema_decay < 1:
+            raise ValueError("--mopd-ema-decay must be in [0, 1).")
+        if not 0 <= args.mopd_inclusion_floor <= 0.25:
+            raise ValueError("--mopd-inclusion-floor is infeasible for four tasks.")
+        if args.mopd_score_max_age != 50:
+            raise ValueError("The frozen protocol requires --mopd-score-max-age 50.")
         try:
-            re.compile(args.geometry_parameter_include)
-            if args.geometry_parameter_exclude:
-                re.compile(args.geometry_parameter_exclude)
-        except re.error as exc:
-            raise ValueError(f"Invalid geometry parameter regular expression: {exc}") from exc
+            checkpoints = tuple(
+                int(value) for value in args.mopd_checkpoint_responses.split(",") if value
+            )
+            eval_responses = tuple(
+                int(value) for value in args.mopd_eval_responses.split(",") if value
+            )
+        except ValueError as exc:
+            raise ValueError("MOPD response milestones must be comma-separated integers.") from exc
+        for name, values in (("checkpoint", checkpoints), ("evaluation", eval_responses)):
+            if (
+                not values
+                or values != tuple(sorted(set(values)))
+                or any(value <= 0 or value > args.mopd_response_budget or value % 8 for value in values)
+            ):
+                raise ValueError(
+                    f"MOPD {name} response milestones must be unique increasing multiples of eight "
+                    "within the response budget."
+                )
+        if args.mopd_failure_penalty <= 0 or args.mopd_score_chunk_size <= 0:
+            raise ValueError("MOPD failure penalty and score chunk size must be positive.")
+        if args.mopd_bank_coordinates <= 0 or args.mopd_bank_units_per_task != 8:
+            raise ValueError("The frozen bank requires eight units per task and positive coordinate count.")
+        if args.mopd_run_mode == "bank" and not args.mopd_bank_dir:
+            raise ValueError("--mopd-run-mode bank requires --mopd-bank-dir.")
+        if args.mopd_eval_on_start and (
+            args.mopd_run_mode != "train" or args.mopd_reset_sampler or args.start_rollout_id <= 0
+        ):
+            raise ValueError("--mopd-eval-on-start is only valid for an in-place checkpoint resume.")
+        if args.mopd_run_mode == "warm" and (
+            args.mopd_task_width,
+            args.mopd_allocation,
+            args.mopd_adamw_state,
+        ) != (1, "uniform", "taskwise"):
+            raise ValueError("Warm start is fixed round-robin K=1 Uniform with taskwise AdamW state.")
+        if args.mopd_run_mode == "bank" and (
+            args.mopd_task_width,
+            args.mopd_allocation,
+            args.mopd_adamw_state,
+        ) != (1, "uniform", "taskwise"):
+            raise ValueError("Frozen-bank capture is fixed to K=1 Uniform with taskwise AdamW state.")
+        allowed_train_configs = {
+            (1, "uniform", "conventional"),
+            (1, "uniform", "taskwise"),
+            (1, "gpas", "taskwise"),
+            (1, "cost_gpas", "taskwise"),
+            (2, "uniform", "taskwise"),
+            (2, "cost_gpas", "taskwise"),
+            (4, "all", "taskwise"),
+            (4, "all", "conventional"),
+        }
+        if args.mopd_run_mode == "train" and (
+            args.mopd_task_width,
+            args.mopd_allocation,
+            args.mopd_adamw_state,
+        ) not in allowed_train_configs:
+            raise ValueError("MOPD train configuration is not one of the eight frozen protocol cells.")
+        train_config = (
+            args.mopd_task_width,
+            args.mopd_allocation,
+            args.mopd_adamw_state,
+        )
+        main_schedule = (
+            64_000,
+            (16_384, 32_768, 64_000),
+            (2_048, 4_096, 8_192, 16_384, 32_768, 49_152, 64_000),
+        )
+        confirmation_schedule = (
+            16_384,
+            (16_384,),
+            (2_048, 4_096, 8_192, 16_384),
+        )
+        observed_schedule = (args.mopd_response_budget, checkpoints, eval_responses)
+        confirmation_configs = {
+            (1, "uniform", "taskwise"),
+            (1, "gpas", "taskwise"),
+            (1, "cost_gpas", "taskwise"),
+        }
+        if args.mopd_run_mode == "bank":
+            if observed_schedule != main_schedule or args.mopd_seed != 42:
+                raise ValueError("Frozen-bank runs require the seed-42 64k campaign schedule.")
+        elif args.mopd_run_mode == "warm":
+            expected_schedule = main_schedule if args.mopd_seed == 42 else confirmation_schedule
+            if observed_schedule != expected_schedule or args.mopd_seed not in {42, 43, 44}:
+                raise ValueError("Warm runs must use the schedule associated with seed 42, 43, or 44.")
+        elif args.mopd_seed == 42:
+            if observed_schedule != main_schedule:
+                raise ValueError("Seed-42 main runs require the frozen 64k response schedule.")
+        elif args.mopd_seed in {43, 44}:
+            if observed_schedule != confirmation_schedule or train_config not in confirmation_configs:
+                raise ValueError(
+                    "Seeds 43/44 are reserved for the three 16k critical confirmation runs."
+                )
+        else:
+            raise ValueError("The shortened campaign freezes MOPD seeds to 42, 43, and 44.")
+        if args.mopd_task_width == 4 and args.mopd_allocation != "all":
+            raise ValueError("K=4 uses --mopd-allocation all.")
+        if args.mopd_allocation == "all" and args.mopd_task_width != 4:
+            raise ValueError("--mopd-allocation all requires K=4.")
+        if args.rollout_max_response_len != 8192:
+            raise ValueError("The frozen protocol requires --rollout-max-response-len 8192.")
+        kwargs = getattr(args, "apply_chat_template_kwargs", None) or {}
+        if not isinstance(kwargs, dict) or kwargs.get("enable_thinking") is not False:
+            raise ValueError("Qwen3 allocation rollouts require enable_thinking=false.")
 
     if getattr(args, "custom_loss_function_path", None) == "slime_plugins.m2rl.hybrid.hybrid_loss_function":
         if not args.use_opd or args.opd_type != "sglang":

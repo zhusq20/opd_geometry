@@ -3,11 +3,13 @@ import gc
 import logging
 import math
 import os
+import time
 from argparse import Namespace
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import torch
 from megatron.core import mpu
@@ -42,27 +44,36 @@ from .stateless_adam import StatelessAdam
 logger = logging.getLogger(__name__)
 
 
-def _distributed_cuda_memory_mib() -> dict[str, float]:
-    """Return the maximum current/peak PyTorch memory across training ranks."""
+def _cuda_sync() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize(torch.cuda.current_device())
 
+
+def _distributed_stage_seconds(local_seconds: float) -> tuple[float, float]:
+    """Return (wall=max rank time, GPU-seconds=sum rank time)."""
+
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    values = torch.tensor([local_seconds, local_seconds], dtype=torch.float64, device=device)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        maximum = values[:1].clone()
+        total = values[1:].clone()
+        torch.distributed.all_reduce(maximum, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(total, op=torch.distributed.ReduceOp.SUM)
+        values = torch.cat((maximum, total))
+    return float(values[0].item()), float(values[1].item())
+
+
+def _distributed_peak_hbm_bytes() -> int:
     if not torch.cuda.is_available():
-        return {}
-    device = torch.cuda.current_device()
-    values = torch.tensor(
-        [
-            torch.cuda.memory_allocated(device),
-            torch.cuda.memory_reserved(device),
-            torch.cuda.max_memory_allocated(device),
-            torch.cuda.max_memory_reserved(device),
-        ],
-        dtype=torch.float64,
-        device=device,
+        return 0
+    peak = torch.tensor(
+        torch.cuda.max_memory_allocated(torch.cuda.current_device()),
+        dtype=torch.int64,
+        device=torch.device("cuda", torch.cuda.current_device()),
     )
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.MAX)
-    values = values.cpu().tolist()
-    names = ("gpu_memory_allocated_mib", "gpu_memory_reserved_mib", "gpu_peak_allocated_mib", "gpu_peak_reserved_mib")
-    return {name: float(value) / 1024**2 for name, value in zip(names, values, strict=True)}
+        torch.distributed.all_reduce(peak, op=torch.distributed.ReduceOp.MAX)
+    return int(peak.item())
 
 
 def _disable_tqdm_for_non_main_rank() -> bool:
@@ -551,7 +562,7 @@ def train_one_step(
     num_microbatches: int,
     step_global_batch_size: int,
     microbatch_pbar=None,
-) -> tuple[dict[str, float], float]:
+) -> tuple[dict[str, float], float, dict[str, Any] | None]:
     """Execute a single pipeline-parallel training step.
 
     Runs forward/backward over ``num_microbatches``, applies optimizer step and
@@ -675,6 +686,12 @@ def train_one_step(
 
         return output_tensor, partial(loss_function, args, batch, num_microbatches, step_global_batch_size)
 
+    # Forward/backward stage timing is synchronized only for the MOPD cost
+    # audit. Ordinary Slime runs retain their existing asynchronous timing.
+    if getattr(args, "mopd_enabled", False):
+        _cuda_sync()
+        forward_backward_start = time.perf_counter()
+
     # Forward pass.
     forward_backward_func = get_forward_backward_func()
     losses_reduced = forward_backward_func(
@@ -687,6 +704,11 @@ def train_one_step(
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
     )
+    mopd_forward_backward_local_seconds = None
+    if getattr(args, "mopd_enabled", False):
+        _cuda_sync()
+        mopd_forward_backward_local_seconds = time.perf_counter() - forward_backward_start
+        mopd_optimizer_stage_start = time.perf_counter()
 
     if args.custom_megatron_after_backward_hook_path:
         from slime.utils.misc import load_function
@@ -694,25 +716,10 @@ def train_one_step(
         custom_after_backward_hook = load_function(args.custom_megatron_after_backward_hook_path)
         custom_after_backward_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
-    if args.geometry_output_dir and args._slime_model_role in args.geometry_roles:
-        from slime_plugins.geometry.observer import after_backward
-
-        after_backward(
-            args,
-            rollout_id,
-            step_id,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            data_iterator=data_iterator,
-            num_microbatches=num_microbatches,
-            actual_batch_size=step_global_batch_size,
-        )
-
     valid_step = True
     failure_reason = None
     grad_norm = float("nan")
-    if not getattr(args, "check_for_nan_in_loss_and_grad", True):
+    if not getattr(args, "mopd_enabled", False) and not getattr(args, "check_for_nan_in_loss_and_grad", True):
         found_inf_flag = optimizer.prepare_grads()
         if found_inf_flag:
             valid_step = False
@@ -733,48 +740,54 @@ def train_one_step(
 
         check_mtp_only_grad(model, step_id)
 
-    probe_only = bool(getattr(args, "geometry_raw_gradient_probe_only", False))
     update_successful = False
     num_zeros_in_grad = None
-    if valid_step and not probe_only:
+    mopd_feedback = None
+    if getattr(args, "mopd_enabled", False):
+        from slime_plugins.mopd.optimizer import mopd_capture_step
+
+        capture_successful, grad_norm, num_zeros_in_grad, mopd_feedback = mopd_capture_step(
+            args,
+            data_iterator,
+            model,
+            optimizer,
+            num_microbatches=num_microbatches,
+        )
+        valid_step = bool(capture_successful)
+        failure_reason = mopd_feedback.get("failure_reason")
+    elif valid_step:
         # Update parameters.
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
         if not update_successful:
             failure_reason = "optimizer_step_rejected"
 
-    if (
-        args.geometry_output_dir
-        and args._slime_model_role in args.geometry_roles
-        and not probe_only
-    ):
-        from slime_plugins.geometry.observer import after_optimizer_step
-
-        after_optimizer_step(
-            args,
-            rollout_id,
-            step_id,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            update_successful=update_successful,
-            grad_norm=grad_norm,
-            num_zeros_in_grad=num_zeros_in_grad,
-            failure_reason=failure_reason,
+    if getattr(args, "mopd_enabled", False):
+        _cuda_sync()
+        optimizer_local_seconds = time.perf_counter() - mopd_optimizer_stage_start
+        forward_backward_wall, forward_backward_gpu = _distributed_stage_seconds(
+            float(mopd_forward_backward_local_seconds)
+        )
+        optimizer_wall, optimizer_gpu = _distributed_stage_seconds(optimizer_local_seconds)
+        assert mopd_feedback is not None
+        mopd_feedback.update(
+            {
+                "actor_forward_backward_wall_seconds": forward_backward_wall,
+                "actor_forward_backward_gpu_seconds": forward_backward_gpu,
+                "optimizer_wall_seconds": optimizer_wall,
+                "optimizer_gpu_seconds": optimizer_gpu,
+                "student_peak_hbm_bytes": _distributed_peak_hbm_bytes(),
+            }
         )
 
     # Preserve Slime's established behavior for an optimizer-side rejection.
-    # Geometry has already durably recorded the failed event before this abort.
-    if valid_step and not probe_only:
+    if valid_step and not getattr(args, "mopd_enabled", False):
         assert update_successful
 
-    # Advance the scheduler only after geometry has read the optimizer groups:
-    # their current LR is the one that produced this update, while step() may
-    # install the LR for the next update. Dynamic batches advance by the true
-    # per-step global batch size.
-    if update_successful:
+    # Dynamic batches advance by the true per-step global batch size.
+    if update_successful and not getattr(args, "mopd_enabled", False):
         opt_param_scheduler.step(increment=step_global_batch_size)
 
-    if args.custom_megatron_after_train_step_hook_path and not probe_only:
+    if args.custom_megatron_after_train_step_hook_path and not getattr(args, "mopd_enabled", False):
         from slime.utils.misc import load_function
 
         custom_after_train_step_hook = load_function(args.custom_megatron_after_train_step_hook_path)
@@ -803,8 +816,8 @@ def train_one_step(
             cp_size=mpu.get_context_parallel_world_size(),
             dp_with_cp_group=mpu.get_data_parallel_group(with_context_parallel=True),
         )
-        return loss_reduced, grad_norm
-    return {}, grad_norm
+        return loss_reduced, grad_norm, mopd_feedback
+    return {}, grad_norm, mopd_feedback
 
 
 def should_disable_forward_pre_hook(args: Namespace) -> bool:
@@ -820,7 +833,7 @@ def train(
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
     global_batch_sizes: Sequence[int],
-) -> None:
+) -> dict[str, Any] | None:
     """Run training over a rollout consisting of multiple steps.
 
     The model is switched to train mode, training hooks are configured, and
@@ -928,14 +941,27 @@ def train(
         disable=_disable_tqdm_for_non_main_rank(),
     )
 
+    mopd_step_feedback: list[dict[str, Any]] = []
+    mopd_final_feedback: dict[str, Any] | None = None
+    mopd_operation = None
+    if getattr(args, "mopd_enabled", False):
+        from slime_plugins.mopd.optimizer import begin_mopd_operation
+
+        operations = list(data_iterator[0].rollout_data["mopd_operations"])
+        adamw_states = list(data_iterator[0].rollout_data["mopd_adamw_states"])
+        if len(set(operations)) != 1 or len(set(adamw_states)) != 1:
+            raise ValueError("one MOPD rollout must use one operation type and one AdamW state rule")
+        mopd_operation = str(operations[0])
+        begin_mopd_operation(optimizer, mopd_operation, str(adamw_states[0]))
+
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
         accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
 
         # Run training step.
-        if args.geometry_output_dir and torch.cuda.is_available():
+        if getattr(args, "mopd_enabled", False) and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats(torch.cuda.current_device())
-        loss_dict, grad_norm = train_one_step(
+        loss_dict, grad_norm, step_feedback = train_one_step(
             args,
             rollout_id,
             step_id,
@@ -947,8 +973,8 @@ def train(
             global_batch_sizes[step_id],
             microbatch_pbar=microbatch_pbar,
         )
-        memory_metrics = _distributed_cuda_memory_mib() if args.geometry_output_dir else {}
-
+        if step_feedback is not None:
+            mopd_step_feedback.append(step_feedback)
         if step_id == 0:
             # Enable forward pre-hook after training step has successfully run. All subsequent
             # forward passes will use the forward pre-hook / `param_sync_func` in
@@ -1001,8 +1027,6 @@ def train(
             log_dict[f"train/{role_tag}grad_clipped"] = int(
                 finite_grad_norm and clip_threshold > 0 and float(grad_norm) > clip_threshold
             )
-            for name, value in memory_metrics.items():
-                log_dict[f"train/{role_tag}{name}"] = value
             if args.enable_mtp_training:
                 for _i in range(mtp_losses.shape[0]):
                     log_dict[f"train/{role_tag}mtp_{_i + 1}_loss"] = mtp_losses[_i].item()
@@ -1016,9 +1040,13 @@ def train(
             log_dict["train/step"] = accumulated_step_id
             log_dict["train/rollout_id"] = int(rollout_id)
             log_dict["train/step_within_rollout"] = int(step_id)
-            # One-based count: this event is emitted after the optimizer step.
-            log_dict["train/num_updates"] = accumulated_step_id + 1
-            log_dict["train/model_version"] = accumulated_step_id + 1
+            if getattr(args, "mopd_enabled", False):
+                log_dict["train/mopd_gradient_slice"] = 1
+                log_dict["train/optimizer_step_executed"] = 0
+            else:
+                # One-based count: this event is emitted after the optimizer step.
+                log_dict["train/num_updates"] = accumulated_step_id + 1
+                log_dict["train/model_version"] = accumulated_step_id + 1
             logging_utils.log(args, log_dict, step_key="train/step")
 
             if args.ci_test and "train/train_rollout_logprob_abs_diff" in log_dict:
@@ -1061,10 +1089,104 @@ def train(
                     rel_tol=0.01,
                     abs_tol=0.01,
                 ), f"grad norm mismatch: {grad_norm} != {expected_grad_norm}"
+    if getattr(args, "mopd_enabled", False):
+        from slime_plugins.mopd.optimizer import finish_mopd_operation
+
+        _cuda_sync()
+        final_optimizer_start = time.perf_counter()
+        update_successful, aggregate_norm, mopd_final_feedback = finish_mopd_operation(args, optimizer)
+        _cuda_sync()
+        final_optimizer_wall, final_optimizer_gpu = _distributed_stage_seconds(
+            time.perf_counter() - final_optimizer_start
+        )
+        if mopd_operation == "train" and not update_successful:
+            raise RuntimeError("MOPD AdamW rejected the combined task-set update")
+
+        response_increment = int(mopd_final_feedback["attempted_responses"])
+        if mopd_operation != "bank":
+            opt_param_scheduler.step(increment=response_increment)
+
+        if args.custom_megatron_after_train_step_hook_path and mopd_operation == "train":
+            from slime.utils.misc import load_function
+
+            custom_after_train_step_hook = load_function(args.custom_megatron_after_train_step_hook_path)
+            custom_after_train_step_hook(
+                args,
+                rollout_id,
+                num_steps_per_rollout - 1,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                update_successful=update_successful,
+                grad_norm=aggregate_norm,
+                num_zeros_in_grad=None,
+            )
+
+        timing_by_task: dict[str, dict[str, float]] = {}
+        for step_feedback in mopd_step_feedback:
+            task_timing = timing_by_task.setdefault(
+                str(step_feedback["task"]),
+                {
+                    "actor_forward_backward_wall_seconds": 0.0,
+                    "actor_forward_backward_gpu_seconds": 0.0,
+                    "optimizer_wall_seconds": 0.0,
+                    "optimizer_gpu_seconds": 0.0,
+                    "student_peak_hbm_bytes": 0,
+                },
+            )
+            for key in task_timing:
+                if key == "student_peak_hbm_bytes":
+                    task_timing[key] = max(int(task_timing[key]), int(step_feedback[key]))
+                else:
+                    task_timing[key] += float(step_feedback[key])
+        # The final compound AdamW step (or probe reduction) is shared by the
+        # selected exact set.  Attribute it once, evenly across its task units,
+        # so Cost-GPAS learns the complete service cost without double-counting
+        # it in the operation-level totals below.
+        task_units = mopd_final_feedback["task_units"]
+        final_wall_share = final_optimizer_wall / len(task_units)
+        final_gpu_share = final_optimizer_gpu / len(task_units)
+        for task_unit in task_units:
+            task_timing = dict(timing_by_task[str(task_unit["task"])])
+            task_timing["optimizer_wall_seconds"] += final_wall_share
+            task_timing["optimizer_gpu_seconds"] += final_gpu_share
+            task_unit.update(task_timing)
+
+        peak_hbm_bytes = max(
+            _distributed_peak_hbm_bytes(),
+            *(int(value["student_peak_hbm_bytes"]) for value in timing_by_task.values()),
+        )
+        mopd_final_feedback.update(
+            {
+                "actor_forward_backward_wall_seconds": sum(
+                    float(value["actor_forward_backward_wall_seconds"])
+                    for value in timing_by_task.values()
+                ),
+                "actor_forward_backward_gpu_seconds": sum(
+                    float(value["actor_forward_backward_gpu_seconds"])
+                    for value in timing_by_task.values()
+                ),
+                "optimizer_wall_seconds": final_optimizer_wall
+                + sum(float(value["optimizer_wall_seconds"]) for value in timing_by_task.values()),
+                "optimizer_gpu_seconds": final_optimizer_gpu
+                + sum(float(value["optimizer_gpu_seconds"]) for value in timing_by_task.values()),
+                "peak_hbm_bytes": peak_hbm_bytes,
+            }
+        )
+
     microbatch_pbar.close()
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
         disable_forward_pre_hook(model)
+    if getattr(args, "mopd_enabled", False):
+        if mopd_final_feedback is None:
+            raise RuntimeError("MOPD operation did not produce final trainer feedback")
+        if (
+            not (torch.distributed.is_available() and torch.distributed.is_initialized())
+            or torch.distributed.get_rank() == 0
+        ):
+            return mopd_final_feedback
+    return None
 
 
 def save(

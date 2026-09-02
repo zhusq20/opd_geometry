@@ -32,6 +32,7 @@ from types import SimpleNamespace
 
 import pytest
 import ray
+import torch
 
 from slime.backends.megatron_utils import data as megatron_data
 from slime.utils.data import process_rollout_data
@@ -163,6 +164,48 @@ def test_log_passrate_uses_actual_partial_tail_size(monkeypatch):
     )
 
     assert captured["pass@1"] == pytest.approx(1 / 53)
+
+
+def test_log_rollout_data_skips_mopd_task_labels(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(megatron_data.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(megatron_data.mpu, "is_pipeline_last_stage", lambda: True)
+    monkeypatch.setattr(megatron_data.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        megatron_data.mpu,
+        "get_data_parallel_world_size",
+        lambda *, with_context_parallel: 1,
+    )
+    monkeypatch.setattr(
+        megatron_data,
+        "gather_log_data",
+        lambda name, args, rollout_id, metrics: captured.update(metrics),
+    )
+
+    megatron_data.log_rollout_data(
+        rollout_id=0,
+        args=SimpleNamespace(
+            ci_test=False,
+            log_multi_turn=False,
+            log_passrate=False,
+            log_correct_samples=False,
+        ),
+        rollout_data={
+            "response_lengths": [1],
+            "loss_masks": [torch.tensor([1.0])],
+            "total_lengths": [2],
+            "global_batch_sizes": [1],
+            "mopd_tasks": ["math"],
+            "mopd_operations": ["train"],
+            "mopd_adamw_states": ["taskwise"],
+            "mopd_inclusion_probabilities": [0.25],
+        },
+    )
+
+    assert "mopd_tasks" not in captured
+    assert "mopd_operations" not in captured
+    assert "mopd_adamw_states" not in captured
+    assert captured["mopd_inclusion_probabilities"] == (0.25, 1)
 
 
 def test_missing_raw_reward_is_tolerated(unwrap_ray_get):

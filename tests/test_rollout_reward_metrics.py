@@ -1,15 +1,98 @@
 """Regression tests for scalar rollout reward metrics."""
 
-import json
 from types import SimpleNamespace
 
 import pytest
 
-from slime.ray.rollout import _compute_training_reward_metrics, _compute_zero_std_metrics, _save_eval_artifacts
+from slime.ray.rollout import (
+    _assemble_mopd_feedback,
+    _compute_training_reward_metrics,
+    _compute_zero_std_metrics,
+    _save_eval_artifacts,
+)
 from slime.utils.types import Sample
-from slime_plugins.geometry.rollout_samples import persist_rollout_samples
 
 NUM_GPUS = 0
+
+
+def _mopd_stage_metrics():
+    return {
+        "mopd/student_rollout_gpu_seconds": 4.0,
+        "mopd/teacher_gpu_seconds": 2.0,
+        "mopd/student_rollout_wall_seconds": 1.0,
+        "mopd/teacher_wall_seconds": 2.0,
+        "mopd/rollout_and_teacher_wall_seconds": 2.0,
+        "mopd/reward_wall_seconds": 0.5,
+        "mopd/teacher_pool_gpu_count": 1,
+        "mopd/valid_response_tokens": 65_600,
+        "mopd/teacher_scored_tokens": 70_000,
+        "mopd/prompt_count": 64,
+        "mopd/completed_responses": 63,
+        "mopd/truncated_responses": 1,
+        "mopd/invalid_responses": 0,
+        "mopd/teacher_peak_memory_mib": 4096,
+        "mopd/resident_teacher_after_index": 0,
+        "mopd/task/math/student_rollout_seconds": 1.0,
+        "mopd/task/math/teacher_ready_seconds": 1.5,
+        "mopd/task/math/teacher_scoring_seconds": 0.5,
+        "mopd/task/math/teacher_switch_seconds": 1.5,
+        "mopd/task/math/teacher_load_seconds": 1.5,
+        "mopd/task/math/teacher_offload_seconds": 0.0,
+        "mopd/task/math/prompt_count": 16,
+        "mopd/task/math/attempted_responses": 64,
+        "mopd/task/math/valid_response_tokens": 65_600,
+        "mopd/task/math/teacher_scored_tokens": 70_000,
+        "mopd/task/math/completed_responses": 63,
+        "mopd/task/math/truncated_responses": 1,
+        "mopd/task/math/invalid_responses": 0,
+        "mopd/task/math/empty_responses": 0,
+        "mopd/task/math/teacher_scoring_failures": 0,
+        "mopd/task/math/teacher_memory_mib": 4096,
+        "mopd/task/math/teacher_transfer_tail_seconds": 1.5,
+        "mopd/task/math/switched": 1,
+    }
+
+
+def _mopd_trainer_feedback():
+    return {
+        "mopd": True,
+        "driver_step_wall_seconds": 10.0,
+        "actor_forward_backward_gpu_seconds": 12.0,
+        "optimizer_gpu_seconds": 4.0,
+        "actor_forward_backward_wall_seconds": 3.0,
+        "optimizer_wall_seconds": 1.0,
+        "operation": "train",
+        "task_units": [
+            {
+                "task": "math",
+                "actor_forward_backward_wall_seconds": 3.0,
+                "optimizer_wall_seconds": 1.0,
+            }
+        ],
+        "peak_hbm_bytes": 8 * 2**30,
+    }
+
+
+@pytest.mark.unit
+def test_mopd_cost_accounting_uses_end_to_end_wall_time_and_all_resident_gpus():
+    args = SimpleNamespace(rollout_num_gpus=4, actor_num_nodes=1, actor_num_gpus_per_node=4)
+    feedback = _assemble_mopd_feedback(args, _mopd_stage_metrics(), _mopd_trainer_feedback())
+
+    assert feedback["component_wall_seconds"] == pytest.approx(6.5)
+    assert feedback["total_step_seconds"] == pytest.approx(10.0)
+    assert feedback["active_gpu_seconds"] == pytest.approx(22.0)
+    assert feedback["allocated_gpu_count"] == 5
+    assert feedback["total_gpu_seconds"] == pytest.approx(50.0)
+    assert feedback["valid_response_tokens"] == 65_600
+
+
+@pytest.mark.unit
+def test_mopd_cost_accounting_rejects_a_driver_clock_shorter_than_critical_path():
+    args = SimpleNamespace(rollout_num_gpus=4, actor_num_nodes=1, actor_num_gpus_per_node=4)
+    feedback = _mopd_trainer_feedback()
+    feedback["driver_step_wall_seconds"] = 6.0
+    with pytest.raises(ValueError, match="shorter than"):
+        _assemble_mopd_feedback(args, _mopd_stage_metrics(), feedback)
 
 
 @pytest.mark.unit
@@ -85,59 +168,6 @@ def test_removed_task_reward_is_observed_but_not_used():
     assert metrics["task_reward_observed"] == 1
     assert metrics["reward_used_in_loss"] == 0
     assert metrics["reward_loss_coefficient"] == 0.0
-
-
-@pytest.mark.unit
-def test_training_rollout_samples_are_durable_complete_and_idempotent(tmp_path):
-    args = SimpleNamespace(
-        geometry_output_dir=str(tmp_path),
-        experiment_name="paper-run",
-        experiment_task="multi",
-        seed=17,
-        rollout_batch_size=2,
-        n_samples_per_prompt=1,
-        global_batch_size=2,
-        reward_key=None,
-        use_opd=True,
-        opd_task_reward_weight=0.0,
-    )
-    sample = Sample(
-        index=9,
-        group_index=4,
-        rollout_id=9,
-        prompt="2 + 2 = ?",
-        response="4",
-        response_length=1,
-        loss_mask=[1],
-        label="4",
-        reward={"teacher": {}, "task_reward": 1.0},
-        status=Sample.Status.COMPLETED,
-        metadata={"task_name": "math", "prompt_id": "math-4", "sample_id": "math-4-0"},
-    )
-
-    first = persist_rollout_samples(3, args, [sample])
-    second = persist_rollout_samples(3, args, [sample])
-
-    assert first == second
-    path = tmp_path / "rollout" / "samples" / "rollout_00000003.jsonl"
-    record = json.loads(path.read_text())
-    assert record["task"] == "math"
-    assert record["prompt_id"] == "math-4"
-    assert record["sample_id"] == "math-4-0"
-    assert record["prompt"] == "2 + 2 = ?"
-    assert record["response"] == "4"
-    assert record["label"] == "4"
-    assert record["reward"] == 1.0
-    assert record["passed"] is True
-    assert record["num_updates"] == 3
-    assert record["model_version"] == 3
-    assert record["task_reward_observed"] is True
-    assert record["reward_used_in_loss"] is False
-    assert record["reward_loss_coefficient"] == 0.0
-
-    sample.response = "divergent replay"
-    with pytest.raises(FileExistsError, match="divergent rollout artifact"):
-        persist_rollout_samples(3, args, [sample])
 
 
 @pytest.mark.unit

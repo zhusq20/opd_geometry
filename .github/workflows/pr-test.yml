@@ -671,10 +671,6 @@ jobs:
             },
             {
               "num_gpus": 0,
-              "test_file": "test_rollout_geometry.py"
-            },
-            {
-              "num_gpus": 0,
               "test_file": "test_rollout_reward_metrics.py"
             },
             {
@@ -683,35 +679,31 @@ jobs:
             },
             {
               "num_gpus": 0,
-              "test_file": "test_geometry_observer.py"
+              "test_file": "test_mopd_analysis.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_mopd_eval.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_mopd_optimizer.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_mopd_provenance.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_mopd_rollout.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_mopd_sampler.py"
             },
             {
               "num_gpus": 0,
               "test_file": "test_optimizer_factory.py"
-            },
-            {
-              "num_gpus": 0,
-              "test_file": "test_megatron_step_hooks.py"
-            },
-            {
-              "num_gpus": 0,
-              "test_file": "test_forgetting_logger.py"
-            },
-            {
-              "num_gpus": 0,
-              "test_file": "test_geometry_analysis.py"
-            },
-            {
-              "num_gpus": 0,
-              "test_file": "test_run_artifacts.py"
-            },
-            {
-              "num_gpus": 0,
-              "test_file": "test_paper_statistics.py"
-            },
-            {
-              "num_gpus": 0,
-              "test_file": "test_optimizer_geometry_launcher.py"
             },
             {
               "num_gpus": 0,

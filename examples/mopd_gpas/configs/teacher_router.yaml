@@ -1,0 +1,40 @@
+schema_version: 2
+concurrency: 64
+request_timeout: 900
+slot:
+  gpu_count: 1
+  physical_gpu: ${MOPD_TEACHER_GPU}
+  state_path: ${MOPD_TEACHER_SLOT_STATE}
+teachers:
+  math:
+    url: http://127.0.0.1:${MOPD_TEACHER_PORT}/generate
+    control_url: http://127.0.0.1:${MOPD_TEACHER_PORT}/update_weights_from_disk
+    model_path: ${MOPD_TEACHER_HF_ROOT}/math
+    load_format: auto
+    weight_version: math
+    concurrency: 64
+    request_timeout: 900
+  code:
+    url: http://127.0.0.1:${MOPD_TEACHER_PORT}/generate
+    control_url: http://127.0.0.1:${MOPD_TEACHER_PORT}/update_weights_from_disk
+    model_path: ${MOPD_TEACHER_HF_ROOT}/code
+    load_format: auto
+    weight_version: code
+    concurrency: 64
+    request_timeout: 900
+  if:
+    url: http://127.0.0.1:${MOPD_TEACHER_PORT}/generate
+    control_url: http://127.0.0.1:${MOPD_TEACHER_PORT}/update_weights_from_disk
+    model_path: ${MOPD_TEACHER_HF_ROOT}/if
+    load_format: auto
+    weight_version: if
+    concurrency: 64
+    request_timeout: 900
+  science:
+    url: http://127.0.0.1:${MOPD_TEACHER_PORT}/generate
+    control_url: http://127.0.0.1:${MOPD_TEACHER_PORT}/update_weights_from_disk
+    model_path: ${MOPD_TEACHER_HF_ROOT}/science
+    load_format: auto
+    weight_version: science
+    concurrency: 64
+    request_timeout: 900

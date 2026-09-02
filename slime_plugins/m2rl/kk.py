@@ -1,6 +1,6 @@
 """Strict binary verifier for Knights-and-Knaves assignments.
 
-The optimizer-geometry experiments use a binary correctness contract: ``1``
+The MOPD experiments use a binary correctness contract: ``1``
 means that every named inhabitant has exactly the expected identity and that
 the final answer follows the requested structure; every other model response
 receives ``0``.  Dataset/schema errors are raised instead of being converted
@@ -139,9 +139,7 @@ def evaluate_kk_response(response: str | None, label: Any) -> dict[str, Any]:
     format_errors = list(dict.fromkeys(format_errors))
     format_valid = not format_errors
     correct = format_valid and not incorrect_names
-    assigned_roles = {
-        name: assignments[key] for key, (name, _role) in expected_by_key.items() if key in assignments
-    }
+    assigned_roles = {name: assignments[key] for key, (name, _role) in expected_by_key.items() if key in assignments}
     return {
         "correct": correct,
         "format_valid": format_valid,

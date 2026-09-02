@@ -43,21 +43,6 @@ def _enable_sgd_checkpoint_loading(optimizer: Any) -> None:
         optimizer.init_state_fn = _init_sgd_checkpoint_state
 
 
-def _annotate_muon_geometry(optimizer: Any, config: Any) -> None:
-    """Expose immutable Muon scaling choices to the observation adapter."""
-
-    children = getattr(optimizer, "chained_optimizers", None)
-    if children is not None:
-        for child in children:
-            _annotate_muon_geometry(child, config)
-        return
-    inner = getattr(optimizer, "optimizer", optimizer)
-    if "muon" not in type(inner).__name__.lower():
-        return
-    inner.slime_muon_scale_mode = config.muon_scale_mode
-    inner.slime_muon_extra_scale_factor = config.muon_extra_scale_factor
-
-
 def is_muon_optimizer(name: str | None) -> bool:
     return str(name or "").lower() in MUON_OPTIMIZERS
 
@@ -172,5 +157,4 @@ def build_megatron_optimizer(
         layer_wise_distributed_optimizer=optimizer_name == "dist_muon",
     )
     optimizer.slime_optimizer_name = optimizer_name
-    _annotate_muon_geometry(optimizer, config)
     return optimizer

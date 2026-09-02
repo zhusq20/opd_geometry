@@ -182,10 +182,6 @@ outputs/
 # Downloaded and generated M2RL training corpora are local artifacts.
 /data/m2rl/
 
-examples/optimizer_geometry.permission-backup-20260813
-
-examples/optimizer_geometry.readonly-20260814
-
 local/
 train_rollout_diff_exp/results/
 **/rollout_data/

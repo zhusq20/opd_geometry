@@ -1,0 +1,12 @@
+routes:
+  deepscaler: {}
+  gpqa: {}
+  ifbench: {}
+  livecodebench:
+    url: ${SANDBOXFUSION_BASE_URL}/submit
+    dataset: m2rl_livecodebench
+    run_timeout: 6
+    request_timeout: 180
+    retry_attempts: 3
+    retry_backoff_seconds: 1
+    concurrency: 8

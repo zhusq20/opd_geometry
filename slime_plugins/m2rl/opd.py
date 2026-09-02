@@ -66,12 +66,6 @@ def teacher_route(args: Any, sample: Sample) -> dict[str, Any]:
     raise KeyError(f"No OPD teacher route for sample metadata keys {keys} and no default route.")
 
 
-def teacher_url(args: Any, sample: Sample) -> str:
-    """Backward-compatible URL accessor used by tests and external callers."""
-
-    return str(teacher_route(args, sample)["url"])
-
-
 async def _teacher_request(
     session: aiohttp.ClientSession,
     semaphore: asyncio.Semaphore,

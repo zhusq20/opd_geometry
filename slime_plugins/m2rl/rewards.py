@@ -1,4 +1,4 @@
-"""Reward router for the optimizer-geometry task suite.
+"""Reward router for the four-task MOPD suite.
 
 Math and science reuse Slime's tested rule rewards. Instruction-following
 training uses the vendored IFEvalG verifier, while official IFBench evaluation
@@ -30,8 +30,6 @@ from slime.rollout.rm_hub import (
     grade_answer_verl,
 )
 from slime.utils.types import Sample
-
-from .sandbox_security import validate_preflight_marker
 
 _CONFIG_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _SEMAPHORES: dict[tuple[int, int], asyncio.Semaphore] = {}
@@ -89,21 +87,13 @@ def extract_python(response: str) -> str | None:
 
 
 def _sandbox_payload(code: str, stdin: str, config: dict[str, Any]) -> dict[str, Any]:
-    memory_limit_mb = config.get("memory_limit_mb")
-    if memory_limit_mb is None:
-        # Backward compatibility with M2RL's old byte-valued
-        # ``memory_limit`` option.  SandboxFusion's actual API field is
-        # ``memory_limit_MB``; sending the old name silently disabled the
-        # limit under Pydantic's default extra-field handling.
-        memory_limit_bytes = int(config.get("memory_limit", 4 * 1024**3))
-        memory_limit_mb = math.ceil(memory_limit_bytes / 1024**2) if memory_limit_bytes > 0 else memory_limit_bytes
     return {
         "code": code,
         "stdin": stdin,
         "language": config.get("language", "python"),
         "compile_timeout": float(config.get("compile_timeout", 5)),
         "run_timeout": float(config.get("run_timeout", 10)),
-        "memory_limit_MB": int(memory_limit_mb),
+        "memory_limit_MB": int(config.get("memory_limit_mb", 4096)),
     }
 
 
@@ -150,8 +140,6 @@ async def code_reward(args: Any, sample: Sample, config: dict[str, Any]) -> floa
     if len(inputs) > max_cases:
         # Every response for one prompt must be graded on the same cases so
         # GRPO's within-group comparison does not include evaluator noise.
-        # ``group_index`` is checkpointed by the rollout data source; retain
-        # ``index`` as the deterministic fallback for ungrouped/eval samples.
         selection_index = sample.group_index if sample.group_index is not None else sample.index
         rng = random.Random(int(selection_index or 0) + int(config.get("seed", 0)))
         chosen = sorted(rng.sample(range(len(inputs)), max_cases))
@@ -161,7 +149,6 @@ async def code_reward(args: Any, sample: Sample, config: dict[str, Any]) -> floa
     url = config.get("url") or getattr(args, "code_sandbox_url", None)
     if not url:
         raise ValueError("unit_test reward requires code.url in --m2rl-reward-config or --code-sandbox-url.")
-    validate_preflight_marker(config, str(config.get("preflight_url") or url))
     timeout = aiohttp.ClientTimeout(total=float(config.get("request_timeout", 30)))
     connector = aiohttp.TCPConnector(limit=int(config.get("concurrency", 128)))
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
@@ -260,7 +247,6 @@ async def livecodebench_reward(args: Any, sample: Sample, config: dict[str, Any]
     url = config.get("url")
     if not url:
         raise ValueError("LiveCodeBench reward requires routes.livecodebench.url.")
-    validate_preflight_marker(config, str(config.get("preflight_url") or url))
     metadata = sample.metadata or {}
     row = metadata.get("sandboxfusion_row")
     if isinstance(row, str):

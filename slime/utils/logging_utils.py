@@ -144,3 +144,4 @@ def mark_run_complete(args, *, final_num_updates: int) -> None:
     if getattr(args, "use_wandb", False) and wandb.run is not None:
         wandb.run.summary["run/status"] = "complete"
         wandb.run.summary["run/final_num_updates"] = int(final_num_updates)
+        wandb_utils.log_run_data_artifact(args)

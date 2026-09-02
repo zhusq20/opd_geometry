@@ -9,7 +9,7 @@ import torch
 
 from slime.utils.types import Sample
 from slime_plugins.m2rl import opd
-from slime_plugins.m2rl.opd import _teacher_log_probs, teacher_url
+from slime_plugins.m2rl.opd import _teacher_log_probs, teacher_route
 
 NUM_GPUS = 0
 
@@ -20,8 +20,8 @@ def test_teacher_routing_uses_task_then_default(tmp_path):
     path.write_text(json.dumps({"teachers": {"math": "http://math/generate"}, "default": "http://base/generate"}))
     args = SimpleNamespace(opd_teacher_router_config=str(path), rm_url=None)
 
-    assert teacher_url(args, Sample(metadata={"task_name": "math"})) == "http://math/generate"
-    assert teacher_url(args, Sample(metadata={"task_name": "code"})) == "http://base/generate"
+    assert teacher_route(args, Sample(metadata={"task_name": "math"}))["url"] == "http://math/generate"
+    assert teacher_route(args, Sample(metadata={"task_name": "code"}))["url"] == "http://base/generate"
 
 
 @pytest.mark.unit

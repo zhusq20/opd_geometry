@@ -10,7 +10,6 @@ import pytest
 
 from slime.utils.dp_schedule import build_dp_schedule
 
-
 NUM_GPUS = 0
 
 
@@ -320,6 +319,34 @@ def test_rejects_when_fewer_rollouts_than_gbs():
     tp = make_tp(dp_size=1)
     with pytest.raises(AssertionError, match="num_rollouts"):
         build_dp_schedule(args, tp, [3] * 6, global_batch_size=4, rollout_indices=[0, 0, 1, 1, 2, 2])
+
+
+@pytest.mark.unit
+def test_mopd_full_task_unit_is_one_64_response_backward_slice():
+    """Every response in one 16x4 task unit is scheduled exactly once."""
+
+    response_count = 64
+    total_lengths = [3 + (index % 5) for index in range(response_count)]
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=18)
+    tp = make_tp(dp_size=4)
+    partitions, mbi, nmb, gbs_per_step = build_dp_schedule(
+        args,
+        tp,
+        total_lengths,
+        global_batch_size=response_count,
+        rollout_indices=list(range(response_count)),
+    )
+    assert gbs_per_step == [response_count]
+    assert len(nmb) == 1
+    assert_invariants(
+        partitions,
+        mbi,
+        nmb,
+        dp_size=4,
+        expected_global_sample_indices=range(response_count),
+        total_lengths=total_lengths,
+        max_per_bin=18,
+    )
 
 
 if __name__ == "__main__":

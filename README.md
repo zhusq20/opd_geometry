@@ -98,9 +98,9 @@ For a comprehensive quick start guide covering environment setup, data preparati
 
 We also provide examples for some use cases not covered in the quick start guide; please check [examples](examples/).
 
-For optimizer-mechanism research, [`examples/optimizer_geometry`](examples/optimizer_geometry/README.md)
-provides an AdamW/SGD/Muon × GRPO/PPO/OPD matrix, deterministic multi-task curricula,
-five-domain M2RL rewards, distributed parameter-geometry observations, and forgetting metrics.
+The Qwen3-1.7B four-task exact-set MOPD/GPAS study, including frozen-gradient
+banks, eight matched trajectories, and final capability evaluation, lives in
+[`examples/mopd_gpas`](examples/mopd_gpas/README.md).
 
 ### Agentic RL examples
 

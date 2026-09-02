@@ -31,9 +31,6 @@ def test_sandbox_payload_uses_sandboxfusion_memory_field():
     assert payload["memory_limit_MB"] == 512
     assert "memory_limit" not in payload
 
-    legacy = _sandbox_payload("print(1)", "", {"memory_limit": 4 * 1024**3})
-    assert legacy["memory_limit_MB"] == 4096
-
 
 def test_code_reward_uses_same_test_subset_for_grpo_group(monkeypatch):
     calls = []
@@ -54,7 +51,6 @@ def test_code_reward_uses_same_test_subset_for_grpo_group(monkeypatch):
 
     monkeypatch.setattr(rewards.aiohttp, "ClientSession", FakeClientSession)
     monkeypatch.setattr(rewards, "_execute_code", fake_execute)
-    monkeypatch.setattr(rewards, "validate_preflight_marker", lambda *_args: None)
     unit_tests = {"inputs": [str(index) for index in range(50)], "outputs": [str(index) for index in range(50)]}
     config = {"url": "http://sandbox/run_code", "max_cases": 20, "seed": 42}
 
@@ -177,7 +173,6 @@ def test_livecodebench_retries_transient_server_error(monkeypatch):
         _FakeResponse(200, payload={"accepted": True, "tests": []}),
     ]
     monkeypatch.setattr(rewards.aiohttp, "ClientSession", _fake_client_session(responses, calls))
-    monkeypatch.setattr(rewards, "validate_preflight_marker", lambda *_args: None)
 
     result = asyncio.run(
         rewards.livecodebench_reward(
@@ -195,7 +190,6 @@ def test_livecodebench_http_error_is_serializable_and_identifies_problem(monkeyp
     calls = []
     responses = [_FakeResponse(500, body="sandbox uploads exceed 67108864 bytes")]
     monkeypatch.setattr(rewards.aiohttp, "ClientSession", _fake_client_session(responses, calls))
-    monkeypatch.setattr(rewards, "validate_preflight_marker", lambda *_args: None)
 
     with pytest.raises(RuntimeError, match="abc375_c.*HTTP 500.*uploads exceed") as error:
         asyncio.run(
@@ -353,10 +347,7 @@ KK_LABEL = {
             "Reasoning can appear before the final block.\n<answer>\n"
             "Michael is a knight\nZoey is a knave\nEthan is a knight\n</answer>"
         ),
-        (
-            "<ANSWER>\n(1) ethan is a knight.\n"
-            "2. MICHAEL is a knight\n- Zoey is a knave\n</ANSWER><|im_end|>"
-        ),
+        ("<ANSWER>\n(1) ethan is a knight.\n" "2. MICHAEL is a knight\n- Zoey is a knave\n</ANSWER><|im_end|>"),
     ],
 )
 def test_kk_reward_accepts_exact_assignment_in_any_order(response):

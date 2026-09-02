@@ -1,0 +1,47 @@
+schema_version: 1
+campaign_id: mopd-gpas-64k-v3
+seed: 42
+code_revision: FILL_BEFORE_ASSIGNING_RUNS
+assets:
+  model_repo: zsqzz/mopd-gpas-64k-models
+  model_revision: 46c307ad13f274d8db7c1df949e4df8359ae6b32
+  data_repo: zsqzz/mopd-gpas-64k-data
+  data_revision: e3ead6f98b7089e0def39516cd06cf711b10b1ec
+shared_dependency: warm_start-seed42
+resources_per_run:
+  student_gpus: 1
+  teacher_gpus: 1
+runs:
+  - id: uniform_k1_conventional
+    owner: null
+    machine: null
+    status: pending
+  - id: uniform_k1_taskwise
+    owner: null
+    machine: null
+    status: pending
+    unlocks: [frozen_bank_middle, frozen_bank_late]
+  - id: gpas_k1_taskwise
+    owner: null
+    machine: null
+    status: pending
+  - id: cost_gpas_k1_taskwise
+    owner: null
+    machine: null
+    status: pending
+  - id: uniform_k2_taskwise
+    owner: null
+    machine: null
+    status: pending
+  - id: cost_gpas_k2_taskwise
+    owner: null
+    machine: null
+    status: pending
+  - id: all_k4_taskwise
+    owner: null
+    machine: null
+    status: pending
+  - id: all_k4_conventional
+    owner: null
+    machine: null
+    status: pending

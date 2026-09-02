@@ -90,6 +90,45 @@ def test_wandb_provenance_artifact_contains_manifest_and_source_snapshot(tmp_pat
     assert added[-1][1] == "logged"
 
 
+@pytest.mark.unit
+def test_wandb_plot_artifact_contains_lossless_metrics_and_allocation(tmp_path, monkeypatch):
+    metrics = tmp_path / "metrics"
+    metrics.mkdir()
+    mopd = metrics / "mopd.jsonl"
+    mopd.write_text('{"metrics":{"mopd/update":0}}\n')
+    allocation_dir = tmp_path / "allocation"
+    allocation_dir.mkdir()
+    allocation = allocation_dir / "allocation.jsonl"
+    allocation.write_text('{"update":0}\n')
+    completion = tmp_path / "run_complete.json"
+    completion.write_text('{"status":"complete"}\n')
+    added = []
+
+    class Artifact:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def add_file(self, path, name):
+            added.append((path, name))
+
+    monkeypatch.setattr(wandb_utils.wandb, "run", SimpleNamespace(id="run42"))
+    monkeypatch.setattr(wandb_utils.wandb, "Artifact", Artifact)
+    monkeypatch.setattr(wandb_utils.wandb, "log_artifact", lambda artifact: added.append((artifact, "logged")))
+
+    wandb_utils.log_run_data_artifact(
+        SimpleNamespace(
+            metrics_output_dir=str(metrics),
+            mopd_output_dir=str(allocation_dir),
+            completion_marker_path=str(completion),
+        )
+    )
+
+    assert (str(mopd), "metrics/mopd.jsonl") in added
+    assert (str(allocation), "allocation/allocation.jsonl") in added
+    assert (str(completion), "run_complete.json") in added
+    assert added[-1][1] == "logged"
+
+
 @pytest.mark.integration
 def test_real_offline_wandb_persists_id_metrics_provenance_and_completion(tmp_path, monkeypatch):
     monkeypatch.setenv("WANDB_MODE", "offline")
@@ -112,7 +151,7 @@ def test_real_offline_wandb_persists_id_metrics_provenance_and_completion(tmp_pa
             wandb_run_name="offline_integration",
             wandb_random_suffix=False,
             wandb_team="zsqzz",
-            wandb_project="iclr2027-opd-geometry-test",
+            wandb_project="iclr2027-mopd-test",
             wandb_dir=str(tmp_path / "wandb"),
             rank=0,
             run_manifest_path=str(manifest),
@@ -142,8 +181,7 @@ def test_real_offline_wandb_persists_id_metrics_provenance_and_completion(tmp_pa
         assert resumed.wandb_run_id == first_id
         logging_utils.log(resumed, {"rollout/step": 1, "rollout/reward/code": 0.5}, "rollout/step")
         logging_utils.log(resumed, {"eval/step": 1, "eval/livecodebench/pass@1": 0.4}, "eval/step")
-        logging_utils.log(resumed, {"geometry/step": 1, "geometry/global/update_norm": 0.01}, "geometry/step")
-        logging_utils.log(resumed, {"forgetting/step": 1, "forgetting/code": 0.0}, "forgetting/step")
+        logging_utils.log(resumed, {"mopd/update": 1, "mopd/adam_score": 0.01}, "mopd/update")
         logging_utils.mark_run_complete(resumed, final_num_updates=1)
     finally:
         logging_utils.finish_tracking(resumed)
@@ -154,8 +192,7 @@ def test_real_offline_wandb_persists_id_metrics_provenance_and_completion(tmp_pa
     assert marker["final_num_updates"] == 1
     assert {path.name for path in (tmp_path / "metrics").glob("*.jsonl")} == {
         "eval.jsonl",
-        "forgetting.jsonl",
-        "geometry.jsonl",
+        "mopd.jsonl",
         "rollout.jsonl",
         "train.jsonl",
     }
