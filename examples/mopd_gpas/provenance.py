@@ -174,16 +174,38 @@ def hardware_record() -> dict[str, Any]:
         "--format=csv,noheader,nounits",
     ]
     try:
-        result = subprocess.run(command, text=True, capture_output=True, check=False)
-    except FileNotFoundError:
-        record["nvidia_smi"] = {"available": False, "error": "nvidia-smi not found"}
+        result = subprocess.run(command, text=True, capture_output=True, check=False, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        record["nvidia_smi"] = {
+            "available": False,
+            "query": command[1],
+            "gpus": [],
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        return record
+    if result.returncode:
+        error = result.stderr.strip() or result.stdout.strip() or f"nvidia-smi exited with code {result.returncode}"
+        record["nvidia_smi"] = {
+            "available": False,
+            "query": command[1],
+            "gpus": [],
+            "error": error,
+        }
         return record
     lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        record["nvidia_smi"] = {
+            "available": False,
+            "query": command[1],
+            "gpus": [],
+            "error": "nvidia-smi returned an empty GPU inventory",
+        }
+        return record
     record["nvidia_smi"] = {
-        "available": result.returncode == 0,
+        "available": True,
         "query": command[1],
         "gpus": lines,
-        "error": result.stderr.strip() or None,
+        "error": None,
     }
     return record
 
@@ -212,11 +234,19 @@ def selected_command_options(command: list[str]) -> dict[str, Any]:
         "eval-config",
         "eval-function-path",
         "mopd-seed",
+        "mopd-allocation",
+        "mopd-total-steps",
+        "mopd-microbatches-per-step",
+        "mopd-prompts-per-microbatch",
+        "mopd-min-microbatches",
+        "mopd-max-microbatches",
         "mopd-response-budget",
-        "mopd-checkpoint-responses",
+        "mopd-checkpoint-steps",
         "mopd-eval-responses",
-        "mopd-reset-sampler",
         "mopd-eval-on-start",
+        "mopd-heldout-variance",
+        "mopd-variance-checkpoint-step",
+        "mopd-variance-controller-state",
     )
     selected: dict[str, Any] = {}
     for name in names:
@@ -271,11 +301,13 @@ def start(args: argparse.Namespace) -> dict[str, Any]:
             "ray_dashboard_port": os.environ.get("RAY_DASHBOARD_PORT"),
             "ray_gcs_port": os.environ.get("RAY_GCS_PORT"),
             "ray_aux_port_base": os.environ.get("RAY_AUX_PORT_BASE"),
-            "mopd_train_cuda_visible_devices": os.environ.get("MOPD_TRAIN_CUDA_VISIBLE_DEVICES"),
-            "mopd_teacher_gpu": os.environ.get("MOPD_TEACHER_GPU"),
-            "mopd_teacher_port": os.environ.get("MOPD_TEACHER_PORT"),
+            "mopd_training_gpu": os.environ.get("MOPD_TRAIN_GPU"),
+            "mopd_inference_gpu": os.environ.get("MOPD_INFERENCE_GPU"),
+            "mopd_teacher_ports": {
+                task: os.environ.get(f"MOPD_TEACHER_{task.upper()}_PORT") for task in ("math", "code", "if", "science")
+            },
             "mopd_teacher_hf_root": os.environ.get("MOPD_TEACHER_HF_ROOT"),
-            "mopd_teacher_slot_state": os.environ.get("MOPD_TEACHER_SLOT_STATE"),
+            "mopd_qwen3_4b": os.environ.get("MOPD_QWEN3_4B"),
         },
         "hardware": hardware_record(),
     }
@@ -304,9 +336,7 @@ def resume(args: argparse.Namespace) -> dict[str, Any]:
         "protocol_cli": selected_command_options(args.training_command),
         "inputs": [file_record(value) for value in args.input],
         "checkpoints": [checkpoint_record(value) for value in args.checkpoint],
-        "source_snapshot": source_snapshot(
-            repo, run_dir, args.source, f"source_snapshot_resume_{ordinal:03d}.tar.gz"
-        ),
+        "source_snapshot": source_snapshot(repo, run_dir, args.source, f"source_snapshot_resume_{ordinal:03d}.tar.gz"),
         "git": git_record(repo),
     }
     failed = run_dir / "run_failed.json"

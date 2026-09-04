@@ -4,15 +4,16 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import torch
 
 from examples.mopd_gpas import (
     analyze_capability,
-    analyze_frozen_bank,
+    analyze_heldout_variance,
     analyze_mopd,
     plot_results,
     prepare_mopd,
 )
+
+NUM_GPUS = 0
 
 
 def _write_jsonl(path: Path, rows) -> None:
@@ -20,439 +21,244 @@ def _write_jsonl(path: Path, rows) -> None:
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
 
-def test_frozen_bank_k2_enumerates_six_sets_and_taskwise_target_is_exact():
-    raw = np.asarray([1.0, 2.0, 3.0, 4.0])
-    marginals, distribution = analyze_frozen_bank._distribution(
-        "gpas",
-        raw_scores=raw,
-        adam_scores=raw,
-        width=2,
-        task_seconds=np.ones(4),
-        switch_seconds=np.zeros(4),
-        resident=0,
-    )
-    assert len(distribution) == 6
-    vectors = [np.asarray([i + 1.0, 2 * i - 1.0]) for i in range(4)]
-    _mse, conventional, taskwise = analyze_frozen_bank._estimator_error(vectors, marginals, distribution)
-    assert conventional > 0
-    assert taskwise == pytest.approx(0.0, abs=1e-12)
-
-
-def test_frozen_bank_fold_uses_rms_unit_scores_and_raw_gradient_second_moment():
-    observations = {}
-    for task_index, task in enumerate(analyze_frozen_bank.TASKS):
-        observations[task] = [
-            {
-                "raw": np.asarray([1.0 + offset, (-1.0) ** offset * (task_index + 1.0)]),
-                "adam": np.asarray([100.0, 100.0]),
-                "raw_score": float(offset + 1 + task_index),
-                "adam_score": float(2 * (offset + 1 + task_index)),
-                "task_seconds": 1.0,
-                "switch_seconds": 0.0,
-            }
-            for offset in range(8)
-        ]
-    fold = analyze_frozen_bank._fold(observations, slice(0, 4), slice(4, 8), resident=0)
-    expected_score = np.sqrt(np.mean(np.square([1.0, 2.0, 3.0, 4.0])))
-    assert fold["scores"]["math"]["raw_norm"] == pytest.approx(expected_score)
-
-    method = fold["K"]["1"]["uniform"]
-    marginals = np.asarray(list(method["marginals"].values()))
-    distribution = {
-        tuple(analyze_frozen_bank.TASKS.index(name) for name in names.split("+")): probability
-        for names, probability in method["set_distribution"].items()
-    }
-    expected = []
-    for offset in range(4, 8):
-        raw_vectors = [observations[task][offset]["raw"] for task in analyze_frozen_bank.TASKS]
-        expected.append(analyze_frozen_bank._estimator_error(raw_vectors, marginals, distribution)[1])
-    assert method["conventional_second_moment_relative_error"] == pytest.approx(np.mean(expected))
-
-
-def _frozen_bank_rows():
-    rows = []
-    for operation in range(32):
-        task = analyze_frozen_bank.TASKS[operation % 4]
-        rows.append(
-            {
-                "operation_index": operation,
-                "execution_order": [task],
-                "feedback": {
-                    "task_units": [
-                        {
-                            "predicted_full_task_seconds": 1.0,
-                            "teacher_transfer_tail_seconds": 0.0,
-                        }
-                    ]
-                },
-            }
-        )
-    return rows
-
-
-def test_frozen_bank_loads_the_single_optimizer_rank_used_by_the_launcher(tmp_path):
-    rows = _frozen_bank_rows()
-    _write_jsonl(tmp_path / "allocation/allocation.jsonl", rows)
-    for row in rows:
-        operation = row["operation_index"]
-        task = row["execution_order"][0]
-        path = tmp_path / "bank" / f"unit_{operation:03d}_{task}_rank_0000.pt"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "schema_version": 1,
-                "metadata": {
-                    "operation_index": operation,
-                    "task": task,
-                    "raw_score": 1.0,
-                    "adam_score": 2.0,
-                },
-                "layout": [{"name": "parameter", "take": 2}],
-                "raw": torch.tensor([1.0, 2.0]),
-                "scaled": torch.tensor([2.0, 4.0]),
-            },
-            path,
-        )
-
-    observations, _ = analyze_frozen_bank._load_stage(tmp_path)
-
-    assert all(len(units) == 8 for units in observations.values())
-
-
-def test_frozen_bank_rejects_a_missing_single_rank_capture(tmp_path):
-    rows = _frozen_bank_rows()
-    _write_jsonl(tmp_path / "allocation/allocation.jsonl", rows)
-    with pytest.raises(ValueError, match="requires ranks 0..0"):
-        analyze_frozen_bank._load_stage(tmp_path)
-
-
-def _completion(path: Path, updates=1):
-    path.mkdir(parents=True, exist_ok=True)
-    (path / "run_complete.json").write_text(
-        json.dumps({"status": "complete", "final_num_updates": updates}), encoding="utf-8"
-    )
-
-
-def _eval_metrics(rollout_id, mean):
-    tasks = ("math", "code", "if", "science")
-    return {
-        "eval/rollout_id": rollout_id,
-        "eval/num_updates": 1,
-        "eval/mean_relative_teacher_loss": mean,
-        **{f"eval/relative_teacher_loss/{task}": mean for task in tasks},
-        **{f"eval/teacher_loss/{task}": mean / (index + 1) for index, task in enumerate(tasks)},
-    }
-
-
-def _build_synthetic_runs(root: Path):
-    def feedback(operation, task, gpu_seconds, valid_tokens=10_000):
-        unit = {
+def _feedback(step: int, config_index: int) -> dict:
+    task_units = [
+        {
             "task": task,
-            "switched": True,
-            "teacher_switch_seconds": 0.1,
-            "teacher_transfer_tail_seconds": 0.1,
-            "teacher_memory_mib": 3000.0,
-            "student_rollout_seconds": 4.0,
-            "teacher_scoring_seconds": 3.0,
-            "actor_forward_backward_wall_seconds": 2.0,
-            "optimizer_wall_seconds": 1.0,
-            "student_peak_hbm_bytes": 4 * 2**30,
+            "microbatches": 4,
+            "microbatch_seconds": 0.25,
         }
-        return {
-            "operation": operation,
-            "total_gpu_seconds": gpu_seconds,
-            "active_gpu_seconds": gpu_seconds - 2.0,
-            "rollout_gpu_seconds": 8.0,
-            "teacher_gpu_seconds": 3.0,
-            "actor_forward_backward_gpu_seconds": 4.0,
-            "optimizer_gpu_seconds": 1.0,
-            "valid_response_tokens": valid_tokens,
-            "completed_responses": 64,
-            "invalid_responses": 0,
-            "truncated_responses": 0,
-            "peak_hbm_bytes": 4 * 2**30,
-            "teacher_peak_memory_mib": 3000,
-            "allocated_gpu_count": 5,
-            "total_step_seconds": gpu_seconds / 5,
-            "total_wall_seconds": gpu_seconds / 5,
-            "rollout_wall_seconds": 4.0,
-            "teacher_wall_seconds": 3.0,
-            "rollout_and_teacher_wall_seconds": 4.0,
-            "actor_forward_backward_wall_seconds": 2.0,
-            "optimizer_wall_seconds": 1.0,
-            "task_units": [unit],
-        }
+        for task in analyze_mopd.TASKS
+    ]
+    wall = 8.0 + config_index / 10
+    return {
+        "task_units": task_units,
+        "fixed_seconds": wall - 4.0,
+        "aggregate_grad_norm": 2.0,
+        "aggregate_grad_clipped": False,
+        "total_wall_seconds": wall,
+        "total_gpu_seconds": 2 * wall,
+        "valid_response_tokens": 1_000 + step,
+        "generated_tokens": 1_100 + step,
+        "truncated_responses": 0,
+        "invalid_responses": 0,
+        "peak_hbm_bytes": 50 * 2**30,
+        "teacher_peak_memory_mib": 40 * 1024,
+    }
 
-    warm = root / "warm_start-seed42"
-    _completion(warm, 8)
-    warm_rows = []
-    for operation in range(8):
-        task = analyze_mopd.TASKS[operation % 4]
-        warm_rows.append(
-            {
-                "operation_index": operation,
-                "rollout_id": operation,
-                "attempted_responses_before": 64 * operation,
-                "attempted_responses_after": 64 * (operation + 1),
-                "operation": "train",
-                "selected_set": [task],
-                "execution_order": [task],
-                "resident_teacher_before": ("math" if operation == 0 else analyze_mopd.TASKS[(operation - 1) % 4]),
-                "resident_teacher_after": task,
-                "optimizer_updates_after": operation + 1,
-                "processed_task_units_after": operation + 1,
-                "probe_count_after": 0,
-                "inclusion_probabilities": {task: 0.25 for task in analyze_mopd.TASKS},
-                "set_distribution": {task: 0.25 for task in analyze_mopd.TASKS},
-                "score_ages_after": {task: 0 for task in analyze_mopd.TASKS},
-                "raw_gradient_rms_after": {task: 1.0 for task in analyze_mopd.TASKS},
-                "adam_gradient_rms_after": {task: 2.0 for task in analyze_mopd.TASKS},
-                "predicted_set_seconds": {task: 1.0 for task in analyze_mopd.TASKS},
-                "feedback": feedback("train", task, 5.0, valid_tokens=100),
-            }
+
+def _build_runs(root: Path) -> Path:
+    weights = {task: 0.25 for task in analyze_mopd.TASKS}
+    protocol = {
+        "schema_version": 4,
+        "training": {"configs": list(analyze_mopd.CONFIGS)},
+        "objective": {"weights": weights},
+        "initial_kl": {"tasks": {task: {"ell0": 1.0} for task in analyze_mopd.TASKS}},
+    }
+    protocol_path = root / "protocol.json"
+    protocol_path.parent.mkdir(parents=True, exist_ok=True)
+    protocol_path.write_text(json.dumps(protocol), encoding="utf-8")
+    for config_index, config in enumerate(analyze_mopd.CONFIGS):
+        run = root / f"{config}-seed42"
+        run.mkdir(parents=True)
+        (run / "run_complete.json").write_text(
+            json.dumps({"status": "complete", "final_num_updates": 500}), encoding="utf-8"
         )
-    _write_jsonl(warm / "allocation/allocation.jsonl", warm_rows)
-    _write_jsonl(warm / "metrics/eval.jsonl", [{"metrics": _eval_metrics(7, 0.9)}])
-
-    for index, config in enumerate(analyze_mopd.CONFIGS):
-        path = root / f"{config}-seed42"
-        _completion(path, 2)
-
-        train_probabilities = {"math": 0.1, "code": 0.2, "if": 0.3, "science": 0.4}
-        _write_jsonl(
-            path / "allocation/allocation.jsonl",
-            [
-                {
-                    "operation_index": 0,
-                    "rollout_id": 8,
-                    "attempted_responses_before": 512,
-                    "attempted_responses_after": 63992,
-                    "operation": "train",
-                    "selected_set": ["math"],
-                    "execution_order": ["math"],
-                    "resident_teacher_before": "science",
-                    "resident_teacher_after": "math",
-                    "feedback": feedback("train", "math", 100.0 + index),
-                    "optimizer_updates_after": 9,
-                    "processed_task_units_after": 9,
-                    "probe_count_after": 0,
-                    "score_ages_after": {task: 0 for task in analyze_mopd.TASKS},
-                    "inclusion_probabilities": train_probabilities,
-                    "set_distribution": train_probabilities,
-                    "raw_gradient_rms_after": {task: 1.0 for task in analyze_mopd.TASKS},
-                    "adam_gradient_rms_after": {task: 2.0 for task in analyze_mopd.TASKS},
-                    "predicted_set_seconds": {task: 1.0 for task in analyze_mopd.TASKS},
-                },
-                {
-                    "operation_index": 1,
-                    "rollout_id": 9,
-                    "attempted_responses_before": 63992,
-                    "attempted_responses_after": 64000,
-                    "operation": "probe",
-                    "selected_set": ["science"],
-                    "execution_order": ["science"],
-                    "resident_teacher_before": "math",
-                    "resident_teacher_after": "science",
-                    "feedback": feedback("probe", "science", 10.0),
-                    "optimizer_updates_after": 9,
-                    "processed_task_units_after": 9,
-                    "probe_count_after": 1,
-                    "score_ages_after": {task: 1 for task in analyze_mopd.TASKS},
-                    "inclusion_probabilities": {
-                        "math": 0.0,
-                        "code": 0.0,
-                        "if": 0.0,
-                        "science": 1.0,
-                    },
-                    "set_distribution": {"science": 1.0},
-                    "raw_gradient_rms_after": {task: 1.0 for task in analyze_mopd.TASKS},
-                    "adam_gradient_rms_after": {task: 2.0 for task in analyze_mopd.TASKS},
-                    "predicted_set_seconds": {task: 1.0 for task in analyze_mopd.TASKS},
-                },
-            ],
-        )
-        _write_jsonl(path / "metrics/eval.jsonl", [{"metrics": _eval_metrics(9, 0.7 + index * 0.01)}])
-
-
-def test_main_report_contains_all_eight_configs_and_response_axis(tmp_path, monkeypatch):
-    root = tmp_path / "runs"
-    _build_synthetic_runs(root)
-    output = tmp_path / "report.json"
-    monkeypatch.setattr(analyze_mopd, "_paired_bootstrap", lambda runs: {"configs": list(runs)})
-    monkeypatch.setattr(sys, "argv", ["analyze_mopd.py", "--root", str(root), "--output", str(output)])
-    analyze_mopd.main()
-    report = json.loads(output.read_text())
-    assert output.with_name("mopd_outcomes.csv").is_file()
-    assert tuple(report["configs"]) == analyze_mopd.CONFIGS
-    assert all(report["curves"][config][-1]["attempted_responses"] == 64000 for config in report["configs"])
-    assert report["outcomes"]["uniform_k1_conventional"]["responses_to_threshold"] is not None
-    assert report["outcomes"]["uniform_k1_conventional"]["final_train_operation_index"] == 0
-    assert report["outcomes"]["uniform_k1_conventional"]["final_inclusion_probabilities"]["math"] == 0.1
-    assert len(report["system_traces"]["uniform_k1_conventional"]) == 2
-
-
-def _synthetic_figure_reports():
-    configs = list(plot_results.CONFIGS)
-    tasks = plot_results.TASKS
-
-    def system_trace(config_index, config):
-        if config == "cost_gpas_k2_taskwise":
-            set_distribution = {
-                "math+code": 0.20,
-                "math+if": 0.15,
-                "math+science": 0.15,
-                "code+if": 0.15,
-                "code+science": 0.20,
-                "if+science": 0.15,
-            }
-            inclusion = {task: 0.5 for task in tasks}
-        else:
-            set_distribution = {task: probability for task, probability in zip(tasks, (0.1, 0.2, 0.3, 0.4))}
-            inclusion = dict(set_distribution)
         rows = []
-        for operation in range(5):
-            is_probe = operation == 2 and config in plot_results.ADAPTIVE_CONFIGS
+        wall = 8.0 + config_index / 10
+        for index in range(500):
+            noise = {task: float(task_index + 1) for task_index, task in enumerate(analyze_mopd.TASKS)}
             rows.append(
                 {
-                    "operation": "probe" if is_probe else "train",
-                    "attempted_responses_after": 512 + (operation + 1) * 12_000,
-                    "total_gpu_seconds": 100.0 + config_index,
-                    "score_ages": {task: operation + task_index for task_index, task in enumerate(tasks)},
-                    "raw_gradient_rms": {
-                        task: float(task_index + 1 + operation / 10) for task_index, task in enumerate(tasks)
-                    },
-                    "adam_gradient_rms": {
-                        task: float((4 - task_index) * (operation + 1)) for task_index, task in enumerate(tasks)
-                    },
-                    "inclusion_probabilities": inclusion,
-                    "set_distribution": set_distribution,
-                    "component_wall_seconds": {
-                        "rollout_and_teacher_wall_seconds": 10.0 + config_index,
-                        "actor_forward_backward_wall_seconds": 2.0,
-                        "optimizer_wall_seconds": 0.5,
-                    },
-                    "student_peak_hbm_gib": 48.0 + config_index / 10,
-                    "teacher_peak_hbm_gib": 18.0 + config_index / 10,
-                    "task_units": [
-                        {
-                            "switched": operation > 0,
-                            "teacher_transfer_tail_seconds": operation / 10,
-                        }
-                    ],
+                    "operation_index": index,
+                    "optimizer_updates_after": index + 1,
+                    "attempted_responses_after": (index + 1) * 64,
+                    "counts": {task: 4 for task in analyze_mopd.TASKS},
+                    "H": 1.0,
+                    "raw_noise_after": noise,
+                    "scaled_noise_after": noise,
+                    "loss_ema_after": {task: 0.8 for task in analyze_mopd.TASKS},
+                    "task_seconds_before": {task: None if index == 0 else 0.25 for task in analyze_mopd.TASKS},
+                    "task_seconds_after": {task: 0.25 for task in analyze_mopd.TASKS},
+                    "fixed_seconds_before": None if index == 0 else wall - 4.0,
+                    "fixed_seconds_after": wall - 4.0,
+                    "feedback": _feedback(index, config_index),
                 }
             )
-        return rows
+        _write_jsonl(run / "allocation/allocation.jsonl", rows)
+        eval_rows = []
+        for step in analyze_mopd.STEPS:
+            loss = 1.0 - step / 2_000 + config_index / 100
+            metrics = {
+                "eval/num_updates": step,
+                "eval/weighted_teacher_loss": loss,
+                **{f"eval/teacher_loss/{task}": loss for task in analyze_mopd.TASKS},
+                **{f"eval/normalized_teacher_loss/{task}": loss for task in analyze_mopd.TASKS},
+            }
+            eval_rows.append({"metrics": metrics})
+        _write_jsonl(run / "metrics/eval.jsonl", eval_rows)
+    return protocol_path
 
-    outcomes = {}
-    bootstraps = {}
+
+def test_main_report_uses_eight_runs_and_the_500_step_clock(tmp_path, monkeypatch):
+    root = tmp_path / "runs"
+    protocol = _build_runs(root)
+    output = tmp_path / "report/mopd.json"
+    monkeypatch.setattr(
+        analyze_mopd,
+        "paired_bootstrap",
+        lambda runs, weights: {"replicates": 1_000, "checkpoints": {}},
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "analyze_mopd.py",
+            "--root",
+            str(root),
+            "--protocol",
+            str(protocol),
+            "--output",
+            str(output),
+        ],
+    )
+    analyze_mopd.main()
+    report = json.loads(output.read_text())
+    assert tuple(report["configs"]) == analyze_mopd.CONFIGS
+    assert report["response_budget"] == 32_000
+    assert all(report["curves"][config][-1]["step"] == 500 for config in report["configs"])
+    assert report["outcomes"]["uniform"]["gpu_hours"] == pytest.approx(8_000 / 3_600)
+    assert report["outcomes"]["std_mopd"]["gpu_hours_to_uniform_final"] is None
+    assert report["outcomes"]["d3_mopd"]["gpu_hours_to_uniform_final"] is None
+    assert report["outcomes"]["open_mopd"]["gpu_hours_to_uniform_final"] is None
+    assert report["mechanism_summary"]["uniform"]["H"] == {
+        "q25": 1.0,
+        "median": 1.0,
+        "q75": 1.0,
+    }
+    assert report["mechanism_summary"]["uniform"]["raw_scaled_ranking_disagreement_fraction"] == 0.0
+    assert output.with_name("mopd_outcomes.csv").is_file()
+
+
+def test_bootstrap_is_paired_by_prompt_and_excludes_non_fixed_objectives(monkeypatch, tmp_path):
+    runs = {config: {"path": str(tmp_path / f"{config}-seed42")} for config in analyze_mopd.CONFIGS}
+
+    def prompt_losses(path: Path, step: int):
+        config = path.name.removesuffix("-seed42")
+        offset = analyze_mopd.CONFIGS.index(config) / 100 + step / 100_000
+        return {
+            task: ([f"{task}-{index}" for index in range(128)], np.arange(128) / 128 + offset)
+            for task in analyze_mopd.TASKS
+        }
+
+    monkeypatch.setattr(analyze_mopd, "_prompt_losses", prompt_losses)
+    report = analyze_mopd.paired_bootstrap(runs, {task: 0.25 for task in analyze_mopd.TASKS}, replicates=100)
+    final = report["checkpoints"]["500"]
+    assert report["replicates"] == 100
+    assert final["gpas"]["paired_delta_vs_uniform"] == pytest.approx(0.01)
+    assert "weighted_loss_95ci" not in final["std_mopd"]
+    assert "weighted_loss_95ci" not in final["d3_mopd"]
+    assert "weighted_loss_95ci" not in final["open_mopd"]
+    assert final["std_mopd"]["tasks"]["math"]["paired_delta_vs_uniform"] == pytest.approx(0.05)
+
+
+def _figure_reports():
     curves = {}
-    for index, config in enumerate(configs):
-        final = 0.68 + index * 0.015
-        relative_losses = {task: final + (task_index - 1.5) * 0.02 for task_index, task in enumerate(tasks)}
-        outcomes[config] = {
-            "mean_relative_loss": final,
-            "relative_losses": relative_losses,
-            "responses_to_threshold": None if index == len(configs) - 1 else 40_000 + 1_000 * index,
-            "gpu_hours_to_threshold": None if index == len(configs) - 1 else 1.1 + index / 10,
-            "gpu_hours": 2.0 + index / 10,
-        }
-        worst = max(relative_losses.values())
-        bootstraps[config] = {
-            "mean_relative_loss_95ci": [final - 0.02, final + 0.02],
-            "worst_task_loss_95ci": [worst - 0.02, worst + 0.02],
-        }
+    outcomes = {}
+    traces = {}
+    checkpoints = {}
+    for step in analyze_mopd.STEPS:
+        checkpoints[str(step)] = {}
+        for config_index, config in enumerate(plot_results.CONFIGS):
+            loss = 1.0 - step / 2_000 + config_index / 100
+            item = {"objective_comparable": config not in analyze_mopd.NON_FIXED_OBJECTIVE, "tasks": {}}
+            if config not in analyze_mopd.NON_FIXED_OBJECTIVE:
+                item["weighted_loss_95ci"] = [loss - 0.01, loss + 0.01]
+            checkpoints[str(step)][config] = item
+    for config_index, config in enumerate(plot_results.CONFIGS):
         curves[config] = [
             {
-                "attempted_responses": 0,
-                "valid_response_tokens": 0,
-                "gpu_hours": 0.0,
-                "mean_relative_loss": 1.0,
-            },
-            {
-                "attempted_responses": 32_000,
-                "valid_response_tokens": 10_000_000 + index * 100_000,
-                "gpu_hours": 1.0 + index / 20,
-                "mean_relative_loss": 0.82 + index * 0.01,
-            },
-            {
-                "attempted_responses": 64_000,
-                "valid_response_tokens": 20_000_000 + index * 200_000,
-                "gpu_hours": 2.0 + index / 10,
-                "mean_relative_loss": final,
-            },
+                "step": step,
+                "attempted_responses": step * 64,
+                "gpu_hours": step / 200 + config_index / 100,
+                "weighted_loss": 1.0 - step / 2_000 + config_index / 100,
+            }
+            for step in analyze_mopd.STEPS
         ]
-
+        outcomes[config] = {
+            "raw_losses": {task: 0.5 + task_index / 10 for task_index, task in enumerate(plot_results.TASKS)},
+            "weighted_loss": 0.65 + config_index / 100,
+            "gpu_hours": 2.5 + config_index / 10,
+            "gpu_hours_to_uniform_final": 2.0 + config_index / 10,
+            "fixed_to_variable_ratio_median": 1.5,
+            "step_time_p50_seconds": 8.0,
+            "step_time_p95_seconds": 10.0,
+        }
+        traces[config] = [
+            {
+                "step": step,
+                "counts": {
+                    task: 4 + ((task_index + step) % 3) - 1 for task_index, task in enumerate(plot_results.TASKS)
+                },
+                "raw_noise": {task: 1.0 + task_index for task_index, task in enumerate(plot_results.TASKS)},
+                "scaled_noise": {task: 2.0 + task_index for task_index, task in enumerate(plot_results.TASKS)},
+                "task_seconds_ema": {
+                    task: 0.2 + task_index / 10 for task_index, task in enumerate(plot_results.TASKS)
+                },
+                "fixed_to_variable_ratio": 1.5,
+                "H": 1.2,
+            }
+            for step in range(1, 501, 25)
+        ]
     mopd = {
         "seed": 42,
-        "configs": configs,
-        "response_budget": 64_000,
+        "configs": list(plot_results.CONFIGS),
         "common_threshold": 0.75,
         "curves": curves,
         "outcomes": outcomes,
-        "paired_bootstrap": {"baseline": configs[0], "configs": bootstraps},
-        "system_traces": {config: system_trace(index, config) for index, config in enumerate(configs)},
+        "system_traces": traces,
+        "paired_bootstrap": {"checkpoints": checkpoints},
     }
-    capability_configs = {}
-    capability_bootstraps = {}
-    baseline_macro = float(np.mean([0.45 + 0.02 * task_index for task_index in range(len(tasks))]))
-    for index, config in enumerate(configs):
-        scores = {task: {"score": 0.45 + 0.02 * task_index + 0.005 * index} for task_index, task in enumerate(tasks)}
-        macro = float(np.mean([value["score"] for value in scores.values()]))
-        delta = macro - baseline_macro
-        capability_configs[config] = {"domains": scores, "macro_score": macro}
-        capability_bootstraps[config] = {
-            "paired_macro_delta_vs_baseline": delta,
-            "paired_macro_delta_95ci": [delta - 0.01, delta + 0.01],
-        }
     capability = {
         "seed": 42,
-        "configs": capability_configs,
-        "paired_bootstrap": {"baseline": configs[0], "configs": capability_bootstraps},
-    }
-    bank = {
-        "stages": {
-            stage: {
-                "cross_fit": {
-                    "K": {
-                        str(k): {
-                            method: {
-                                "relative_adamw_estimator_mse": 0.2
-                                + 0.01 * k
-                                + 0.02 * stage_index
-                                + 0.01 * method_index
-                            }
-                            for method_index, method in enumerate(("uniform", "raw_norm", "gpas", "cost_gpas"))
-                        }
-                        for k in (1, 2, 4)
+        "configs": {
+            config: {
+                "domains": {
+                    task: {
+                        "score": 0.4 + task_index / 10 + config_index / 100,
+                        "normalized_gain": 0.2 + task_index / 10 + config_index / 100,
                     }
+                    for task_index, task in enumerate(plot_results.TASKS)
                 }
             }
-            for stage_index, stage in enumerate(("warm", "middle", "late"))
+            for config_index, config in enumerate(plot_results.CONFIGS)
+        },
+    }
+    variance = {
+        "checkpoints": {
+            str(step): {
+                method: {"relative_variance": 1.0 - method_index / 20}
+                for method_index, method in enumerate(("uniform", "raw_noise", "loss_gap", "gpas", "cost_gpas"))
+            }
+            for step in (50, 250, 500)
         }
     }
-    sampling = [
-        {
-            "adamw_empirical_mse_ratio": str(value),
-            "adamw_theory_mse_ratio": str(value * 0.99),
-            "cost_empirical_ratio": str(0.8 + value / 10),
-            "cost_theory_ratio": str(0.79 + value / 10),
-        }
-        for value in (1.0, 1.4, 0.7, 0.6)
-    ]
-    moments = [
-        {
-            "optimizer": optimizer,
-            "moment": moment,
-            "mc_relative_bias": str(value),
-            "calculated_relative_bias": str(value * 0.98),
-        }
-        for optimizer, values in (
-            ("Standard AdamW", (0.01, 0.8)),
-            ("Moment-consistent AdamW", (0.01, 0.002)),
-        )
-        for moment, value in zip(("First moment", "Second moment"), values)
-    ]
-    return mopd, capability, bank, sampling, moments
+    return mopd, capability, variance
+
+
+def test_result_gallery_renders_protocol_figures(tmp_path):
+    mopd, capability, variance = _figure_reports()
+    manifest = plot_results.render_all(mopd, capability, tmp_path, variance)
+    assert manifest["seed"] == 42
+    assert set(manifest["figures"]) == {
+        "learning_efficiency",
+        "task_losses",
+        "allocation_dynamics",
+        "system_costs",
+        "capability",
+        "heldout_gradient_variance",
+    }
+    assert all((tmp_path / name).stat().st_size > 1_000 for name in manifest["figures"].values())
 
 
 def test_capability_bootstrap_is_single_seed_and_paired_by_prompt():
@@ -470,8 +276,106 @@ def test_capability_bootstrap_is_single_seed_and_paired_by_prompt():
     }
     report = analyze_capability.paired_bootstrap(configs, replicates=100)
     assert report["seed"] == 42
-    assert report["configs"][analyze_capability.CONFIGS[0]]["paired_macro_delta_95ci"] == [0.0, 0.0]
-    assert report["configs"][analyze_capability.CONFIGS[1]]["paired_macro_delta_vs_baseline"] == pytest.approx(0.01)
+    assert report["configs"]["uniform"]["paired_macro_delta_95ci"] == [0.0, 0.0]
+    assert report["configs"]["gpas"]["paired_macro_delta_vs_baseline"] == pytest.approx(0.01)
+
+
+def test_capability_bootstrap_reports_teacher_normalized_gain():
+    configs = {
+        config: {
+            "domains": {
+                domain: {
+                    "prompt_indices": list(range(5)),
+                    "prompt_scores": [0.4 + 0.01 * config_index] * 5,
+                }
+                for domain in analyze_capability.DOMAINS
+            }
+        }
+        for config_index, config in enumerate(analyze_capability.CONFIGS)
+    }
+    references = {
+        reference: {
+            "domains": {
+                domain: {
+                    "score": 0.2 if reference == "initial_student" else 0.6,
+                    "prompt_indices": list(range(5)),
+                    "prompt_scores": [0.2 if reference == "initial_student" else 0.6] * 5,
+                }
+                for domain in analyze_capability.DOMAINS
+            }
+        }
+        for reference in analyze_capability.REFERENCES
+    }
+    report = analyze_capability.paired_bootstrap(configs, references, replicates=100)
+    assert report["configs"]["uniform"]["normalized_gain_95ci"] == pytest.approx([0.5, 0.5])
+    assert report["configs"]["gpas"]["paired_normalized_delta_vs_baseline"] == pytest.approx(0.025)
+
+
+def test_heldout_variance_crossfits_halves_with_training_time_costs(tmp_path):
+    run = tmp_path / "step_050"
+    run.mkdir()
+    (run / "run_complete.json").write_text(json.dumps({"status": "complete"}), encoding="utf-8")
+    units = []
+    for index, task in enumerate(analyze_mopd.TASKS, start=1):
+        units.append(
+            {
+                "task": task,
+                "microbatches": 32,
+                "microbatch_seconds": 100.0,
+                "raw_microbatch_sq": [2.0 * index] * 32,
+                "scaled_microbatch_sq": [3.0 * index] * 32,
+                "teacher_loss_microbatch": [0.1 * index] * 32,
+                "raw_half_mean_sq": [float(index), float(index)],
+                "scaled_half_mean_sq": [float(index), float(index)],
+                "raw_task_mean_sq": float(index),
+                "scaled_task_mean_sq": float(index),
+                "raw_subset_mean_sq": {"2": [float(index)] * 2, "4": [float(index)] * 2},
+                "scaled_subset_mean_sq": {"2": [float(index)] * 2, "4": [float(index)] * 2},
+            }
+        )
+    artifact = {
+        "schema_version": 1,
+        "checkpoint_step": 50,
+        "target_weights": dict.fromkeys(analyze_mopd.TASKS, 0.25),
+        "training_controller_state": {
+            "checkpoint_step": 50,
+            "task_seconds": {task: 1.0 + index for index, task in enumerate(analyze_mopd.TASKS)},
+            "fixed_seconds": 7.0,
+        },
+        "feedback": {"fixed_seconds": 400.0, "task_units": units},
+    }
+    (run / "heldout_gradient_scalars.json").write_text(json.dumps(artifact), encoding="utf-8")
+
+    report = analyze_heldout_variance.analyze_checkpoint(run, 50)
+
+    assert report["uniform"]["relative_variance"] == pytest.approx(1.0)
+    assert report["task_seconds"]["math"] == 1.0
+    assert report["fixed_seconds"] == 7.0
+
+
+def test_analysis_tables_match_the_preregistered_rows_and_columns(tmp_path):
+    mopd, capability, variance = _figure_reports()
+    references = {}
+    for reference_index, reference in enumerate(analyze_capability.REFERENCES):
+        references[reference] = {
+            "domains": {domain: {"score": 0.2 + 0.2 * (reference_index > 0)} for domain in analyze_capability.DOMAINS}
+        }
+    capability["references"] = references
+    capability["headroom"] = {
+        domain: {"initial_score": 0.2, "difference": 0.4} for domain in analyze_capability.DOMAINS
+    }
+    main_table = tmp_path / "mopd_main_table.csv"
+    analyze_capability._write_main_table(main_table, capability, mopd)
+    rows = main_table.read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 1 + len(analyze_capability.TABLE_TARGETS)
+    assert "final_heldout_F" in rows[0]
+    assert rows[1].startswith("initial_student,reference,")
+
+    variance_table = tmp_path / "heldout_gradient_variance.csv"
+    analyze_heldout_variance._write_table(variance_table, variance["checkpoints"])
+    variance_rows = variance_table.read_text(encoding="utf-8").splitlines()
+    assert len(variance_rows) == 4
+    assert variance_rows[1].startswith("50,")
 
 
 def test_protocol_preparation_rejects_an_additional_seed(monkeypatch):
@@ -480,19 +384,5 @@ def test_protocol_preparation_rejects_an_additional_seed(monkeypatch):
         prepare_mopd.main()
 
 
-def test_single_seed_result_gallery_renders_nine_rows_and_twenty_seven_panels(tmp_path):
-    reports = _synthetic_figure_reports()
-    manifest = plot_results.render_all(*reports, tmp_path)
-    assert manifest["seed"] == 42
-    assert manifest["row_count"] == 9
-    assert manifest["panel_count"] == 27
-    for relative_path in (*manifest["rows"], *manifest["panels"]):
-        assert (tmp_path / relative_path).stat().st_size > 1_000
-    assert json.loads((tmp_path / "figure_manifest.json").read_text()) == manifest
-
-
-def test_result_gallery_rejects_a_second_seed(tmp_path):
-    mopd, capability, bank, sampling, moments = _synthetic_figure_reports()
-    capability["seed"] = 43
-    with pytest.raises(ValueError, match="single training seed 42"):
-        plot_results.render_all(mopd, capability, bank, sampling, moments, tmp_path)
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

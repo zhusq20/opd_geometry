@@ -69,7 +69,7 @@ def _checkpoint(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         state = torch.load(sampler, map_location="cpu", weights_only=False)
         controller = state.get("controller") or {}
         if (
-            int(controller.get("completed_operations", -1)) != int(entry["operation_index"]) + 1
+            int(controller.get("completed_steps", -1)) != int(entry["optimizer_updates"])
             or int(controller.get("attempted_responses", -1)) != int(entry["attempted_responses"])
             or controller.get("pending") is not None
         ):
@@ -102,10 +102,9 @@ def inspect(run_dir: Path) -> dict[str, Any]:
             Path(record["path"]).is_file() and _sha256(Path(record["path"])) == record["sha256"]
             for record in matching_eval[0]["datasets"].values()
         )
-    resident_index = int(state["controller"]["resident_teacher"])
     metric_limits = {
         "eval.jsonl": ("eval/rollout_id", rollout_id),
-        "mopd.jsonl": ("mopd/update", operation_index),
+        "mopd.jsonl": ("mopd/update", int(entry["optimizer_updates"])),
         "rollout.jsonl": ("rollout/step", rollout_id),
         "train.jsonl": ("train/rollout_id", rollout_id),
     }
@@ -122,11 +121,8 @@ def inspect(run_dir: Path) -> dict[str, Any]:
         "operation_index": operation_index,
         "attempted_responses": int(entry["attempted_responses"]),
         "optimizer_updates": int(entry["optimizer_updates"]),
-        "resident_task": TASKS[resident_index],
         "allocation_frontier": int(allocations[-1]["operation_index"]),
-        "rewind_required": (
-            int(allocations[-1]["operation_index"]) > operation_index or metric_tail or eval_tail
-        ),
+        "rewind_required": (int(allocations[-1]["operation_index"]) > operation_index or metric_tail or eval_tail),
         "eval_on_start": not eval_complete,
     }
 
@@ -174,7 +170,7 @@ def apply(run_dir: Path) -> dict[str, Any]:
 
     metric_limits = {
         "eval.jsonl": ("eval/rollout_id", rollout_id),
-        "mopd.jsonl": ("mopd/update", operation_index),
+        "mopd.jsonl": ("mopd/update", int(result["optimizer_updates"])),
         "rollout.jsonl": ("rollout/step", rollout_id),
         "train.jsonl": ("train/rollout_id", rollout_id),
     }
@@ -191,9 +187,7 @@ def apply(run_dir: Path) -> dict[str, Any]:
     if eval_index.exists():
         _atomic_jsonl(eval_index, kept_eval)
     referenced = {
-        str(Path(record["path"]).resolve())
-        for row in kept_eval
-        for record in (row.get("datasets") or {}).values()
+        str(Path(record["path"]).resolve()) for row in kept_eval for record in (row.get("datasets") or {}).values()
     }
     artifact_root = run_dir / "teacher_loss_eval"
     for path in (artifact_root.rglob("*.jsonl") if artifact_root.is_dir() else ()):

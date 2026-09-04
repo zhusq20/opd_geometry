@@ -51,6 +51,7 @@ def test_code_reward_uses_same_test_subset_for_grpo_group(monkeypatch):
 
     monkeypatch.setattr(rewards.aiohttp, "ClientSession", FakeClientSession)
     monkeypatch.setattr(rewards, "_execute_code", fake_execute)
+    monkeypatch.setattr(rewards, "validate_preflight_marker", lambda *_args: None)
     unit_tests = {"inputs": [str(index) for index in range(50)], "outputs": [str(index) for index in range(50)]}
     config = {"url": "http://sandbox/run_code", "max_cases": 20, "seed": 42}
 
@@ -166,6 +167,17 @@ def _livecodebench_sample():
     )
 
 
+def test_livecodebench_reward_fails_closed_without_preflight_marker():
+    with pytest.raises(ValueError, match="preflight_marker"):
+        asyncio.run(
+            rewards.livecodebench_reward(
+                SimpleNamespace(),
+                _livecodebench_sample(),
+                {"url": "http://sandbox/submit"},
+            )
+        )
+
+
 def test_livecodebench_retries_transient_server_error(monkeypatch):
     calls = []
     responses = [
@@ -173,6 +185,7 @@ def test_livecodebench_retries_transient_server_error(monkeypatch):
         _FakeResponse(200, payload={"accepted": True, "tests": []}),
     ]
     monkeypatch.setattr(rewards.aiohttp, "ClientSession", _fake_client_session(responses, calls))
+    monkeypatch.setattr(rewards, "validate_preflight_marker", lambda *_args: None)
 
     result = asyncio.run(
         rewards.livecodebench_reward(
@@ -190,6 +203,7 @@ def test_livecodebench_http_error_is_serializable_and_identifies_problem(monkeyp
     calls = []
     responses = [_FakeResponse(500, body="sandbox uploads exceed 67108864 bytes")]
     monkeypatch.setattr(rewards.aiohttp, "ClientSession", _fake_client_session(responses, calls))
+    monkeypatch.setattr(rewards, "validate_preflight_marker", lambda *_args: None)
 
     with pytest.raises(RuntimeError, match="abc375_c.*HTTP 500.*uploads exceed") as error:
         asyncio.run(

@@ -295,7 +295,13 @@ def log_rollout_data(
                 # step, but cannot be reduced as a numeric rollout metric.
                 "mopd_tasks",
                 "mopd_operations",
-                "mopd_adamw_states",
+                "mopd_aggregations",
+                "mopd_operation_indices",
+                "mopd_target_weights",
+                "mopd_microbatch_indices",
+                "mopd_task_microbatch_counts",
+                "mopd_failure_penalties",
+                "mopd_step_global_batch_sizes",
                 "metadata",
                 "task_rewards_observed",
                 # DP-local view of `raw_reward`, which this loop already logs;

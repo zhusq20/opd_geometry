@@ -236,7 +236,15 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     # resume), so the worst case is the cosine/linear schedule reaches its
     # plateau slightly early or late. Pass ``--lr-decay-iters`` explicitly if you
     # need exact decay control.
-    args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    mopd_step_clock = bool(getattr(args, "mopd_enabled", False))
+    if mopd_step_clock:
+        args.train_iters = int(args.mopd_total_steps)
+        scheduler_increment = 1
+    else:
+        args.train_iters = (
+            args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+        )
+        scheduler_increment = args.global_batch_size
     # Eval-only runs still construct an optimizer before loading actor weights,
     # while their training loop remains empty. Megatron requires a positive
     # scheduler horizon even though that scheduler is never stepped.
@@ -244,15 +252,15 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
         args.train_iters = 1
     if args.lr_decay_iters is None:
         args.lr_decay_iters = args.train_iters
-    lr_decay_steps = args.lr_decay_iters * args.global_batch_size
-    wd_incr_steps = args.train_iters * args.global_batch_size
+    lr_decay_steps = args.lr_decay_iters * scheduler_increment
+    wd_incr_steps = args.train_iters * scheduler_increment
     wsd_decay_steps = None
     if args.lr_wsd_decay_iters is not None:
-        wsd_decay_steps = args.lr_wsd_decay_iters * args.global_batch_size
+        wsd_decay_steps = args.lr_wsd_decay_iters * scheduler_increment
     if args.lr_warmup_fraction is not None:
         lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
     else:
-        lr_warmup_steps = args.lr_warmup_iters * args.global_batch_size
+        lr_warmup_steps = args.lr_warmup_iters * scheduler_increment
 
     opt_param_scheduler = OptimizerParamScheduler(
         optimizer,
@@ -948,11 +956,11 @@ def train(
         from slime_plugins.mopd.optimizer import begin_mopd_operation
 
         operations = list(data_iterator[0].rollout_data["mopd_operations"])
-        adamw_states = list(data_iterator[0].rollout_data["mopd_adamw_states"])
-        if len(set(operations)) != 1 or len(set(adamw_states)) != 1:
-            raise ValueError("one MOPD rollout must use one operation type and one AdamW state rule")
+        aggregations = list(data_iterator[0].rollout_data["mopd_aggregations"])
+        if len(set(operations)) != 1 or len(set(aggregations)) != 1:
+            raise ValueError("one MOPD rollout must use one operation type and one aggregation rule")
         mopd_operation = str(operations[0])
-        begin_mopd_operation(optimizer, mopd_operation, str(adamw_states[0]))
+        begin_mopd_operation(optimizer, mopd_operation, str(aggregations[0]))
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
@@ -1102,9 +1110,11 @@ def train(
         if mopd_operation == "train" and not update_successful:
             raise RuntimeError("MOPD AdamW rejected the combined task-set update")
 
-        response_increment = int(mopd_final_feedback["attempted_responses"])
-        if mopd_operation != "bank":
-            opt_param_scheduler.step(increment=response_increment)
+        # The revised protocol uses optimizer updates, not generated responses,
+        # as the learning-rate clock. Held-out probes leave both weights and the
+        # scheduler untouched.
+        if mopd_operation == "train":
+            opt_param_scheduler.step(increment=1)
 
         if args.custom_megatron_after_train_step_hook_path and mopd_operation == "train":
             from slime.utils.misc import load_function
@@ -1139,17 +1149,9 @@ def train(
                     task_timing[key] = max(int(task_timing[key]), int(step_feedback[key]))
                 else:
                     task_timing[key] += float(step_feedback[key])
-        # The final compound AdamW step (or probe reduction) is shared by the
-        # selected exact set.  Attribute it once, evenly across its task units,
-        # so Cost-GPAS learns the complete service cost without double-counting
-        # it in the operation-level totals below.
         task_units = mopd_final_feedback["task_units"]
-        final_wall_share = final_optimizer_wall / len(task_units)
-        final_gpu_share = final_optimizer_gpu / len(task_units)
         for task_unit in task_units:
             task_timing = dict(timing_by_task[str(task_unit["task"])])
-            task_timing["optimizer_wall_seconds"] += final_wall_share
-            task_timing["optimizer_gpu_seconds"] += final_gpu_share
             task_unit.update(task_timing)
 
         peak_hbm_bytes = max(
@@ -1159,12 +1161,10 @@ def train(
         mopd_final_feedback.update(
             {
                 "actor_forward_backward_wall_seconds": sum(
-                    float(value["actor_forward_backward_wall_seconds"])
-                    for value in timing_by_task.values()
+                    float(value["actor_forward_backward_wall_seconds"]) for value in timing_by_task.values()
                 ),
                 "actor_forward_backward_gpu_seconds": sum(
-                    float(value["actor_forward_backward_gpu_seconds"])
-                    for value in timing_by_task.values()
+                    float(value["actor_forward_backward_gpu_seconds"]) for value in timing_by_task.values()
                 ),
                 "optimizer_wall_seconds": final_optimizer_wall
                 + sum(float(value["optimizer_wall_seconds"]) for value in timing_by_task.values()),

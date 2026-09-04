@@ -287,7 +287,9 @@ class ServerGroup:
 
         # Compute base_port from the maximum cursor across all nodes that
         # this group's engines may land on (conservative: just use global max).
-        base_port = max(port_cursors.values()) if port_cursors else 15000
+        base_port = (
+            max(port_cursors.values()) if port_cursors else int(os.environ.get("SLIME_ROLLOUT_PORT_BASE", "15000"))
+        )
         addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
             args=self.args,
             rollout_engines=rollout_engines,
@@ -473,47 +475,30 @@ class RolloutServer:
 
 
 def _assemble_mopd_feedback(args: Any, rollout_metrics: dict[str, Any], trainer_feedback: dict[str, Any]):
-    """Combine end-to-end wall time with auditable stage-level MOPD costs."""
+    """Join rollout and backward timing into the protocol's ``C + sum m_i tau_i`` model."""
 
     feedback = dict(trainer_feedback or {})
     if not feedback.get("mopd"):
         raise ValueError(f"Trainer did not return MOPD feedback: {feedback!r}")
 
-    operation = str(feedback["operation"])
+    variable_seconds = 0.0
     for unit in feedback["task_units"]:
         task = str(unit["task"])
         prefix = f"mopd/task/{task}/"
-        rollout_seconds = float(rollout_metrics[prefix + "student_rollout_seconds"])
-        ready_seconds = float(rollout_metrics[prefix + "teacher_ready_seconds"])
         scoring_seconds = float(rollout_metrics[prefix + "teacher_scoring_seconds"])
-        switch_seconds = float(rollout_metrics[prefix + "teacher_switch_seconds"])
-        switched = bool(rollout_metrics[prefix + "switched"])
-        backward_seconds = float(unit["actor_forward_backward_wall_seconds"])
-        capture_seconds = float(unit["optimizer_wall_seconds"])
-        resident_readiness_tail = 0.0 if switched else max(ready_seconds - rollout_seconds, 0.0)
-        service_seconds = (
-            rollout_seconds
-            + resident_readiness_tail
-            + scoring_seconds
-            + backward_seconds
-            + capture_seconds
-        )
-        if operation == "probe":
-            predicted_full = 8.0 * service_seconds
-        else:
-            predicted_full = service_seconds
+        backward_seconds = float(unit["actor_forward_backward_wall_seconds"]) + float(unit["optimizer_wall_seconds"])
+        microbatches = int(unit["microbatches"])
+        variable_seconds += scoring_seconds + backward_seconds
         unit.update(
             {
-                "predicted_full_task_seconds": predicted_full,
-                "teacher_switch_seconds": switch_seconds,
-                "teacher_load_seconds": float(rollout_metrics[prefix + "teacher_load_seconds"]),
-                "teacher_offload_seconds": float(rollout_metrics[prefix + "teacher_offload_seconds"]),
-                "teacher_ready_seconds": ready_seconds,
-                "student_rollout_seconds": rollout_seconds,
                 "teacher_scoring_seconds": scoring_seconds,
+                "student_rollout_seconds": float(rollout_metrics[prefix + "student_rollout_seconds"]),
+                "backward_seconds": backward_seconds,
+                "microbatch_seconds": (scoring_seconds + backward_seconds) / microbatches,
                 "prompt_count": int(rollout_metrics[prefix + "prompt_count"]),
                 "attempted_responses": int(rollout_metrics[prefix + "attempted_responses"]),
                 "valid_response_tokens": int(rollout_metrics[prefix + "valid_response_tokens"]),
+                "generated_tokens": int(rollout_metrics[prefix + "generated_tokens"]),
                 "teacher_scored_tokens": int(rollout_metrics[prefix + "teacher_scored_tokens"]),
                 "completed_responses": int(rollout_metrics[prefix + "completed_responses"]),
                 "truncated_responses": int(rollout_metrics[prefix + "truncated_responses"]),
@@ -521,10 +506,7 @@ def _assemble_mopd_feedback(args: Any, rollout_metrics: dict[str, Any], trainer_
                 "empty_responses": int(rollout_metrics[prefix + "empty_responses"]),
                 "teacher_scoring_failures": int(rollout_metrics[prefix + "teacher_scoring_failures"]),
                 "teacher_memory_mib": float(rollout_metrics[prefix + "teacher_memory_mib"]),
-                "teacher_transfer_tail_seconds": float(
-                    rollout_metrics[prefix + "teacher_transfer_tail_seconds"]
-                ),
-                "switched": switched,
+                "teacher_memory_probe_failures": int(rollout_metrics.get(prefix + "teacher_memory_probe_failures", 0)),
             }
         )
 
@@ -535,9 +517,7 @@ def _assemble_mopd_feedback(args: Any, rollout_metrics: dict[str, Any], trainer_
         "optimizer_gpu_seconds": float(feedback["optimizer_gpu_seconds"]),
     }
     feedback.update(active_component_costs)
-    rollout_and_teacher_wall_seconds = float(
-        rollout_metrics["mopd/rollout_and_teacher_wall_seconds"]
-    )
+    rollout_and_teacher_wall_seconds = float(rollout_metrics["mopd/rollout_and_teacher_wall_seconds"])
     component_wall_seconds = float(
         rollout_and_teacher_wall_seconds
         + rollout_metrics["mopd/reward_wall_seconds"]
@@ -549,18 +529,12 @@ def _assemble_mopd_feedback(args: Any, rollout_metrics: dict[str, Any], trainer_
         raise ValueError(f"Invalid end-to-end MOPD step time: {total_step_seconds}.")
     if total_step_seconds + 1e-6 < component_wall_seconds:
         raise ValueError(
-            "End-to-end MOPD step time is shorter than its measured critical-path stages: "
-            f"total={total_step_seconds}, stages={component_wall_seconds}."
+            f"End-to-end MOPD step time {total_step_seconds} is shorter than "
+            f"its measured component critical path {component_wall_seconds}."
         )
-
-    student_pool_gpu_count = max(
-        int(args.rollout_num_gpus),
-        int(args.actor_num_nodes) * int(args.actor_num_gpus_per_node),
-    )
-    teacher_pool_gpu_count = int(rollout_metrics["mopd/teacher_pool_gpu_count"])
-    if student_pool_gpu_count <= 0 or teacher_pool_gpu_count <= 0:
-        raise ValueError("MOPD resident student and teacher GPU pools must both be positive.")
-    allocated_gpu_count = student_pool_gpu_count + teacher_pool_gpu_count
+    actor_gpu_count = int(args.actor_num_nodes) * int(args.actor_num_gpus_per_node)
+    inference_gpu_count = int(args.rollout_num_gpus)
+    allocated_gpu_count = actor_gpu_count + inference_gpu_count
     feedback.update(
         {
             "rollout_wall_seconds": float(rollout_metrics["mopd/student_rollout_wall_seconds"]),
@@ -570,30 +544,24 @@ def _assemble_mopd_feedback(args: Any, rollout_metrics: dict[str, Any], trainer_
             "actor_forward_backward_wall_seconds": float(feedback["actor_forward_backward_wall_seconds"]),
             "optimizer_wall_seconds": float(feedback["optimizer_wall_seconds"]),
             "valid_response_tokens": int(rollout_metrics["mopd/valid_response_tokens"]),
+            "generated_tokens": int(rollout_metrics["mopd/generated_tokens"]),
             "teacher_scored_tokens": int(rollout_metrics["mopd/teacher_scored_tokens"]),
             "prompt_count": int(rollout_metrics["mopd/prompt_count"]),
             "completed_responses": int(rollout_metrics["mopd/completed_responses"]),
             "truncated_responses": int(rollout_metrics["mopd/truncated_responses"]),
             "invalid_responses": int(rollout_metrics["mopd/invalid_responses"]),
-            "student_pool_gpu_count": student_pool_gpu_count,
-            "teacher_pool_gpu_count": teacher_pool_gpu_count,
+            "actor_gpu_count": actor_gpu_count,
+            "inference_gpu_count": inference_gpu_count,
             "allocated_gpu_count": allocated_gpu_count,
             "active_gpu_seconds": float(sum(active_component_costs.values())),
             "component_wall_seconds": component_wall_seconds,
-            # GPU hours account for every resident GPU over the full operation,
-            # including idle time in the colocated student pool and one teacher slot.
             "total_gpu_seconds": total_step_seconds * allocated_gpu_count,
             "total_step_seconds": total_step_seconds,
             "total_wall_seconds": total_step_seconds,
+            "fixed_seconds": max(total_step_seconds - variable_seconds, 0.0),
             "peak_hbm_bytes": int(feedback.get("peak_hbm_bytes", 0)),
             "teacher_peak_memory_mib": float(rollout_metrics["mopd/teacher_peak_memory_mib"]),
-            "resident_teacher_after": (
-                None
-                if int(rollout_metrics["mopd/resident_teacher_after_index"]) < 0
-                else ("math", "code", "if", "science")[
-                    int(rollout_metrics["mopd/resident_teacher_after_index"])
-                ]
-            ),
+            "teacher_memory_probe_failures": int(rollout_metrics.get("mopd/teacher_memory_probe_failures", 0)),
         }
     )
     return feedback
@@ -836,19 +804,16 @@ class RolloutManager:
         record = self.data_source.complete_update(int(rollout_id), feedback)
         log_values = {
             "mopd/operation_index": int(record["operation_index"]),
-            "mopd/update": int(record["operation_index"]),
-            "mopd/operation_train": int(record["operation"] == "train"),
-            "mopd/operation_probe": int(record["operation"] == "probe"),
-            "mopd/operation_bank": int(record["operation"] == "bank"),
-            "mopd/task_width": int(record["task_width"]),
+            "mopd/update": int(record["optimizer_updates_after"]),
             "mopd/attempted_responses_before": int(record["attempted_responses_before"]),
             "mopd/attempted_responses": int(record["attempted_responses_after"]),
-            "mopd/processed_task_units": int(record["processed_task_units_after"]),
             "mopd/optimizer_updates": int(record["optimizer_updates_after"]),
-            "mopd/probe_count": int(record["probe_count_after"]),
             "mopd/checkpoint_due": int(record["checkpoint_due"]),
             "mopd/budget_complete": int(record["budget_complete"]),
+            "mopd/aggregate_grad_norm": float(feedback["aggregate_grad_norm"]),
+            "mopd/aggregate_grad_clipped": int(bool(feedback["aggregate_grad_clipped"])),
             "mopd/valid_response_tokens": int(feedback["valid_response_tokens"]),
+            "mopd/generated_tokens": int(feedback["generated_tokens"]),
             "mopd/teacher_scored_tokens": int(feedback["teacher_scored_tokens"]),
             "mopd/prompt_count": int(feedback["prompt_count"]),
             "mopd/completed_responses": int(feedback["completed_responses"]),
@@ -863,9 +828,7 @@ class RolloutManager:
             "mopd/allocated_gpu_count": int(feedback["allocated_gpu_count"]),
             "mopd/rollout_wall_seconds": float(feedback["rollout_wall_seconds"]),
             "mopd/teacher_wall_seconds": float(feedback["teacher_wall_seconds"]),
-            "mopd/rollout_and_teacher_wall_seconds": float(
-                feedback["rollout_and_teacher_wall_seconds"]
-            ),
+            "mopd/rollout_and_teacher_wall_seconds": float(feedback["rollout_and_teacher_wall_seconds"]),
             "mopd/reward_wall_seconds": float(feedback["reward_wall_seconds"]),
             "mopd/actor_forward_backward_wall_seconds": float(feedback["actor_forward_backward_wall_seconds"]),
             "mopd/optimizer_wall_seconds": float(feedback["optimizer_wall_seconds"]),
@@ -874,34 +837,62 @@ class RolloutManager:
             "mopd/total_wall_seconds": float(feedback["total_wall_seconds"]),
             "mopd/peak_hbm_bytes": int(feedback["peak_hbm_bytes"]),
             "mopd/teacher_peak_memory_mib": float(feedback["teacher_peak_memory_mib"]),
+            "mopd/teacher_memory_probe_failures": int(feedback["teacher_memory_probe_failures"]),
             "mopd/overflow_flag": int(bool(feedback["overflow_flag"])),
+            "mopd/fixed_seconds": float(feedback["fixed_seconds"]),
         }
-        for task, probability in record["inclusion_probabilities"].items():
-            log_values[f"mopd/inclusion/{task}"] = float(probability)
-            log_values[f"mopd/score_age/{task}"] = int(record["score_ages_after"][task])
-            log_values[f"mopd/raw_gradient_rms/{task}"] = float(record["raw_gradient_rms_after"][task])
-            log_values[f"mopd/adam_gradient_rms/{task}"] = float(record["adam_gradient_rms_after"][task])
-            log_values[f"mopd/task_seconds_ema/{task}"] = float(record["task_seconds_after"][task])
-            log_values[f"mopd/switch_seconds_ema/{task}"] = float(record["switch_seconds_after"][task])
-        for subset, probability in record["set_distribution"].items():
-            log_values[f"mopd/set_probability/{subset}"] = float(probability)
+        if record["operation"] == "heldout_variance":
+            log_values["mopd/checkpoint_step"] = int(record["checkpoint_step"])
+            step_key = "mopd/checkpoint_step"
+        else:
+            log_values["mopd/H"] = float(record["H"])
+            log_values["mopd/fixed_seconds_ema"] = float(record["fixed_seconds_after"])
+            for task in record["counts"]:
+                log_values[f"mopd/count/{task}"] = int(record["counts"][task])
+                log_values[f"mopd/scaled_noise/{task}"] = float(record["scaled_noise_after"][task])
+                log_values[f"mopd/raw_noise/{task}"] = float(record["raw_noise_after"][task])
+                log_values[f"mopd/loss_ema/{task}"] = float(record["loss_ema_after"][task])
+                log_values[f"mopd/task_seconds_ema/{task}"] = float(record["task_seconds_after"][task])
+                relative_change = record["scaled_noise_relative_change"][task]
+                if relative_change is not None:
+                    log_values[f"mopd/scaled_noise_relative_change/{task}"] = float(relative_change)
+            step_key = "mopd/update"
         for unit in feedback["task_units"]:
             task = str(unit["task"])
             for key in (
-                "raw_score", "adam_score", "raw_teacher_loss", "relative_teacher_loss",
-                "importance_correction", "inclusion_probability", "predicted_full_task_seconds",
-                "teacher_switch_seconds", "teacher_load_seconds", "teacher_offload_seconds",
-                "teacher_ready_seconds", "teacher_transfer_tail_seconds", "student_rollout_seconds",
-                "teacher_scoring_seconds", "actor_forward_backward_wall_seconds",
-                "actor_forward_backward_gpu_seconds", "optimizer_wall_seconds",
-                "optimizer_gpu_seconds", "teacher_memory_mib", "student_peak_hbm_bytes",
-                "attempted_responses", "valid_response_tokens", "teacher_scored_tokens",
-                "completed_responses", "truncated_responses", "invalid_responses",
-                "empty_responses", "teacher_scoring_failures",
+                "microbatches",
+                "raw_noise",
+                "scaled_noise",
+                "sum_raw_gradient_sq",
+                "sum_scaled_gradient_sq",
+                "raw_task_mean_sq",
+                "scaled_task_mean_sq",
+                "teacher_loss",
+                "target_weight",
+                "teacher_scoring_seconds",
+                "backward_seconds",
+                "microbatch_seconds",
+                "student_rollout_seconds",
+                "actor_forward_backward_wall_seconds",
+                "actor_forward_backward_gpu_seconds",
+                "optimizer_wall_seconds",
+                "optimizer_gpu_seconds",
+                "teacher_memory_mib",
+                "student_peak_hbm_bytes",
+                "teacher_memory_probe_failures",
+                "prompt_count",
+                "attempted_responses",
+                "valid_response_tokens",
+                "generated_tokens",
+                "teacher_scored_tokens",
+                "completed_responses",
+                "truncated_responses",
+                "invalid_responses",
+                "empty_responses",
+                "teacher_scoring_failures",
             ):
                 log_values[f"mopd/task/{task}/{key}"] = float(unit[key])
-            log_values[f"mopd/task/{task}/clip_flag"] = int(bool(unit["clip_flag"]))
-        logging_utils.log(self.args, log_values, step_key="mopd/update")
+        logging_utils.log(self.args, log_values, step_key=step_key)
         return record
 
     def load(self, rollout_id=None):
@@ -1167,13 +1158,11 @@ class RolloutManager:
                 "mopd_tasks": "mopd_task",
                 "mopd_operations": "mopd_operation",
                 "mopd_operation_indices": "mopd_operation_index",
-                "mopd_inclusion_probabilities": "mopd_inclusion_probability",
                 "mopd_target_weights": "mopd_target_weight",
-                "mopd_importance_corrections": "mopd_importance_correction",
-                "mopd_relative_loss_scales": "mopd_relative_loss_scale",
+                "mopd_aggregations": "mopd_aggregation",
+                "mopd_microbatch_indices": "mopd_microbatch_index",
+                "mopd_task_microbatch_counts": "mopd_task_microbatch_count",
                 "mopd_failure_penalties": "mopd_failure_penalty",
-                "mopd_processed_task_units_before": "mopd_processed_task_units_before",
-                "mopd_adamw_states": "mopd_adamw_state",
                 "mopd_step_global_batch_sizes": "mopd_step_global_batch_size",
             }
             for output_key, metadata_key in metadata_fields.items():
@@ -1269,13 +1258,11 @@ class RolloutManager:
                 "mopd_tasks",
                 "mopd_operations",
                 "mopd_operation_indices",
-                "mopd_inclusion_probabilities",
                 "mopd_target_weights",
-                "mopd_importance_corrections",
-                "mopd_relative_loss_scales",
+                "mopd_aggregations",
+                "mopd_microbatch_indices",
+                "mopd_task_microbatch_counts",
                 "mopd_failure_penalties",
-                "mopd_processed_task_units_before",
-                "mopd_adamw_states",
                 "mopd_step_global_batch_sizes",
             ]:
                 if key not in data:

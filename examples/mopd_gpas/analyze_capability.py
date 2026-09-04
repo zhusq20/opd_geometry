@@ -4,29 +4,49 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 SEED = 42
 CONFIGS = (
-    "uniform_k1_conventional",
-    "uniform_k1_taskwise",
-    "gpas_k1_taskwise",
-    "cost_gpas_k1_taskwise",
-    "uniform_k2_taskwise",
-    "cost_gpas_k2_taskwise",
-    "all_k4_taskwise",
-    "all_k4_conventional",
+    "uniform",
+    "gpas",
+    "cost_gpas",
+    "raw_noise",
+    "loss_gap",
+    "std_mopd",
+    "d3_mopd",
+    "open_mopd",
 )
+NON_FIXED_OBJECTIVE = {"std_mopd", "d3_mopd", "open_mopd"}
+REFERENCES = ("initial_student", "teacher_math", "teacher_if", "teacher_qwen3_4b")
+TEACHER_BY_DOMAIN = {
+    "math": "teacher_math",
+    "code": "teacher_qwen3_4b",
+    "if": "teacher_if",
+    "science": "teacher_qwen3_4b",
+}
 DOMAINS = {
     "math": ("math500_pass1", 1, 500),
     "code": ("livecodebench_postcutoff_pass1", 1, 128),
     "if": ("ifbench_strict", 1, 300),
     "science": ("gpqa_diamond_avg4", 4, 198),
 }
+TABLE_TARGETS = REFERENCES + (
+    "std_mopd",
+    "uniform",
+    "raw_noise",
+    "loss_gap",
+    "gpas",
+    "cost_gpas",
+    "d3_mopd",
+    "open_mopd",
+)
 
 
 def jsonl(path: Path):
@@ -92,20 +112,25 @@ def evaluate(path: Path, domains: dict[str, tuple[str, int, int]]) -> dict:
     return {"domains": scores}
 
 
-def paired_bootstrap(configs: dict[str, dict], replicates: int = 10_000) -> dict:
+def paired_bootstrap(
+    configs: dict[str, dict], references: dict[str, dict] | None = None, replicates: int = 1_000
+) -> dict:
     baseline = CONFIGS[0]
     rng = np.random.default_rng(SEED)
-    bootstrap_scores: dict[str, dict[str, np.ndarray]] = {config: {} for config in CONFIGS}
+    targets = dict(configs)
+    if references is not None:
+        targets.update(references)
+    bootstrap_scores: dict[str, dict[str, np.ndarray]] = {target: {} for target in targets}
     for domain in DOMAINS:
         reference_indices = configs[baseline]["domains"][domain]["prompt_indices"]
         count = len(reference_indices)
         resamples = rng.integers(0, count, size=(replicates, count))
-        for config in CONFIGS:
-            values = configs[config]["domains"][domain]
+        for target in targets:
+            values = targets[target]["domains"][domain]
             if values["prompt_indices"] != reference_indices:
-                raise ValueError(f"capability prompts are not paired for {domain}: {config}")
+                raise ValueError(f"capability prompts are not paired for {domain}: {target}")
             prompt_scores = np.asarray(values["prompt_scores"], dtype=np.float64)
-            bootstrap_scores[config][domain] = prompt_scores[resamples].mean(axis=1)
+            bootstrap_scores[target][domain] = prompt_scores[resamples].mean(axis=1)
 
     macro = {config: sum(bootstrap_scores[config].values()) / len(DOMAINS) for config in CONFIGS}
     result = {"replicates": replicates, "seed": SEED, "baseline": baseline, "configs": {}}
@@ -134,14 +159,93 @@ def paired_bootstrap(configs: dict[str, dict], replicates: int = 10_000) -> dict
                 for domain in DOMAINS
             },
         }
+    if references is not None:
+        normalized: dict[str, dict[str, np.ndarray]] = {config: {} for config in CONFIGS}
+        for domain in DOMAINS:
+            initial = references["initial_student"]["domains"][domain]["score"]
+            teacher = references[TEACHER_BY_DOMAIN[domain]]["domains"][domain]["score"]
+            headroom = float(teacher - initial)
+            if headroom == 0:
+                raise ValueError(f"zero teacher/student capability headroom for {domain}")
+            initial_bootstrap = bootstrap_scores["initial_student"][domain]
+            for config in CONFIGS:
+                normalized[config][domain] = (bootstrap_scores[config][domain] - initial_bootstrap) / headroom
+        normalized_macro = {config: sum(normalized[config].values()) / len(DOMAINS) for config in CONFIGS}
+        for config in CONFIGS:
+            baseline_delta = normalized_macro[config] - normalized_macro[baseline]
+            result["configs"][config]["normalized_gain_95ci"] = list(
+                map(float, np.percentile(normalized_macro[config], [2.5, 97.5]))
+            )
+            result["configs"][config]["paired_normalized_delta_vs_baseline"] = float(np.mean(baseline_delta))
+            result["configs"][config]["paired_normalized_delta_95ci"] = list(
+                map(float, np.percentile(baseline_delta, [2.5, 97.5]))
+            )
     return result
+
+
+def _write_main_table(path: Path, report: dict[str, Any], mopd: dict[str, Any] | None) -> None:
+    fields = [
+        "target",
+        "kind",
+        *(f"score_{domain}" for domain in DOMAINS),
+        *(f"normalized_gain_{domain}" for domain in DOMAINS),
+        "normalized_gain_mean",
+        *(f"score_delta_vs_uniform_{domain}" for domain in DOMAINS),
+        "score_delta_vs_uniform_mean",
+        *(f"normalized_delta_vs_uniform_{domain}" for domain in DOMAINS),
+        "normalized_delta_vs_uniform_mean",
+        "final_heldout_F",
+        "gpu_hours_to_uniform_final",
+    ]
+    uniform = report["configs"]["uniform"]
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for target in TABLE_TARGETS:
+            kind = "reference" if target in REFERENCES else "config"
+            values = report["references" if kind == "reference" else "configs"][target]
+            scores = {domain: float(values["domains"][domain]["score"]) for domain in DOMAINS}
+            normalized = {
+                domain: (scores[domain] - float(report["headroom"][domain]["initial_score"]))
+                / float(report["headroom"][domain]["difference"])
+                for domain in DOMAINS
+            }
+            row: dict[str, Any] = {
+                "target": target,
+                "kind": kind,
+                **{f"score_{domain}": scores[domain] for domain in DOMAINS},
+                **{f"normalized_gain_{domain}": normalized[domain] for domain in DOMAINS},
+                "normalized_gain_mean": float(np.mean(list(normalized.values()))),
+            }
+            if kind == "config":
+                score_deltas = {
+                    domain: scores[domain] - float(uniform["domains"][domain]["score"]) for domain in DOMAINS
+                }
+                normalized_deltas = {
+                    domain: normalized[domain] - float(uniform["domains"][domain]["normalized_gain"])
+                    for domain in DOMAINS
+                }
+                row.update(
+                    {
+                        **{f"score_delta_vs_uniform_{domain}": score_deltas[domain] for domain in DOMAINS},
+                        "score_delta_vs_uniform_mean": float(np.mean(list(score_deltas.values()))),
+                        **{f"normalized_delta_vs_uniform_{domain}": normalized_deltas[domain] for domain in DOMAINS},
+                        "normalized_delta_vs_uniform_mean": float(np.mean(list(normalized_deltas.values()))),
+                    }
+                )
+                if target not in NON_FIXED_OBJECTIVE and mopd is not None:
+                    outcome = mopd["outcomes"][target]
+                    row["final_heldout_F"] = float(outcome["weighted_loss"])
+                    row["gpu_hours_to_uniform_final"] = outcome["gpu_hours_to_uniform_final"]
+            writer.writerow(row)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--response-budget", type=int, default=64_000)
+    parser.add_argument("--mopd-report", type=Path)
+    parser.add_argument("--response-budget", type=int, default=32_000)
     args = parser.parse_args()
     configs = {
         config: evaluate(
@@ -150,17 +254,50 @@ def main() -> None:
         )
         for config in CONFIGS
     }
-    for values in configs.values():
+    references = {
+        reference: evaluate(args.root / "capability_references" / reference, DOMAINS) for reference in REFERENCES
+    }
+    for values in (*configs.values(), *references.values()):
         values["macro_score"] = float(np.mean([values["domains"][domain]["score"] for domain in DOMAINS]))
+    headroom = {}
+    for domain in DOMAINS:
+        initial = references["initial_student"]["domains"][domain]["score"]
+        teacher_name = TEACHER_BY_DOMAIN[domain]
+        teacher = references[teacher_name]["domains"][domain]["score"]
+        headroom[domain] = {
+            "initial_score": initial,
+            "teacher": teacher_name,
+            "teacher_score": teacher,
+            "difference": teacher - initial,
+            "normalization_reliable": teacher - initial >= 0.03,
+        }
+    for config, values in configs.items():
+        for domain in DOMAINS:
+            denominator = headroom[domain]["difference"]
+            if denominator == 0:
+                raise ValueError(f"zero teacher/student capability headroom for {domain}")
+            values["domains"][domain]["normalized_gain"] = (
+                values["domains"][domain]["score"] - headroom[domain]["initial_score"]
+            ) / denominator
+        values["normalized_gain_mean"] = float(
+            np.mean([values["domains"][domain]["normalized_gain"] for domain in DOMAINS])
+        )
     result = {
-        "schema_version": 2,
+        "schema_version": 3,
         "objective": "mopd",
         "seed": SEED,
         "attempted_responses": args.response_budget,
+        "references": references,
+        "teacher_by_domain": TEACHER_BY_DOMAIN,
+        "headroom": headroom,
         "configs": configs,
-        "paired_bootstrap": paired_bootstrap(configs),
+        "paired_bootstrap": paired_bootstrap(configs, references),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    table = args.output.with_name("mopd_main_table.csv")
+    mopd = None if args.mopd_report is None else json.loads(args.mopd_report.read_text())
+    _write_main_table(table, result, mopd)
+    result["main_table_csv"] = str(table.resolve())
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"Capability report written to {args.output}")
 

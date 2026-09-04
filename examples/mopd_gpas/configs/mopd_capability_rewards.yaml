@@ -4,6 +4,10 @@ routes:
   ifbench: {}
   livecodebench:
     url: ${SANDBOXFUSION_BASE_URL}/submit
+    preflight_url: ${SANDBOXFUSION_BASE_URL}/run_code
+    require_preflight: true
+    preflight_marker: ${M2RL_SANDBOX_PREFLIGHT_MARKER}
+    preflight_max_age_seconds: 604800
     dataset: m2rl_livecodebench
     run_timeout: 6
     request_timeout: 180

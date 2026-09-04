@@ -1,4 +1,4 @@
-"""Paired held-out relative teacher loss through the shared teacher slot."""
+"""Paired held-out teacher loss for the fixed four-task objective."""
 
 from __future__ import annotations
 
@@ -15,19 +15,17 @@ from slime.utils.types import Sample
 from slime_plugins.m2rl.opd import _teacher_log_probs
 
 from .sampler import TASKS
-from .teacher_slot import activate_teacher, score_teacher_samples
+from .teacher_slot import score_teacher_samples
 
 
-async def generation_only_reward(
-    args: Namespace, sample: Sample | list[Sample], **kwargs: Any
-) -> float | list[float]:
+async def generation_only_reward(args: Namespace, sample: Sample | list[Sample], **kwargs: Any) -> float | list[float]:
     """A zero-cost eval RM; matched teachers are scored serially afterwards."""
 
     del args, kwargs
     return [0.0] * len(sample) if isinstance(sample, list) else 0.0
 
 
-async def _score_all_tasks(args: Namespace, output: RolloutFnEvalOutput, restore_task: str) -> None:
+async def _score_all_tasks(args: Namespace, output: RolloutFnEvalOutput) -> None:
     if tuple(output.data) != TASKS:
         raise ValueError(f"teacher-loss eval datasets must be ordered as {TASKS}, got {tuple(output.data)}")
     for task in TASKS:
@@ -37,14 +35,15 @@ async def _score_all_tasks(args: Namespace, output: RolloutFnEvalOutput, restore
             output.data[task]["samples"],
             failure_penalty=float(args.mopd_failure_penalty),
         )
-    await activate_teacher(args, restore_task)
 
 
-def _relative_scales(data_source: Any) -> dict[str, float]:
+def _objective_config(data_source: Any) -> tuple[dict[str, float], dict[str, float]]:
     configs = {str(source.config["name"]): source.config for source in data_source.sources}
     if tuple(configs) != TASKS:
         raise ValueError(f"MOPD source order must be {TASKS}")
-    return {task: float(configs[task]["relative_loss_scale"]) for task in TASKS}
+    weights = {task: float(configs[task]["target_weight"]) for task in TASKS}
+    initial = {task: float(configs[task]["initial_teacher_loss"]) for task in TASKS}
+    return weights, initial
 
 
 def generate_teacher_loss_eval(
@@ -53,11 +52,9 @@ def generate_teacher_loss_eval(
     if not evaluation:
         raise ValueError("generate_teacher_loss_eval is evaluation-only")
     output = default_generate_rollout(args, rollout_id, data_source, evaluation=True)
-    resident = data_source.controller.resident_teacher
-    restore_task = TASKS[0 if resident is None else int(resident)]
-    run(_score_all_tasks(args, output, restore_task))
-    scales = _relative_scales(data_source)
-    relative_means: list[float] = []
+    run(_score_all_tasks(args, output))
+    weights, initial = _objective_config(data_source)
+    weighted_loss = 0.0
     metrics: dict[str, float | int] = {}
 
     for task in TASKS:
@@ -87,24 +84,21 @@ def generate_teacher_loss_eval(
                 logratio = student - teacher
                 loss = float((logratio * mask).sum().div(mask.sum()).item())
                 token_logratios.extend(
-                    float(value)
-                    for value, valid in zip(logratio.tolist(), mask.tolist(), strict=True)
-                    if valid
+                    float(value) for value, valid in zip(logratio.tolist(), mask.tolist(), strict=True) if valid
                 )
             losses.append(loss)
             sample.metadata = dict(sample.metadata or {})
             sample.metadata["sampled_reverse_kl"] = loss
-            sample.metadata["relative_teacher_loss"] = loss * scales[task]
+            sample.metadata["weighted_teacher_loss"] = loss * weights[task]
             sample.reward = loss
 
         if not losses:
             raise ValueError(f"teacher-loss eval dataset {task} is empty")
         raw_mean = float(np.mean(losses))
-        relative_mean = raw_mean * scales[task]
-        relative_means.append(relative_mean)
+        weighted_loss += weights[task] * raw_mean
         info["rewards"] = losses
         metrics[f"eval/teacher_loss/{task}"] = raw_mean
-        metrics[f"eval/relative_teacher_loss/{task}"] = relative_mean
+        metrics[f"eval/normalized_teacher_loss/{task}"] = raw_mean / initial[task]
         metrics[f"eval/teacher_loss/{task}/responses"] = len(losses)
         metrics[f"eval/teacher_loss/{task}/tokens"] = len(token_logratios)
         metrics[f"eval/teacher_loss/{task}/logratio_p95"] = (
@@ -114,7 +108,7 @@ def generate_teacher_loss_eval(
             float(np.percentile(token_logratios, 99)) if token_logratios else 0.0
         )
 
-    metrics["eval/mean_relative_teacher_loss"] = float(np.mean(relative_means))
+    metrics["eval/weighted_teacher_loss"] = weighted_loss
     return RolloutFnEvalOutput(data=output.data, metrics=metrics)
 
 

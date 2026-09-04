@@ -99,8 +99,9 @@ async def _teacher_request(
 
 async def teacher_reward(
     args: Any, sample: Sample | list[Sample], **kwargs: Any
-) -> dict[str, Any] | list[dict[str, Any]]:
+) -> dict[str, Any] | list[dict[str, Any] | BaseException]:
     if isinstance(sample, list):
+        return_exceptions = bool(kwargs.pop("return_exceptions", False))
         del kwargs
         routes = [teacher_route(args, item) for item in sample]
         semaphores: dict[tuple[str, int], asyncio.Semaphore] = {}
@@ -118,7 +119,8 @@ async def teacher_reward(
                         item,
                     )
                     for item, route in zip(sample, routes, strict=True)
-                ]
+                ],
+                return_exceptions=return_exceptions,
             )
     del kwargs
     route = teacher_route(args, sample)

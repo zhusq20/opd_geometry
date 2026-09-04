@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "name": "open_mopd_full",
+  "scope": "paper final-stage reproduction",
+  "paper": "https://arxiv.org/abs/2608.19098",
+  "official_repository": "https://github.com/BytedTsinghua-SIA/Open-MOPD.git",
+  "official_revision": "4809a96cf85a869106ff0ff3f37d0a51e12010ae",
+  "student": "BytedTsinghua-SIA/Open-MOPD-SmolLM3-3B-MixSFT",
+  "teachers": {
+    "math": "BytedTsinghua-SIA/Open-MOPD-SmolLM3-3B-RL-Math",
+    "code": "BytedTsinghua-SIA/Open-MOPD-SmolLM3-3B-RL-Code",
+    "if": "BytedTsinghua-SIA/Open-MOPD-SmolLM3-3B-RL-IF"
+  },
+  "dataset": "BytedTsinghua-SIA/Open-MOPD-Data",
+  "training": {
+    "world_size": 8,
+    "train_batch_size": 1024,
+    "mini_batch_size": 256,
+    "inner_updates_per_rollout": 4,
+    "learning_rate": 1.5e-06,
+    "lr_scheduler": "constant",
+    "clip_low": 0.2,
+    "clip_high": 0.28,
+    "kl_penalty": false,
+    "entropy_coefficient": 0.0,
+    "prompt_limit": 2048,
+    "response_limits": {
+      "math": 16384,
+      "code": 16384,
+      "if": 2048
+    },
+    "total_steps": 600,
+    "dense_student_top_k": 16,
+    "nucleus_p": 0.99,
+    "reward_weighting": "student_probability",
+    "routing": "hard_domain_label",
+    "prompt_sampling_ratio": {
+      "math": 2,
+      "code": 2,
+      "if": 1
+    },
+    "token_share_target": {
+      "math": 0.3333333333333333,
+      "code": 0.3333333333333333,
+      "if": 0.3333333333333333
+    },
+    "gap_alpha": 1.0,
+    "gap_direction": "forward",
+    "gap_factor_bounds": [0.05, 20.0],
+    "reward_refresh": true
+  },
+  "comparability": {
+    "include_in_qwen3_four_task_main_table": false,
+    "reason": "The paper system changes the student, domains, data, response limits, dense reward support, batch size, and update depth."
+  }
+}

@@ -1,5 +1,5 @@
-"""Four-task exact-set MOPD allocation experiment."""
+"""Four-task micro-batch MOPD/GPAS experiment."""
 
-from .sampler import MOPDController, bounded_inclusion_probabilities
+from .sampler import MOPDController, cost_gpas_allocation, largest_remainder_allocation
 
-__all__ = ["MOPDController", "bounded_inclusion_probabilities"]
+__all__ = ["MOPDController", "cost_gpas_allocation", "largest_remainder_allocation"]

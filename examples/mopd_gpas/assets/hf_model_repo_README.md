@@ -2,15 +2,12 @@
 license: apache-2.0
 ---
 
-# MOPD/GPAS 64k model assets
+# MOPD/GPAS base model assets
 
-Model artifacts for the four-task Qwen3-1.7B MOPD/GPAS campaign in https://github.com/zhusq20/opd_geometry.
+Expected bundle layout:
 
-Repository layout:
+- `student_hf/`: Qwen3-1.7B Hugging Face checkpoint
+- `student_megatron/`: matching Megatron checkpoint
+- `teachers_hf/math/` and `teachers_hf/if/`: converted domain-RL teachers
 
-- `student_hf/`: base Hugging Face checkpoint
-- `student_megatron/`: base Megatron torch-dist checkpoint used to create the warm start
-- `teachers_hf/{math,code,if,science}/`: converted single-task GRPO teachers
-- `warm_start-seed42/`: shared eight-unit warm run used by every main trajectory
-
-Use `examples/mopd_gpas/fetch_assets.sh` from the code repository instead of downloading individual files manually.
+Code and science do not use converted bundle teachers. `fetch_assets.sh` downloads the pinned upstream `Qwen/Qwen3-4B` revision into `models/qwen3-4b/` and verifies it separately.

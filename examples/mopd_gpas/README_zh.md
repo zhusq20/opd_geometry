@@ -1,55 +1,42 @@
-# Qwen3-1.7B 四任务 exact-set MOPD / GPAS
+# Qwen3-1.7B 四任务 micro-batch MOPD / GPAS
 
-这里是 64k MOPD/GPAS 实验的统一入口。协议使用 `math/code/if/science` 四个任务、一个 student rollout GPU 和一个可热切换 teacher GPU；八条 seed-42 主轨迹共享同一个 warm checkpoint，之后可以分发到不同机器独立运行。
+本目录实现相邻论文仓库实验计划的 v4 协议，不修改论文正文。每条训练轨迹使用一张 96GB 训练卡和一张 48GB 推理卡；推理卡同时常驻 student rollout engine 和四个 teacher endpoint。math、IF teacher 是 Qwen3-1.7B 领域 RL checkpoint，code、science 都使用本地 `Qwen/Qwen3-4B` 原版权重（两个独立 endpoint、同一模型目录），全程 `enable_thinking=false`。
 
-## 文档入口
+固定八个配置：`uniform`、`gpas`、`cost_gpas`、`raw_noise`、`loss_gap`、`std_mopd`、`d3_mopd`、`open_mopd`。每个配置 seed 42，500 个 optimizer step；每步 16 个 task micro-batch、每个 4 prompt、每 prompt 1 response，因此严格消耗 32,000 条 attempted response。每任务训练流独立且不重复；候选集做确定性洗牌后，各自固定前 16,000 条有效 prompt。
 
-- [环境与资产配置](docs/SETUP_zh.md)：新机器、Hugging Face 资产、GPU/W&B/SandboxFusion。
-- [实验协议与运行手册](docs/EXPERIMENTS_zh.md)：固定超参数、配置 ID、命令、恢复和成功标准。
-- [多人并行协作](docs/COLLABORATION_zh.md)：任务 DAG、认领方式、结果打包和集中分析。
-- [机器配置模板](configs/site.example.env)：每台机器只修改这一层。
-- [任务分配模板](configs/campaign.example.yaml)：协调者记录 owner、machine 和 status。
+`d3_mopd` 按 [D³-MOPD](https://arxiv.org/abs/2608.24987) 论文 Table 3 的数值实现动态调度。`open_mopd` 按 [Open-MOPD](https://arxiv.org/abs/2608.19098) 实现 token-share balancing 与 forward gap-following；它明确是当前主协议的 K=1 sampled-token 适配版。K=1 时 reward refresh 数学上为恒等操作，因此本 launcher 不声称复现论文另一套 K=4、student-top-k=16 dense reward 系统。
 
-科学协议与机器配置必须分开：seed、预算、评测点和优化器条件不能由执行者修改；路径、GPU 编号、端口、输出目录和 W&B 项目可以按机器修改。
+论文完整系统已作为独立的 [`open_mopd_full`](open_mopd_full/README_zh.md) 复现通道加入：固定官方代码 commit、公开 SmolLM3-3B student/三教师/数据，运行 K=4、dense student-top-k=16 和 reward refresh。它作为论文协议的外部参考单独报告，不混入控制变量完全不同的 Qwen3 四任务主表。
 
-## 执行者快速开始
-
-所有命令都从仓库根目录执行：
+执行顺序：
 
 ```bash
-mkdir -p local
 cp examples/mopd_gpas/configs/site.example.env local/mopd.env
-# 按机器修改 GPU 编号和本地目录。
+# 编辑本机路径与两张 GPU 编号
 source local/mopd.env
 
 bash examples/mopd_gpas/run_stage.sh fetch-assets
+bash examples/mopd_gpas/run_stage.sh prepare-heldout
+bash examples/mopd_gpas/run_stage.sh convert-teachers
+bash examples/mopd_gpas/run_stage.sh measure-initial
+bash examples/mopd_gpas/run_stage.sh prepare
 bash examples/mopd_gpas/run_stage.sh preflight
-
-CONFIG_ID=cost_gpas_k2_taskwise  # 替换为分配给你的唯一配置
-bash examples/mopd_gpas/run_stage.sh train "${CONFIG_ID}"
-bash examples/mopd_gpas/run_stage.sh capability "${CONFIG_ID}"
-bash examples/mopd_gpas/run_stage.sh package "${CONFIG_ID}"
+bash examples/mopd_gpas/run_stage.sh start-teacher
+bash examples/mopd_gpas/run_stage.sh smoke
+bash examples/mopd_gpas/run_stage.sh train uniform
+bash examples/mopd_gpas/run_stage.sh baselines
 ```
 
-训练中断时不要重新开始：
+完整 Open-MOPD 使用单独的 1x8 GPU 论文协议：
 
 ```bash
-bash examples/mopd_gpas/run_stage.sh resume "${CONFIG_ID}"
+bash examples/mopd_gpas/run_stage.sh open-full-fetch all
+bash examples/mopd_gpas/run_stage.sh open-full-train --dry-run
+bash examples/mopd_gpas/run_stage.sh open-full-train --run
 ```
 
-## 八条主轨迹
+中断后使用 `bash examples/mopd_gpas/run_stage.sh resume uniform`，不要在原目录重新启动 fresh run。Uniform 完成后运行 `variance all`，它在 step 50/250/500 各生成每任务 32 个新 micro-batch，只落盘标量范数，并用对应 checkpoint 中训练期的 `tau_i`/`C` 做 Cost-GPAS 反事实分配。能力评测用 `capability all`：先按[环境配置](docs/SETUP_zh.md#livecodebench-capability-sandbox)启动并验证 LiveCodeBench 专用 SandboxFusion，再评初始学生、math teacher、IF teacher 和共享的 Qwen3-4B teacher，最后评八个最终模型。训练、smoke test 和 held-out teacher-loss 评测不使用该 sandbox。全部结果到齐后运行 `analyze`；分析会直接生成 JSON、主表 CSV、held-out 方差 CSV 和 PDF 图组。
 
-| 配置 ID | K | allocation | AdamW second moment |
-|---|---:|---|---|
-| `uniform_k1_conventional` | 1 | Uniform | conventional |
-| `uniform_k1_taskwise` | 1 | Uniform | taskwise |
-| `gpas_k1_taskwise` | 1 | GPAS | taskwise |
-| `cost_gpas_k1_taskwise` | 1 | resident-aware Cost-GPAS | taskwise |
-| `uniform_k2_taskwise` | 2 | Uniform exact set | taskwise |
-| `cost_gpas_k2_taskwise` | 2 | set-aware Cost-GPAS | taskwise |
-| `all_k4_taskwise` | 4 | all tasks | taskwise |
-| `all_k4_conventional` | 4 | all tasks | conventional |
+每 50 step 的 Hugging Face 权重全部保留；完整 optimizer state 只保留当前最新 resume 点，以及 Uniform 的 step 50/250/500 三个方差检查点。
 
-每条主轨迹的成功条件是训练目录和 `capability_eval/response_64000/` 中都存在 `run_complete.json`，且训练 allocation 的最后一个 `attempted_responses_after` 恰好为 64,000。`package` 会检查这些条件，并生成不含 checkpoint 和 W&B cache 的集中分析包。
-
-W&B 默认开启，项目默认为 `iclr2027-mopd-gpas-64k`。访问令牌只通过本机登录或环境变量提供，不写入仓库配置。
+详细说明见 [环境配置](docs/SETUP_zh.md)、[实验协议](docs/EXPERIMENTS_zh.md) 和 [协作手册](docs/COLLABORATION_zh.md)。

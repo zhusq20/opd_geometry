@@ -1,20 +1,24 @@
-schema_version: 1
+schema_version: 2
 base_hf: ${MOPD_HF_CHECKPOINT}
 base_megatron: ${MOPD_BASE_MEGATRON}
 teachers:
   math:
+    kind: domain_rl_qwen3_1.7b
     checkpoint_root: ${SLIME_ROOT}/outputs/qwen3_1.7b_math_code_grpo_20260817T065129Z/qwen3_1.7b_math_grpo_adamw_responsive16_trainr8192_evalr32768_seed42/checkpoints
     step: 299
-    output_hf: ${MOPD_TEACHER_HF_ROOT}/math
+    model_path: ${MOPD_TEACHER_HF_ROOT}/math
   code:
-    checkpoint_root: ${SLIME_ROOT}/outputs/qwen3_1.7b_code_grpo_after_sandbox_20260817T194524Z/qwen3_1.7b_code_grpo_adamw_responsive16_trainr8192_seed42/checkpoints
-    step: 299
-    output_hf: ${MOPD_TEACHER_HF_ROOT}/code
+    kind: pretrained_qwen3_4b
+    repository: Qwen/Qwen3-4B
+    revision: 1cfa9a7208912126459214e8b04321603b3df60c
+    model_path: ${MOPD_QWEN3_4B}
   if:
+    kind: domain_rl_qwen3_1.7b
     checkpoint_root: ${SLIME_ROOT}/outputs/qwen3_1.7b_if_grpo_eosfix_dualeval_20260818T202612Z/qwen3_1.7b_if_grpo_adamw_responsive16_trainr8192_evalr32768_seed42/checkpoints
     step: 299
-    output_hf: ${MOPD_TEACHER_HF_ROOT}/if
+    model_path: ${MOPD_TEACHER_HF_ROOT}/if
   science:
-    checkpoint_root: ${SLIME_ROOT}/outputs/qwen3_1.7b_science_grpo_adamw_lr1e-6_n4_20260817T0655Z/qwen3_1.7b_science_grpo_adamw_responsive16_trainr8192_seed42/checkpoints
-    step: 599
-    output_hf: ${MOPD_TEACHER_HF_ROOT}/science
+    kind: pretrained_qwen3_4b
+    repository: Qwen/Qwen3-4B
+    revision: 1cfa9a7208912126459214e8b04321603b3df60c
+    model_path: ${MOPD_QWEN3_4B}

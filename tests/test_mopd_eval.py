@@ -5,6 +5,9 @@ import pytest
 from slime.rollout.base_types import RolloutFnEvalOutput
 from slime.utils.types import Sample
 from slime_plugins.mopd import eval as mopd_eval
+from slime_plugins.mopd.sampler import TASKS
+
+NUM_GPUS = 0
 
 
 def _payload(log_probs):
@@ -23,7 +26,16 @@ def _sample(student, teacher, mask=None):
     )
 
 
-def test_eval_reports_raw_relative_and_equal_task_mean(monkeypatch):
+def _data_source(weights=(0.1, 0.2, 0.3, 0.4), initial=(0.5, 0.5, 0.5, 0.5)):
+    return SimpleNamespace(
+        sources=[
+            SimpleNamespace(config={"name": task, "target_weight": weight, "initial_teacher_loss": loss})
+            for task, weight, loss in zip(TASKS, weights, initial, strict=True)
+        ]
+    )
+
+
+def test_eval_reports_per_task_normalized_and_fixed_weighted_loss(monkeypatch):
     samples = {
         "math": _sample([-1.0, -2.0], [-2.0, -99.0], [1, 0]),
         "code": _sample([-1.0], [-1.5]),
@@ -40,46 +52,37 @@ def test_eval_reports_raw_relative_and_equal_task_mean(monkeypatch):
         assert task_samples == [samples[task]]
         return {}
 
-    async def activate(_args, task):
-        assert task == "math"
-        return {}
-
     monkeypatch.setattr(mopd_eval, "score_teacher_samples", score)
-    monkeypatch.setattr(mopd_eval, "activate_teacher", activate)
-    sources = [
-        SimpleNamespace(config={"name": task, "relative_loss_scale": scale})
-        for task, scale in zip(("math", "code", "if", "science"), (1.0, 2.0, 3.0, 4.0), strict=True)
-    ]
-    data_source = SimpleNamespace(sources=sources, controller=SimpleNamespace(resident_teacher=0))
     result = mopd_eval.generate_teacher_loss_eval(
-        SimpleNamespace(mopd_failure_penalty=10.0), 7, data_source, evaluation=True
+        SimpleNamespace(mopd_failure_penalty=10.0), 0, _data_source(), evaluation=True
     )
     assert result.metrics["eval/teacher_loss/math"] == pytest.approx(1.0)
-    assert result.metrics["eval/relative_teacher_loss/code"] == pytest.approx(1.0)
-    assert result.metrics["eval/relative_teacher_loss/if"] == pytest.approx(3.0)
-    assert result.metrics["eval/relative_teacher_loss/science"] == pytest.approx(8.0)
-    assert result.metrics["eval/mean_relative_teacher_loss"] == pytest.approx(3.25)
-    assert samples["math"].metadata["relative_teacher_loss"] == pytest.approx(1.0)
+    assert result.metrics["eval/teacher_loss/code"] == pytest.approx(0.5)
+    assert result.metrics["eval/teacher_loss/if"] == pytest.approx(1.0)
+    assert result.metrics["eval/teacher_loss/science"] == pytest.approx(2.0)
+    assert result.metrics["eval/normalized_teacher_loss/science"] == pytest.approx(4.0)
+    assert result.metrics["eval/weighted_teacher_loss"] == pytest.approx(1.3)
+    assert samples["science"].metadata["weighted_teacher_loss"] == pytest.approx(0.8)
 
 
 def test_eval_uses_numeric_penalty_for_empty_or_teacher_failure(monkeypatch):
-    samples = {task: _sample([-1.0], [-1.0]) for task in ("math", "code", "if", "science")}
+    samples = {task: _sample([-1.0], [-1.0]) for task in TASKS}
     samples["if"].metadata["mopd_failure_penalty"] = 10.0
     output = RolloutFnEvalOutput(
         data={task: {"samples": [sample], "rewards": [0.0]} for task, sample in samples.items()}
     )
     monkeypatch.setattr(mopd_eval, "default_generate_rollout", lambda *_args, **_kwargs: output)
-    monkeypatch.setattr(mopd_eval, "score_teacher_samples", lambda *_a, **_k: _async_value({}))
-    monkeypatch.setattr(mopd_eval, "activate_teacher", lambda *_a, **_k: _async_value({}))
-    sources = [SimpleNamespace(config={"name": task, "relative_loss_scale": 1.0}) for task in samples]
+
+    async def score(*_args, **_kwargs):
+        return {}
+
+    monkeypatch.setattr(mopd_eval, "score_teacher_samples", score)
     result = mopd_eval.generate_teacher_loss_eval(
-        SimpleNamespace(mopd_failure_penalty=10.0),
-        0,
-        SimpleNamespace(sources=sources, controller=SimpleNamespace(resident_teacher=0)),
-        evaluation=True,
+        SimpleNamespace(mopd_failure_penalty=10.0), 0, _data_source(), evaluation=True
     )
     assert result.metrics["eval/teacher_loss/if"] == 10.0
+    assert result.metrics["eval/weighted_teacher_loss"] == pytest.approx(3.0)
 
 
-async def _async_value(value):
-    return value
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

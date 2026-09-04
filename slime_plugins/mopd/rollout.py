@@ -1,4 +1,4 @@
-"""Matched student rollouts and sequential one-slot teacher scoring."""
+"""Matched student generation followed by four resident-teacher scoring blocks."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from slime.utils.async_utils import run
 from slime.utils.types import Sample
 
 from .sampler import RESPONSES_PER_PROMPT, TASKS
-from .teacher_slot import activate_teacher, score_teacher_samples
+from .teacher_slot import score_teacher_samples
 
 
 async def _generate_one(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
@@ -44,137 +44,120 @@ def _paired_sampling_seed(args: Namespace, sample: Sample) -> int:
     return int.from_bytes(digest[:8], "big") % (2**31 - 1)
 
 
-async def _generate_task(args: Namespace, samples: list[Sample]) -> tuple[list[Sample], float]:
+async def _generate_samples(args: Namespace, samples: list[Sample]) -> tuple[list[Sample], float, dict[str, float]]:
     state = GenerateState(args)
     started = time.perf_counter()
-    pending = []
+
+    async def timed_generate(sample: Sample) -> tuple[Sample, float]:
+        sample_started = time.perf_counter()
+        result = await _generate_one(args, sample, sampling_params_by_index[int(sample.index)])
+        return result, time.perf_counter() - sample_started
+
+    sampling_params_by_index = {}
     for sample in samples:
         seed = _paired_sampling_seed(args, sample)
         sample.session_id = str(uuid.uuid5(uuid.NAMESPACE_OID, f"mopd:{seed}"))
         params = state.sampling_params.copy()
         if args.sglang_enable_deterministic_inference:
             params["sampling_seed"] = seed
-        pending.append(asyncio.create_task(_generate_one(args, sample, params)))
-    generated = await asyncio.gather(*pending)
+        sampling_params_by_index[int(sample.index)] = params
+    generated_with_seconds = await asyncio.gather(*(asyncio.create_task(timed_generate(sample)) for sample in samples))
     elapsed = time.perf_counter() - started
+    generated = [sample for sample, _seconds in generated_with_seconds]
+    task_seconds = {
+        task: max(seconds for sample, seconds in generated_with_seconds if str(sample.metadata["mopd_task"]) == task)
+        for task in TASKS
+    }
     for sample in generated:
         if sample.tokens is None or sample.rollout_log_probs is None:
-            raise RuntimeError("a MOPD response lacks the token/log-prob arrays required for OPD")
+            raise RuntimeError("a MOPD response lacks token IDs or rollout log-probabilities")
         if sample.loss_mask is None:
             sample.loss_mask = [1] * sample.response_length
-    return generated, elapsed
+    return generated, elapsed, task_seconds
 
 
 async def _generate_train(args: Namespace, rollout_id: int, data_source: Any) -> RolloutFnTrainOutput:
     prompt_count = int(data_source.prompt_count_for_rollout(rollout_id))
     groups = data_source.get_samples(prompt_count)
     if len(groups) != prompt_count or any(len(group) != RESPONSES_PER_PROMPT for group in groups):
-        raise RuntimeError("every MOPD prompt must produce exactly four attempted responses")
-
+        raise RuntimeError("every MOPD prompt must produce exactly one attempted response")
     pending_plan = data_source.controller.pending
     if pending_plan is None:
-        raise RuntimeError("MOPD plan disappeared before generation")
-    by_task: dict[str, list[Sample]] = defaultdict(list)
-    for group in groups:
-        for sample in group:
-            by_task[str(sample.metadata["mopd_task"])].append(sample)
+        raise RuntimeError("MOPD allocation disappeared before generation")
 
-    all_samples: list[Sample] = []
-    task_metrics: dict[str, dict[str, float | int | bool | str | None]] = {}
+    samples = [group[0] for group in groups]
     wall_started = time.perf_counter()
-    for task in pending_plan["execution_order"]:
-        # Student rollout uses GPUs 0-3 while the independent one-slot teacher
-        # on GPU 4 loads task weights. Starting both together makes the
-        # uncovered transfer tail the Cost-GPAS critical-path cost.
-        generation = asyncio.create_task(_generate_task(args, by_task[task]))
-        activation = asyncio.create_task(activate_teacher(args, task))
-        (generated, rollout_seconds), activated = await asyncio.gather(generation, activation)
+    generated, rollout_seconds, task_rollout_seconds = await _generate_samples(args, samples)
+    by_task: dict[str, list[Sample]] = defaultdict(list)
+    for sample in generated:
+        by_task[str(sample.metadata["mopd_task"])].append(sample)
+
+    task_metrics: dict[str, dict[str, float | int]] = {}
+    for task in TASKS:
+        task_samples = by_task[task]
         scored = await score_teacher_samples(
             args,
             task,
-            generated,
+            task_samples,
             failure_penalty=float(args.mopd_failure_penalty),
-            activation=activated,
         )
-        truncated = sum(sample.status == Sample.Status.TRUNCATED for sample in generated)
-        invalid = sum(sample.status in {Sample.Status.ABORTED, Sample.Status.FAILED} for sample in generated)
-        empty = sum(int(sample.effective_response_length) == 0 for sample in generated)
+        truncated = sum(sample.status == Sample.Status.TRUNCATED for sample in task_samples)
+        invalid = sum(sample.status in {Sample.Status.ABORTED, Sample.Status.FAILED} for sample in task_samples)
+        empty = sum(int(sample.effective_response_length) == 0 for sample in task_samples)
         task_metrics[task] = {
             "task": task,
-            "prompt_count": len(generated) // RESPONSES_PER_PROMPT,
-            "attempted_responses": len(generated),
-            "valid_response_tokens": sum(int(sample.effective_response_length) for sample in generated),
-            "completed_responses": len(generated) - truncated - invalid,
+            "microbatches": int(pending_plan["counts"][task]),
+            "prompt_count": len(task_samples),
+            "attempted_responses": len(task_samples),
+            "valid_response_tokens": sum(int(sample.effective_response_length) for sample in task_samples),
+            "generated_tokens": sum(int(sample.response_length) for sample in task_samples),
+            "completed_responses": len(task_samples) - truncated - invalid,
             "truncated_responses": truncated,
             "invalid_responses": invalid,
             "empty_responses": empty,
-            "student_rollout_seconds": rollout_seconds,
-            "teacher_load_seconds": float(scored["teacher_load_seconds"]),
-            "teacher_offload_seconds": float(scored["teacher_offload_seconds"]),
-            "teacher_ready_seconds": float(scored["teacher_ready_seconds"]),
+            "student_rollout_seconds": task_rollout_seconds[task],
             "teacher_scoring_seconds": float(scored["teacher_scoring_seconds"]),
-            "teacher_switch_seconds": float(scored["teacher_switch_seconds"]),
-            "teacher_transfer_tail_seconds": max(
-                float(scored["teacher_ready_seconds"]) - rollout_seconds,
-                0.0,
-            ),
             "teacher_scoring_failures": int(scored["teacher_scoring_failures"]),
             "teacher_scored_tokens": int(scored["teacher_scored_tokens"]),
             "teacher_memory_mib": float(scored["teacher_memory_mib"]),
-            "switched": bool(scored["switched"]),
-            "resident_before": scored["resident_before"],
-            "resident_after": scored["resident_after"],
+            "teacher_memory_probe_failures": int(scored["teacher_memory_probe_failures"]),
         }
-        all_samples.extend(generated)
 
-    all_samples.sort(key=lambda sample: int(sample.index))
+    generated.sort(key=lambda sample: int(sample.index))
     GenerateState(args).reset()
     total_wall = time.perf_counter() - wall_started
-    attempted = len(all_samples)
+    attempted = len(generated)
     if attempted != int(pending_plan["attempted_responses"]):
-        raise RuntimeError("rollout did not preserve the planned attempted-response count")
-    rollout_seconds = sum(float(unit["student_rollout_seconds"]) for unit in task_metrics.values())
-    teacher_seconds = sum(
-        float(unit["teacher_ready_seconds"]) + float(unit["teacher_scoring_seconds"])
-        for unit in task_metrics.values()
-    )
+        raise RuntimeError("rollout did not preserve the planned response count")
+    teacher_seconds = sum(float(unit["teacher_scoring_seconds"]) for unit in task_metrics.values())
     metrics: dict[str, float | int] = {
         "mopd/prompt_count": prompt_count,
         "mopd/attempted_responses": attempted,
         "mopd/response_count": attempted,
-        "mopd/valid_response_tokens": sum(int(sample.effective_response_length) for sample in all_samples),
+        "mopd/valid_response_tokens": sum(int(sample.effective_response_length) for sample in generated),
+        "mopd/generated_tokens": sum(int(sample.response_length) for sample in generated),
         "mopd/teacher_scored_tokens": sum(int(unit["teacher_scored_tokens"]) for unit in task_metrics.values()),
         "mopd/completed_responses": sum(int(unit["completed_responses"]) for unit in task_metrics.values()),
         "mopd/truncated_responses": sum(int(unit["truncated_responses"]) for unit in task_metrics.values()),
         "mopd/invalid_responses": sum(int(unit["invalid_responses"]) for unit in task_metrics.values()),
         "mopd/empty_responses": sum(int(unit["empty_responses"]) for unit in task_metrics.values()),
         "mopd/student_rollout_wall_seconds": rollout_seconds,
-        "mopd/student_rollout_gpu_seconds": rollout_seconds * int(args.rollout_num_gpus),
+        "mopd/student_rollout_gpu_seconds": rollout_seconds,
         "mopd/teacher_wall_seconds": teacher_seconds,
-        "mopd/teacher_pool_gpu_count": 1,
         "mopd/teacher_gpu_seconds": teacher_seconds,
         "mopd/reward_wall_seconds": 0.0,
         "mopd/rollout_and_teacher_wall_seconds": total_wall,
-        "mopd/task_width": len(task_metrics),
-        "mopd/operation_probe": int(pending_plan["operation"] == "probe"),
-        "mopd/operation_bank": int(pending_plan["operation"] == "bank"),
-        "mopd/resident_teacher_before_index": (
-            -1
-            if pending_plan["resident_teacher_before"] is None
-            else TASKS.index(str(pending_plan["resident_teacher_before"]))
-        ),
-        "mopd/resident_teacher_after_index": TASKS.index(str(pending_plan["execution_order"][-1])),
-        "mopd/teacher_peak_memory_mib": max(
-            float(unit["teacher_memory_mib"]) for unit in task_metrics.values()
+        "mopd/task_width": len(TASKS),
+        "mopd/teacher_peak_memory_mib": max(float(unit["teacher_memory_mib"]) for unit in task_metrics.values()),
+        "mopd/teacher_memory_probe_failures": sum(
+            int(unit["teacher_memory_probe_failures"]) for unit in task_metrics.values()
         ),
     }
     for task, unit in task_metrics.items():
         for key, value in unit.items():
-            if isinstance(value, bool):
-                metrics[f"mopd/task/{task}/{key}"] = int(value)
-            elif isinstance(value, (int, float)):
+            if isinstance(value, (int, float)):
                 metrics[f"mopd/task/{task}/{key}"] = value
-    return RolloutFnTrainOutput(samples=[[sample] for sample in all_samples], metrics=metrics)
+    return RolloutFnTrainOutput(samples=[[sample] for sample in generated], metrics=metrics)
 
 
 def generate_rollout(args: Namespace, rollout_id: int, data_source: Any, evaluation: bool = False):

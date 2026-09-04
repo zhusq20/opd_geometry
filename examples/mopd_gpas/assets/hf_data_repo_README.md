@@ -2,15 +2,13 @@
 license: other
 ---
 
-# MOPD/GPAS 64k data assets
+# MOPD/GPAS data assets
 
-Frozen data inputs for the four-task Qwen3-1.7B MOPD/GPAS campaign in https://github.com/zhusq20/opd_geometry.
-
-Repository layout:
+Expected layout:
 
 - `m2rl/train/{math,code,if,science}.jsonl`
 - `m2rl/eval/m2rl_online/`
-- `m2rl/single_task/code/` with the frozen LiveCodeBench v6 online128 subset and index
-- `frozen/controlled/` with the controlled optimizer/sampling inputs used by the final plotter
+- `m2rl/single_task/code/livecodebench_v6_online128.parquet`
+- the corresponding immutable evaluation index files
 
-The bundle combines derived inputs from multiple upstream benchmarks. Consult the source datasets and the code repository for their individual terms. Use it for research reproduction of this campaign.
+The preparation script reserves disjoint train and held-out candidate slices, renders all Qwen3 prompts with `enable_thinking=false`, and writes the exact local manifests used by the run.

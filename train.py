@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from slime_plugins.mopd.sampler import crossed_response_milestone
 
 
 def _save_mopd_actor_checkpoint(args, rollout_manager, actor_model, rollout_id):
-    """Save a MOPD actor without overlapping colocated rollout memory."""
+    """Save a synchronous MOPD actor and its resumable sampler frontier."""
 
     if args.offload_rollout:
         ray.get(rollout_manager.offload.remote())
@@ -28,6 +29,28 @@ def _save_mopd_actor_checkpoint(args, rollout_manager, actor_model, rollout_id):
             # its storage, so repopulate it before generation can resume.
             actor_model.update_weights()
             ray.get(rollout_manager.onload_kv.remote())
+
+
+def _mark_and_prune_mopd_optimizer_checkpoints(args, entries):
+    """Keep the latest full state, plus Uniform steps 50/250/500; HF weights remain archived."""
+
+    retained_uniform_steps = {50, 250, 500}
+    for entry in entries:
+        entry["optimizer_state_retained"] = bool(
+            entry is entries[-1]
+            or (args.mopd_allocation == "uniform" and int(entry["optimizer_step"]) in retained_uniform_steps)
+        )
+
+    index_path = Path(args.save).resolve() / "mopd_checkpoint_index.json"
+    temporary = index_path.with_name(f".{index_path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(entries, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, index_path)
+
+    for entry in entries[:-1]:
+        if not entry["optimizer_state_retained"]:
+            checkpoint = Path(args.save).resolve() / f"iter_{int(entry['rollout_id']):07d}"
+            if checkpoint.is_dir():
+                shutil.rmtree(checkpoint)
 
 
 def train(args):
@@ -61,9 +84,7 @@ def train(args):
     last_rollout_id = args.start_rollout_id - 1
     final_mopd_status = None
     mopd_eval_responses = (
-        tuple(int(value) for value in args.mopd_eval_responses.split(",") if value)
-        if mopd_enabled
-        else ()
+        tuple(int(value) for value in args.mopd_eval_responses.split(",") if value) if mopd_enabled else ()
     )
 
     # special case for eval-only
@@ -79,18 +100,21 @@ def train(args):
         )
         last_eval_num_updates = num_updates
 
-    if mopd_enabled and args.mopd_eval_on_start:
+    if mopd_enabled:
         resume_status = ray.get(rollout_manager.mopd_budget_status.remote())
-        resume_rollout_id = args.start_rollout_id - 1
-        ray.get(
-            rollout_manager.eval.remote(
-                resume_rollout_id,
-                num_updates=int(resume_status["optimizer_updates"]),
-                model_version=int(resume_status["optimizer_updates"]),
-                eval_phase="response_clock",
+        if args.eval_interval is not None and (
+            int(resume_status["optimizer_updates"]) == 0 or args.mopd_eval_on_start
+        ):
+            resume_rollout_id = max(0, args.start_rollout_id - 1)
+            ray.get(
+                rollout_manager.eval.remote(
+                    resume_rollout_id,
+                    num_updates=int(resume_status["optimizer_updates"]),
+                    model_version=int(resume_status["optimizer_updates"]),
+                    eval_phase="step_clock",
+                )
             )
-        )
-        last_eval_num_updates = int(resume_status["optimizer_updates"])
+            last_eval_num_updates = int(resume_status["optimizer_updates"])
 
     def offload_train(actor_trains_this_step):
         # Each model auto-offloads after train() when offload_train is set,
@@ -154,9 +178,10 @@ def train(args):
 
         num_updates_after = num_updates_before_rollout(args, rollout_id) + updates_per_rollout(args)
 
-        if not mopd_enabled and (release_train or should_run_periodic_action(
-            rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
-        )):
+        if not mopd_enabled and (
+            release_train
+            or should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout)
+        ):
             force_sync = release_train or rollout_id == args.num_rollout - 1
             if actor_trains:
                 actor_model.save_model(rollout_id, force_sync=force_sync)
@@ -168,8 +193,7 @@ def train(args):
         offload_train(actor_trains)
         if args.offload_rollout and not release_train:
             ray.get(rollout_manager.onload_weights.remote())
-        if not mopd_enabled or feedback["operation"] == "train":
-            actor_model.update_weights()
+        actor_model.update_weights()
 
         if args.offload_rollout:
             ray.get(rollout_manager.onload_kv.remote())
@@ -183,10 +207,11 @@ def train(args):
                 "optimizer_updates": int(record["optimizer_updates_after"]),
                 "completed_operations": int(record["operation_index"]) + 1,
             }
-            save_boundary = bool(record["checkpoint_due"] or record["budget_complete"])
+            save_boundary = bool(
+                record.get("operation", "train") == "train" and (record["checkpoint_due"] or record["budget_complete"])
+            )
             if save_boundary:
-                if args.mopd_run_mode != "bank":
-                    _save_mopd_actor_checkpoint(args, rollout_manager, actor_model, rollout_id)
+                _save_mopd_actor_checkpoint(args, rollout_manager, actor_model, rollout_id)
                 if args.rollout_global_dataset:
                     ray.get(rollout_manager.save.remote(rollout_id))
                 index_path = Path(args.save).resolve() / "mopd_checkpoint_index.json"
@@ -199,25 +224,19 @@ def train(args):
                         "operation_index": int(record["operation_index"]),
                         "attempted_responses": int(record["attempted_responses_after"]),
                         "optimizer_updates": int(record["optimizer_updates_after"]),
-                        "run_mode": str(record["run_mode"]),
+                        "optimizer_step": int(record["optimizer_updates_after"]),
+                        "hf_checkpoint": str(Path(args.save_hf.format(rollout_id=rollout_id)).resolve()),
                     }
                 )
-                index_path.parent.mkdir(parents=True, exist_ok=True)
-                temporary = index_path.with_name(f".{index_path.name}.{os.getpid()}.tmp")
-                temporary.write_text(json.dumps(entries, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-                os.replace(temporary, index_path)
+                _mark_and_prune_mopd_optimizer_checkpoints(args, entries)
 
             attempted = int(record["attempted_responses_after"])
-            evaluation_due = (
-                args.eval_interval is not None
-                and args.mopd_run_mode != "bank"
-                and (
-                    record["budget_complete"]
-                    or crossed_response_milestone(
-                        int(record["attempted_responses_before"]),
-                        attempted,
-                        mopd_eval_responses,
-                    )
+            evaluation_due = args.eval_interval is not None and (
+                record["budget_complete"]
+                or crossed_response_milestone(
+                    int(record["attempted_responses_before"]),
+                    attempted,
+                    mopd_eval_responses,
                 )
             )
             if evaluation_due:
@@ -226,7 +245,7 @@ def train(args):
                         rollout_id,
                         num_updates=int(record["optimizer_updates_after"]),
                         model_version=int(record["optimizer_updates_after"]),
-                        eval_phase="response_clock",
+                        eval_phase="step_clock",
                     )
                 )
                 last_eval_num_updates = int(record["optimizer_updates_after"])
@@ -246,9 +265,7 @@ def train(args):
     if mopd_enabled:
         final_mopd_status = final_mopd_status or ray.get(rollout_manager.mopd_budget_status.remote())
         if not final_mopd_status["complete"]:
-            raise RuntimeError(
-                "--num-rollout ended before the MOPD response budget; increase the launcher upper bound"
-            )
+            raise RuntimeError(f"--num-rollout ended before the MOPD {args.mopd_total_steps}-step budget")
         final_num_updates = int(final_mopd_status["optimizer_updates"])
     else:
         final_num_updates = (
@@ -258,11 +275,7 @@ def train(args):
         )
     # A run whose length is not divisible by eval_interval still needs a final
     # paper-facing measurement of the final checkpoint.
-    if (
-        args.eval_interval is not None
-        and last_eval_num_updates != final_num_updates
-        and not (mopd_enabled and args.mopd_run_mode == "bank")
-    ):
+    if args.eval_interval is not None and last_eval_num_updates != final_num_updates:
         final_rollout_id = max(args.start_rollout_id, last_rollout_id)
         ray.get(
             rollout_manager.eval.remote(

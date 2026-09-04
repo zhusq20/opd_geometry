@@ -1,47 +1,62 @@
-schema_version: 1
-campaign_id: mopd-gpas-64k-v3
+schema_version: 2
+campaign_id: qwen3-1.7b-4t-microbatch-mopd-gpas-v4
 seed: 42
 code_revision: FILL_BEFORE_ASSIGNING_RUNS
 assets:
+  student: Qwen3-1.7B
+  qwen3_4b_repository: Qwen/Qwen3-4B
+  qwen3_4b_revision: 1cfa9a7208912126459214e8b04321603b3df60c
   model_repo: zsqzz/mopd-gpas-64k-models
   model_revision: 46c307ad13f274d8db7c1df949e4df8359ae6b32
   data_repo: zsqzz/mopd-gpas-64k-data
   data_revision: e3ead6f98b7089e0def39516cd06cf711b10b1ec
-shared_dependency: warm_start-seed42
+shared_dependencies:
+  - converted math and IF teachers
+  - measured initial_kl.json
+  - frozen protocol.json and 128-prompt held-out sets
 resources_per_run:
-  student_gpus: 1
-  teacher_gpus: 1
+  training_gpus_96gb: 1
+  inference_gpus_48gb: 1
 runs:
-  - id: uniform_k1_conventional
+  - id: uniform
     owner: null
     machine: null
     status: pending
-  - id: uniform_k1_taskwise
+    optimizer: conventional_adamw
+  - id: gpas
     owner: null
     machine: null
     status: pending
-    unlocks: [frozen_bank_middle, frozen_bank_late]
-  - id: gpas_k1_taskwise
+    optimizer: conventional_adamw
+  - id: cost_gpas
     owner: null
     machine: null
     status: pending
-  - id: cost_gpas_k1_taskwise
+    optimizer: conventional_adamw
+  - id: raw_noise
     owner: null
     machine: null
     status: pending
-  - id: uniform_k2_taskwise
+    optimizer: conventional_adamw
+  - id: loss_gap
     owner: null
     machine: null
     status: pending
-  - id: cost_gpas_k2_taskwise
+    optimizer: conventional_adamw
+  - id: std_mopd
     owner: null
     machine: null
     status: pending
-  - id: all_k4_taskwise
+    optimizer: conventional_adamw
+  - id: d3_mopd
     owner: null
     machine: null
     status: pending
-  - id: all_k4_conventional
+    optimizer: conventional_adamw
+    paper_hyperparameters: arXiv:2608.24987-table-3
+  - id: open_mopd
     owner: null
     machine: null
     status: pending
+    optimizer: conventional_adamw
+    paper_variant: K1-sampled-token-share-gap

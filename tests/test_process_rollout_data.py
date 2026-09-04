@@ -197,15 +197,17 @@ def test_log_rollout_data_skips_mopd_task_labels(monkeypatch):
             "global_batch_sizes": [1],
             "mopd_tasks": ["math"],
             "mopd_operations": ["train"],
-            "mopd_adamw_states": ["taskwise"],
-            "mopd_inclusion_probabilities": [0.25],
+            "mopd_aggregations": ["fixed_objective"],
+            "mopd_target_weights": [0.25],
+            "mopd_task_microbatch_counts": [4],
         },
     )
 
     assert "mopd_tasks" not in captured
     assert "mopd_operations" not in captured
-    assert "mopd_adamw_states" not in captured
-    assert captured["mopd_inclusion_probabilities"] == (0.25, 1)
+    assert "mopd_aggregations" not in captured
+    assert "mopd_target_weights" not in captured
+    assert "mopd_task_microbatch_counts" not in captured
 
 
 def test_missing_raw_reward_is_tolerated(unwrap_ray_get):

@@ -11,63 +11,68 @@ from slime.ray.rollout import (
     _save_eval_artifacts,
 )
 from slime.utils.types import Sample
+from slime_plugins.mopd.sampler import TASKS
 
 NUM_GPUS = 0
 
 
 def _mopd_stage_metrics():
-    return {
-        "mopd/student_rollout_gpu_seconds": 4.0,
+    metrics = {
+        "mopd/student_rollout_gpu_seconds": 1.0,
         "mopd/teacher_gpu_seconds": 2.0,
         "mopd/student_rollout_wall_seconds": 1.0,
         "mopd/teacher_wall_seconds": 2.0,
-        "mopd/rollout_and_teacher_wall_seconds": 2.0,
+        "mopd/rollout_and_teacher_wall_seconds": 3.0,
         "mopd/reward_wall_seconds": 0.5,
-        "mopd/teacher_pool_gpu_count": 1,
-        "mopd/valid_response_tokens": 65_600,
-        "mopd/teacher_scored_tokens": 70_000,
+        "mopd/valid_response_tokens": 1_000,
+        "mopd/generated_tokens": 1_100,
+        "mopd/teacher_scored_tokens": 2_000,
         "mopd/prompt_count": 64,
         "mopd/completed_responses": 63,
         "mopd/truncated_responses": 1,
         "mopd/invalid_responses": 0,
         "mopd/teacher_peak_memory_mib": 4096,
-        "mopd/resident_teacher_after_index": 0,
-        "mopd/task/math/student_rollout_seconds": 1.0,
-        "mopd/task/math/teacher_ready_seconds": 1.5,
-        "mopd/task/math/teacher_scoring_seconds": 0.5,
-        "mopd/task/math/teacher_switch_seconds": 1.5,
-        "mopd/task/math/teacher_load_seconds": 1.5,
-        "mopd/task/math/teacher_offload_seconds": 0.0,
-        "mopd/task/math/prompt_count": 16,
-        "mopd/task/math/attempted_responses": 64,
-        "mopd/task/math/valid_response_tokens": 65_600,
-        "mopd/task/math/teacher_scored_tokens": 70_000,
-        "mopd/task/math/completed_responses": 63,
-        "mopd/task/math/truncated_responses": 1,
-        "mopd/task/math/invalid_responses": 0,
-        "mopd/task/math/empty_responses": 0,
-        "mopd/task/math/teacher_scoring_failures": 0,
-        "mopd/task/math/teacher_memory_mib": 4096,
-        "mopd/task/math/teacher_transfer_tail_seconds": 1.5,
-        "mopd/task/math/switched": 1,
     }
+    for task in TASKS:
+        prefix = f"mopd/task/{task}/"
+        metrics.update(
+            {
+                prefix + "student_rollout_seconds": 0.25,
+                prefix + "teacher_scoring_seconds": 0.5,
+                prefix + "prompt_count": 16,
+                prefix + "attempted_responses": 16,
+                prefix + "valid_response_tokens": 250,
+                prefix + "generated_tokens": 275,
+                prefix + "teacher_scored_tokens": 500,
+                prefix + "completed_responses": 16,
+                prefix + "truncated_responses": 0,
+                prefix + "invalid_responses": 0,
+                prefix + "empty_responses": 0,
+                prefix + "teacher_scoring_failures": 0,
+                prefix + "teacher_memory_mib": 4096,
+                prefix + "teacher_memory_probe_failures": 0,
+            }
+        )
+    return metrics
 
 
 def _mopd_trainer_feedback():
     return {
         "mopd": True,
         "driver_step_wall_seconds": 10.0,
-        "actor_forward_backward_gpu_seconds": 12.0,
-        "optimizer_gpu_seconds": 4.0,
+        "actor_forward_backward_gpu_seconds": 3.0,
+        "optimizer_gpu_seconds": 1.0,
         "actor_forward_backward_wall_seconds": 3.0,
         "optimizer_wall_seconds": 1.0,
         "operation": "train",
         "task_units": [
             {
-                "task": "math",
-                "actor_forward_backward_wall_seconds": 3.0,
-                "optimizer_wall_seconds": 1.0,
+                "task": task,
+                "microbatches": 4,
+                "actor_forward_backward_wall_seconds": 0.75,
+                "optimizer_wall_seconds": 0.125,
             }
+            for task in TASKS
         ],
         "peak_hbm_bytes": 8 * 2**30,
     }
@@ -75,20 +80,20 @@ def _mopd_trainer_feedback():
 
 @pytest.mark.unit
 def test_mopd_cost_accounting_uses_end_to_end_wall_time_and_all_resident_gpus():
-    args = SimpleNamespace(rollout_num_gpus=4, actor_num_nodes=1, actor_num_gpus_per_node=4)
+    args = SimpleNamespace(rollout_num_gpus=1, actor_num_nodes=1, actor_num_gpus_per_node=1)
     feedback = _assemble_mopd_feedback(args, _mopd_stage_metrics(), _mopd_trainer_feedback())
 
-    assert feedback["component_wall_seconds"] == pytest.approx(6.5)
+    assert feedback["component_wall_seconds"] == pytest.approx(7.5)
     assert feedback["total_step_seconds"] == pytest.approx(10.0)
-    assert feedback["active_gpu_seconds"] == pytest.approx(22.0)
-    assert feedback["allocated_gpu_count"] == 5
-    assert feedback["total_gpu_seconds"] == pytest.approx(50.0)
-    assert feedback["valid_response_tokens"] == 65_600
+    assert feedback["active_gpu_seconds"] == pytest.approx(7.0)
+    assert feedback["allocated_gpu_count"] == 2
+    assert feedback["total_gpu_seconds"] == pytest.approx(20.0)
+    assert feedback["valid_response_tokens"] == 1_000
 
 
 @pytest.mark.unit
 def test_mopd_cost_accounting_rejects_a_driver_clock_shorter_than_critical_path():
-    args = SimpleNamespace(rollout_num_gpus=4, actor_num_nodes=1, actor_num_gpus_per_node=4)
+    args = SimpleNamespace(rollout_num_gpus=1, actor_num_nodes=1, actor_num_gpus_per_node=1)
     feedback = _mopd_trainer_feedback()
     feedback["driver_step_wall_seconds"] = 6.0
     with pytest.raises(ValueError, match="shorter than"):

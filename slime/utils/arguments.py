@@ -1632,32 +1632,45 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_mopd_arguments(parser):
-            group = parser.add_argument_group("Exact-set four-task MOPD experiment")
+            group = parser.add_argument_group("Four-task micro-batch MOPD/GPAS experiment")
             group.add_argument("--mopd-enabled", action="store_true", default=False)
+            group.add_argument("--mopd-smoke-test", action="store_true", default=False)
+            group.add_argument("--mopd-quick-smoke-test", action="store_true", default=False)
+            group.add_argument("--mopd-heldout-variance", action="store_true", default=False)
+            group.add_argument("--mopd-variance-checkpoint-step", type=int, choices=[50, 250, 500], default=None)
             group.add_argument(
-                "--mopd-run-mode", choices=["warm", "train", "bank"], default="train"
+                "--mopd-variance-controller-state",
+                type=str,
+                default=None,
+                help="Uniform sampler checkpoint whose training-time tau/C state is used by the variance probe.",
             )
             group.add_argument(
                 "--mopd-allocation",
-                choices=["uniform", "gpas", "cost_gpas", "all"],
+                choices=[
+                    "uniform",
+                    "gpas",
+                    "cost_gpas",
+                    "raw_noise",
+                    "loss_gap",
+                    "std_mopd",
+                    "d3_mopd",
+                    "open_mopd",
+                ],
                 default="uniform",
             )
-            group.add_argument("--mopd-task-width", type=int, choices=[1, 2, 4], default=1)
-            group.add_argument(
-                "--mopd-adamw-state", choices=["conventional", "taskwise"], default="taskwise"
-            )
             group.add_argument("--mopd-seed", type=int, default=42)
-            group.add_argument("--mopd-ema-decay", type=float, default=0.95)
-            group.add_argument("--mopd-inclusion-floor", type=float, default=0.05)
-            group.add_argument("--mopd-score-max-age", type=int, default=50)
-            group.add_argument("--mopd-response-budget", type=int, default=64_000)
-            group.add_argument(
-                "--mopd-checkpoint-responses", type=str, default="16384,32768,64000"
-            )
+            group.add_argument("--mopd-ema-decay", type=float, default=0.9)
+            group.add_argument("--mopd-total-steps", type=int, default=500)
+            group.add_argument("--mopd-microbatches-per-step", type=int, default=16)
+            group.add_argument("--mopd-prompts-per-microbatch", type=int, default=4)
+            group.add_argument("--mopd-min-microbatches", type=int, default=2)
+            group.add_argument("--mopd-max-microbatches", type=int, default=8)
+            group.add_argument("--mopd-response-budget", type=int, default=32_000)
+            group.add_argument("--mopd-checkpoint-steps", type=str, default="50,100,150,200,250,300,350,400,450,500")
             group.add_argument(
                 "--mopd-eval-responses",
                 type=str,
-                default="2048,4096,8192,16384,32768,49152,64000",
+                default="3200,6400,9600,12800,16000,19200,22400,25600,28800,32000",
                 help="Comma-separated attempted-response milestones for held-out teacher-loss evaluation.",
             )
             group.add_argument("--mopd-failure-penalty", type=float, default=10.0)
@@ -1665,19 +1678,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--mopd-output-dir",
                 type=str,
                 default=None,
-                help="Directory for exact-set allocation.jsonl and response-clock records.",
+                help="Directory for allocation.jsonl and step-clock records.",
             )
             group.add_argument("--mopd-score-chunk-size", type=int, default=1_048_576)
-            group.add_argument("--mopd-reset-sampler", action="store_true", default=False)
             group.add_argument(
                 "--mopd-eval-on-start",
                 action="store_true",
                 default=False,
-                help="Recreate a missing evaluation immediately after loading a resumable checkpoint.",
+                help="Evaluate the loaded student before the first optimizer step.",
             )
-            group.add_argument("--mopd-bank-dir", type=str, default=None)
-            group.add_argument("--mopd-bank-coordinates", type=int, default=65_536)
-            group.add_argument("--mopd-bank-units-per-task", type=int, default=8)
             return parser
 
         def add_mtp_training_arguments(parser):
@@ -2220,8 +2229,43 @@ def slime_validate_args(args):
             configure_optimizer_runtime(args)
 
     if getattr(args, "mopd_enabled", False):
+        from slime_plugins.mopd.sampler import (
+            ALLOCATIONS,
+            MAIN_CHECKPOINT_STEPS,
+            MAIN_EVAL_RESPONSES,
+            MAIN_RESPONSE_BUDGET,
+            MAIN_STEPS,
+            MICROBATCHES_PER_STEP,
+            M_MAX,
+            M_MIN,
+            PROMPTS_PER_MICROBATCH,
+            QUICK_SMOKE_CHECKPOINT_STEPS,
+            QUICK_SMOKE_EVAL_RESPONSES,
+            QUICK_SMOKE_MAX_RESPONSE_LEN,
+            QUICK_SMOKE_RESPONSE_BUDGET,
+            QUICK_SMOKE_STEPS,
+            RESPONSES_PER_STEP,
+            SMOKE_CHECKPOINT_STEPS,
+            SMOKE_EVAL_RESPONSES,
+            SMOKE_RESPONSE_BUDGET,
+            SMOKE_STEPS,
+            VARIANCE_CHECKPOINT_STEPS,
+            VARIANCE_MICROBATCHES,
+            VARIANCE_MICROBATCHES_PER_TASK,
+            VARIANCE_RESPONSE_BUDGET,
+        )
+
+        variance_probe = bool(args.mopd_heldout_variance)
+        smoke_test = bool(args.mopd_smoke_test)
+        quick_smoke_test = bool(args.mopd_quick_smoke_test)
+        if smoke_test and quick_smoke_test:
+            raise ValueError("Choose either the frozen smoke test or the quick smoke test, not both.")
         required_paths = {
-            "data_source_path": "slime_plugins.mopd.data_source.MOPDRolloutDataSource",
+            "data_source_path": (
+                "slime_plugins.mopd.data_source.MOPDVarianceDataSource"
+                if variance_probe
+                else "slime_plugins.mopd.data_source.MOPDRolloutDataSource"
+            ),
             "rollout_function_path": "slime_plugins.mopd.rollout.generate_rollout",
         }
         for attribute, expected in required_paths.items():
@@ -2234,15 +2278,18 @@ def slime_validate_args(args):
             raise ValueError("MOPD requires AdamW.")
         if not bool(getattr(args, "decoupled_weight_decay", True)):
             raise ValueError("MOPD requires decoupled AdamW weight decay semantics.")
-        if args.n_samples_per_prompt != 4:
-            raise ValueError("MOPD task units require --n-samples-per-prompt 4.")
+        if args.n_samples_per_prompt != 1:
+            raise ValueError("MOPD requires one response per prompt.")
         if not args.use_rollout_logprobs:
             raise ValueError(
                 "MOPD requires --use-rollout-logprobs so sampled OPD uses the on-policy SGLang "
                 "log-probabilities without an extra actor forward pass."
             )
-        if args.calculate_per_token_loss:
-            raise ValueError("MOPD uses one response-normalized gradient per selected task.")
+        token_aggregations = {"std_mopd", "d3_mopd", "open_mopd"}
+        if bool(args.calculate_per_token_loss) != (
+            not variance_probe and args.mopd_allocation in token_aggregations
+        ):
+            raise ValueError("StdMOPD, D³-MOPD, and Open-MOPD require --calculate-per-token-loss.")
         if args.use_critic:
             raise ValueError("MOPD does not use a critic.")
         if args.partial_rollout or args.dynamic_sampling_filter_path is not None:
@@ -2255,127 +2302,118 @@ def slime_validate_args(args):
             bool(getattr(args, flag, False))
             for flag in ("overlap_param_gather", "overlap_param_gather_with_optimizer_step")
         ):
-            raise ValueError("Clip/score/correction ordering requires synchronous parameter gather and step.")
-        if not args.colocate:
-            raise ValueError("MOPD cost accounting requires the actor and rollout engines to be colocated.")
+            raise ValueError("MOPD gradient capture requires synchronous parameter gather and step.")
+        if args.colocate:
+            raise ValueError("MOPD reserves separate training and inference GPUs; disable --colocate.")
+        if (
+            int(args.actor_num_nodes),
+            int(args.actor_num_gpus_per_node),
+            int(args.rollout_num_gpus),
+            int(args.rollout_num_gpus_per_engine),
+        ) != (1, 1, 1, 1):
+            raise ValueError("MOPD requires one training GPU and one single-GPU rollout engine.")
         if bool(getattr(args, "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False)):
             raise ValueError("MOPD requires FP32 Adam moments; disable precision-aware optimizer state.")
         if not args.use_opd or args.opd_type != "sglang" or not args.opd_teacher_router_config:
-            raise ValueError("MOPD requires the frozen teachers through one SGLang slot router.")
+            raise ValueError("MOPD requires the four resident teachers through an SGLang router.")
         if args.custom_rm_path != "slime_plugins.m2rl.opd.teacher_reward":
             raise ValueError("MOPD requires the multi-teacher reward adapter.")
         if args.custom_reward_post_process_path != "slime_plugins.m2rl.opd.post_process_rewards":
             raise ValueError("MOPD requires the teacher-logprob reward postprocessor.")
         if args.opd_task_reward_weight != 0:
             raise ValueError("MOPD is pure teacher distillation with task-reward weight zero.")
-
-        if not 0 <= args.mopd_ema_decay < 1:
-            raise ValueError("--mopd-ema-decay must be in [0, 1).")
-        if not 0 <= args.mopd_inclusion_floor <= 0.25:
-            raise ValueError("--mopd-inclusion-floor is infeasible for four tasks.")
-        if args.mopd_score_max_age != 50:
-            raise ValueError("The frozen protocol requires --mopd-score-max-age 50.")
         try:
-            checkpoints = tuple(
-                int(value) for value in args.mopd_checkpoint_responses.split(",") if value
-            )
-            eval_responses = tuple(
-                int(value) for value in args.mopd_eval_responses.split(",") if value
-            )
+            checkpoint_steps = tuple(int(value) for value in args.mopd_checkpoint_steps.split(",") if value)
+            eval_responses = tuple(int(value) for value in args.mopd_eval_responses.split(",") if value)
         except ValueError as exc:
-            raise ValueError("MOPD response milestones must be comma-separated integers.") from exc
-        for name, values in (("checkpoint", checkpoints), ("evaluation", eval_responses)):
-            if (
-                not values
-                or values != tuple(sorted(set(values)))
-                or any(value <= 0 or value > args.mopd_response_budget or value % 8 for value in values)
-            ):
-                raise ValueError(
-                    f"MOPD {name} response milestones must be unique increasing multiples of eight "
-                    "within the response budget."
-                )
+            raise ValueError("MOPD milestones must be comma-separated integers.") from exc
         if args.mopd_failure_penalty <= 0 or args.mopd_score_chunk_size <= 0:
             raise ValueError("MOPD failure penalty and score chunk size must be positive.")
-        if args.mopd_bank_coordinates <= 0 or args.mopd_bank_units_per_task != 8:
-            raise ValueError("The frozen bank requires eight units per task and positive coordinate count.")
-        if args.mopd_run_mode == "bank" and not args.mopd_bank_dir:
-            raise ValueError("--mopd-run-mode bank requires --mopd-bank-dir.")
-        if args.mopd_eval_on_start and (
-            args.mopd_run_mode != "train" or args.mopd_reset_sampler or args.start_rollout_id <= 0
-        ):
-            raise ValueError("--mopd-eval-on-start is only valid for an in-place checkpoint resume.")
-        if args.mopd_run_mode == "warm" and (
-            args.mopd_task_width,
-            args.mopd_allocation,
-            args.mopd_adamw_state,
-        ) != (1, "uniform", "taskwise"):
-            raise ValueError("Warm start is fixed round-robin K=1 Uniform with taskwise AdamW state.")
-        if args.mopd_run_mode == "bank" and (
-            args.mopd_task_width,
-            args.mopd_allocation,
-            args.mopd_adamw_state,
-        ) != (1, "uniform", "taskwise"):
-            raise ValueError("Frozen-bank capture is fixed to K=1 Uniform with taskwise AdamW state.")
-        allowed_train_configs = {
-            (1, "uniform", "conventional"),
-            (1, "uniform", "taskwise"),
-            (1, "gpas", "taskwise"),
-            (1, "cost_gpas", "taskwise"),
-            (2, "uniform", "taskwise"),
-            (2, "cost_gpas", "taskwise"),
-            (4, "all", "taskwise"),
-            (4, "all", "conventional"),
-        }
-        if args.mopd_run_mode == "train" and (
-            args.mopd_task_width,
-            args.mopd_allocation,
-            args.mopd_adamw_state,
-        ) not in allowed_train_configs:
-            raise ValueError("MOPD train configuration is not one of the eight frozen protocol cells.")
-        train_config = (
-            args.mopd_task_width,
-            args.mopd_allocation,
-            args.mopd_adamw_state,
-        )
-        main_schedule = (
-            64_000,
-            (16_384, 32_768, 64_000),
-            (2_048, 4_096, 8_192, 16_384, 32_768, 49_152, 64_000),
-        )
-        confirmation_schedule = (
-            16_384,
-            (16_384,),
-            (2_048, 4_096, 8_192, 16_384),
-        )
-        observed_schedule = (args.mopd_response_budget, checkpoints, eval_responses)
-        confirmation_configs = {
-            (1, "uniform", "taskwise"),
-            (1, "gpas", "taskwise"),
-            (1, "cost_gpas", "taskwise"),
-        }
-        if args.mopd_run_mode == "bank":
-            if observed_schedule != main_schedule or args.mopd_seed != 42:
-                raise ValueError("Frozen-bank runs require the seed-42 64k campaign schedule.")
-        elif args.mopd_run_mode == "warm":
-            expected_schedule = main_schedule if args.mopd_seed == 42 else confirmation_schedule
-            if observed_schedule != expected_schedule or args.mopd_seed not in {42, 43, 44}:
-                raise ValueError("Warm runs must use the schedule associated with seed 42, 43, or 44.")
-        elif args.mopd_seed == 42:
-            if observed_schedule != main_schedule:
-                raise ValueError("Seed-42 main runs require the frozen 64k response schedule.")
-        elif args.mopd_seed in {43, 44}:
-            if observed_schedule != confirmation_schedule or train_config not in confirmation_configs:
-                raise ValueError(
-                    "Seeds 43/44 are reserved for the three 16k critical confirmation runs."
-                )
+        if variance_probe:
+            frozen_protocol = (
+                not smoke_test
+                and args.mopd_allocation == "uniform"
+                and args.mopd_seed == 42
+                and args.mopd_total_steps == 1
+                and args.mopd_microbatches_per_step == VARIANCE_MICROBATCHES
+                and args.mopd_prompts_per_microbatch == PROMPTS_PER_MICROBATCH
+                and args.mopd_min_microbatches == VARIANCE_MICROBATCHES_PER_TASK
+                and args.mopd_max_microbatches == VARIANCE_MICROBATCHES_PER_TASK
+                and args.mopd_response_budget == VARIANCE_RESPONSE_BUDGET
+                and checkpoint_steps == ()
+                and eval_responses == ()
+                and args.mopd_variance_checkpoint_step in VARIANCE_CHECKPOINT_STEPS
+                and args.mopd_variance_controller_state is not None
+            )
+            if not frozen_protocol:
+                raise ValueError("MOPD arguments differ from the frozen held-out variance protocol.")
+            if (
+                args.rollout_batch_size != VARIANCE_RESPONSE_BUDGET
+                or args.global_batch_size != PROMPTS_PER_MICROBATCH
+                or args.micro_batch_size != 1
+                or args.num_rollout != 1
+            ):
+                raise ValueError("Held-out variance requires rollout/global/micro batch sizes 512/4/1.")
+            if args.eval_interval is not None or args.no_load_optim:
+                raise ValueError("Held-out variance requires the loaded AdamW state and performs no evaluation.")
         else:
-            raise ValueError("The shortened campaign freezes MOPD seeds to 42, 43, and 44.")
-        if args.mopd_task_width == 4 and args.mopd_allocation != "all":
-            raise ValueError("K=4 uses --mopd-allocation all.")
-        if args.mopd_allocation == "all" and args.mopd_task_width != 4:
-            raise ValueError("--mopd-allocation all requires K=4.")
-        if args.rollout_max_response_len != 8192:
-            raise ValueError("The frozen protocol requires --rollout-max-response-len 8192.")
+            if quick_smoke_test:
+                expected_steps = QUICK_SMOKE_STEPS
+                expected_budget = QUICK_SMOKE_RESPONSE_BUDGET
+                expected_checkpoints = QUICK_SMOKE_CHECKPOINT_STEPS
+                expected_eval_responses = QUICK_SMOKE_EVAL_RESPONSES
+            elif smoke_test:
+                expected_steps = SMOKE_STEPS
+                expected_budget = SMOKE_RESPONSE_BUDGET
+                expected_checkpoints = SMOKE_CHECKPOINT_STEPS
+                expected_eval_responses = SMOKE_EVAL_RESPONSES
+            else:
+                expected_steps = MAIN_STEPS
+                expected_budget = MAIN_RESPONSE_BUDGET
+                expected_checkpoints = MAIN_CHECKPOINT_STEPS
+                expected_eval_responses = MAIN_EVAL_RESPONSES
+            frozen_protocol = (
+                args.mopd_allocation in ALLOCATIONS
+                and (not (smoke_test or quick_smoke_test) or args.mopd_allocation == "gpas")
+                and args.mopd_seed == 42
+                and args.mopd_ema_decay == 0.9
+                and args.mopd_total_steps == expected_steps
+                and args.mopd_microbatches_per_step == MICROBATCHES_PER_STEP
+                and args.mopd_prompts_per_microbatch == PROMPTS_PER_MICROBATCH
+                and args.mopd_min_microbatches == M_MIN
+                and args.mopd_max_microbatches == M_MAX
+                and args.mopd_response_budget == expected_budget
+                and checkpoint_steps == expected_checkpoints
+                and eval_responses == expected_eval_responses
+                and args.mopd_variance_checkpoint_step is None
+                and args.mopd_variance_controller_state is None
+            )
+            if not frozen_protocol:
+                if quick_smoke_test:
+                    mode = "1-step quick smoke"
+                elif smoke_test:
+                    mode = "20-step smoke"
+                else:
+                    mode = "500-step main"
+                raise ValueError(f"MOPD arguments differ from the frozen {mode} protocol.")
+            if (
+                args.rollout_batch_size != RESPONSES_PER_STEP
+                or args.global_batch_size != PROMPTS_PER_MICROBATCH
+                or args.micro_batch_size != 1
+                or args.num_rollout != expected_steps
+            ):
+                raise ValueError(
+                    f"MOPD requires rollout/global/micro batch sizes 64/4/1 and {expected_steps} rollouts."
+                )
+            if quick_smoke_test and args.eval_interval is not None:
+                raise ValueError("The quick smoke test skips held-out evaluation.")
+            if not quick_smoke_test and args.eval_interval is None:
+                raise ValueError("MOPD requires held-out evaluation at step zero and every 50 steps.")
+            if not args.save or not args.save_hf:
+                raise ValueError("MOPD training requires full resume checkpoints and periodic HuggingFace weights.")
+        expected_response_len = QUICK_SMOKE_MAX_RESPONSE_LEN if quick_smoke_test else 4096
+        if args.rollout_max_response_len != expected_response_len:
+            raise ValueError(f"This MOPD mode requires --rollout-max-response-len {expected_response_len}.")
         kwargs = getattr(args, "apply_chat_template_kwargs", None) or {}
         if not isinstance(kwargs, dict) or kwargs.get("enable_thinking") is not False:
             raise ValueError("Qwen3 allocation rollouts require enable_thinking=false.")

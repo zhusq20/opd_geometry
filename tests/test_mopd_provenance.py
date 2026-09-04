@@ -9,19 +9,24 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
-from omegaconf import OmegaConf
-
-from examples.mopd_gpas import convert_teachers, prepare_mopd
+from examples.mopd_gpas import convert_teachers, prepare_mopd, provenance, verify_hardware
 from examples.mopd_gpas.convert_teachers import (
     complete_hf,
     verify_compatibility,
+    verify_pretrained_teacher,
     verify_source_identity,
     write_conversion_manifest,
 )
-from examples.mopd_gpas.prepare_mopd import SPLITS, sliced
+from examples.mopd_gpas.prepare_mopd import (
+    HELDOUT_CANDIDATE_SLICE,
+    TRAIN_CANDIDATE_SLICE,
+    objective_from_measurement,
+    sliced,
+)
 from examples.mopd_gpas.prepare_resume import apply as apply_resume
 from examples.mopd_gpas.prepare_resume import inspect as inspect_resume
 from examples.mopd_gpas.provenance import checkpoint_record, selected_command_options, source_snapshot
+from omegaconf import OmegaConf
 
 NUM_GPUS = 0
 
@@ -41,6 +46,33 @@ def _model_config():
         "num_key_value_heads": 8,
         "rope_theta": 1_000_000,
     }
+
+
+def test_provenance_records_nvidia_smi_stdout_failure(monkeypatch):
+    failure = subprocess.CompletedProcess([], 255, "Failed to initialize NVML: Unknown Error\n", "")
+    monkeypatch.setattr(provenance.subprocess, "run", lambda *_args, **_kwargs: failure)
+
+    record = provenance.hardware_record()["nvidia_smi"]
+
+    assert record["available"] is False
+    assert record["gpus"] == []
+    assert record["error"] == "Failed to initialize NVML: Unknown Error"
+
+
+def test_hardware_preflight_retries_then_reports_nvidia_smi_stdout(monkeypatch):
+    calls = []
+    failure = subprocess.CompletedProcess([], 255, "Failed to initialize NVML: Unknown Error\n", "")
+    monkeypatch.setattr(verify_hardware, "QUERY_RETRY_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(
+        verify_hardware.subprocess,
+        "run",
+        lambda command, **_kwargs: calls.append(command) or failure,
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to initialize NVML: Unknown Error"):
+        verify_hardware.query()
+
+    assert len(calls) == verify_hardware.QUERY_ATTEMPTS
 
 
 def _write_hf_anchors(path: Path, *, with_shard: bool = True) -> None:
@@ -110,8 +142,20 @@ def test_published_teachers_can_be_verified_without_original_training_checkpoint
 
     monkeypatch.setenv("MOPD_HF_CHECKPOINT", str(base))
     monkeypatch.setenv("MOPD_TEACHER_HF_ROOT", str(teachers))
+    monkeypatch.setenv("MOPD_QWEN3_4B", str(teachers / "code"))
     monkeypatch.setattr(sys, "argv", ["convert_teachers.py", "--verify-only"])
     convert_teachers.main()
+
+
+def test_pretrained_4b_requires_qwen3_and_the_exact_student_tokenizer(tmp_path):
+    base = tmp_path / "base"
+    teacher = tmp_path / "teacher"
+    _write_hf_anchors(base)
+    _write_hf_anchors(teacher)
+    verify_pretrained_teacher(base, teacher)
+    (teacher / "tokenizer_config.json").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="differs"):
+        verify_pretrained_teacher(base, teacher)
 
 
 def test_fresh_teacher_conversion_manifest_pins_source_and_every_output(tmp_path):
@@ -177,13 +221,27 @@ def test_source_snapshot_includes_source_and_excludes_generated_files(tmp_path):
 
 def test_training_and_teacher_loss_splits_are_disjoint(tmp_path):
     path = tmp_path / "code.jsonl"
-    assert sliced(path, "train").endswith("code.jsonl@[0:16000]")
-    assert sliced(path, "probe").endswith("code.jsonl@[16000:16064]")
-    assert sliced(path, "bank").endswith("code.jsonl@[16064:16192]")
-    assert sliced(path, "teacher_loss").endswith("code.jsonl@[16384:16575]")
-    assert SPLITS["train"][1] <= SPLITS["probe"][0]
-    assert SPLITS["probe"][1] <= SPLITS["bank"][0]
-    assert SPLITS["bank"][1] <= SPLITS["teacher_loss"][0]
+    assert sliced(path, TRAIN_CANDIDATE_SLICE).endswith("code.jsonl@[0:16384]")
+    assert sliced(path, HELDOUT_CANDIDATE_SLICE).endswith("code.jsonl@[16384:16575]")
+    assert TRAIN_CANDIDATE_SLICE[1] <= HELDOUT_CANDIDATE_SLICE[0]
+
+
+def test_initial_loss_ratio_over_ten_switches_to_equal_weights(tmp_path):
+    path = tmp_path / "initial.json"
+    value = {
+        "schema_version": 2,
+        "task_order": ["math", "code", "if", "science"],
+        "tasks": {
+            task: {"ell0": loss}
+            for task, loss in zip(("math", "code", "if", "science"), (0.01, 0.2, 0.3, 0.4), strict=True)
+        },
+        "weight_rule": "equal_due_to_max_min_ratio_gt_10",
+        "target_weights": dict.fromkeys(("math", "code", "if", "science"), 0.25),
+    }
+    path.write_text(json.dumps(value), encoding="utf-8")
+    losses, weights, _ = objective_from_measurement(path)
+    assert losses["math"] == 0.01
+    assert weights == dict.fromkeys(("math", "code", "if", "science"), 0.25)
 
 
 def test_protocol_preparation_uses_portable_asset_roots(tmp_path, monkeypatch):
@@ -191,35 +249,77 @@ def test_protocol_preparation_uses_portable_asset_roots(tmp_path, monkeypatch):
     base_hf = tmp_path / "models/student_hf"
     base_megatron = tmp_path / "models/student_megatron"
     teachers = tmp_path / "models/teachers_hf"
+    qwen3_4b = tmp_path / "models/qwen3-4b"
     output = tmp_path / "generated"
 
-    base_hf.mkdir(parents=True)
-    (base_hf / "config.json").write_text("{}\n", encoding="utf-8")
+    base_hf.parent.mkdir(parents=True)
+    _write_hf_anchors(base_hf)
     base_megatron.mkdir(parents=True)
     (base_megatron / "latest_checkpointed_iteration.txt").write_text("0\n", encoding="utf-8")
     for task in ("math", "code", "if", "science"):
         data_path = data_root / "train" / f"{task}.jsonl"
         data_path.parent.mkdir(parents=True, exist_ok=True)
         data_path.write_text("{}\n" * 16_575, encoding="utf-8")
-        teacher = teachers / task
-        teacher.mkdir(parents=True)
-        (teacher / "config.json").write_text("{}\n", encoding="utf-8")
-        (teacher / "model.safetensors").write_bytes(b"weights")
-        (teacher / "conversion_manifest.json").write_text("{}\n", encoding="utf-8")
+    teachers.mkdir()
+    _write_hf_anchors(teachers / "math")
+    _write_hf_anchors(teachers / "if")
+    _write_hf_anchors(qwen3_4b)
+
+    initial = {
+        "schema_version": 2,
+        "task_order": ["math", "code", "if", "science"],
+        "tasks": {task: {"ell0": 1.0} for task in ("math", "code", "if", "science")},
+        "weight_rule": "inverse_initial_teacher_loss",
+        "target_weights": dict.fromkeys(("math", "code", "if", "science"), 0.25),
+    }
+    initial_path = output / "initial_kl.json"
+    initial_path.parent.mkdir()
+    initial_path.write_text(json.dumps(initial), encoding="utf-8")
+
+    def materialize(_data_root, generated, _student):
+        records = {}
+        for task in ("math", "code", "if", "science"):
+            path = generated / "heldout" / f"{task}.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('{"prompt":"p"}\n' * 128, encoding="utf-8")
+            records[task] = {"selected": 128, "file": prepare_mopd.file_record(path)}
+        return records
+
+    monkeypatch.setattr(prepare_mopd, "materialize_heldout", materialize)
 
     monkeypatch.setenv("MOPD_DATA_ROOT", str(data_root))
     monkeypatch.setenv("MOPD_HF_CHECKPOINT", str(base_hf))
     monkeypatch.setenv("MOPD_BASE_MEGATRON", str(base_megatron))
     monkeypatch.setenv("MOPD_TEACHER_HF_ROOT", str(teachers))
+    monkeypatch.setenv("MOPD_QWEN3_4B", str(qwen3_4b))
+    monkeypatch.setenv("MOPD_INITIAL_KL", str(initial_path))
     monkeypatch.setattr(sys, "argv", ["prepare_mopd.py", "--repo", str(tmp_path), "--output", str(output)])
     prepare_mopd.main()
 
     train = yaml.safe_load((output / "train.yaml").read_text(encoding="utf-8"))
     assert train["sources"][0]["path"].startswith(str(data_root.resolve()))
     protocol = json.loads((output / "protocol.json").read_text(encoding="utf-8"))
-    assert protocol["teachers"]["math"]["converted_hf"] == str((teachers / "math").resolve())
-    assert "checkpoint" not in protocol["teachers"]["math"]
-    assert "sha256" not in protocol["datasets"]["math"]
+    assert protocol["teachers"]["math"]["model_path"] == str((teachers / "math").resolve())
+    assert protocol["teachers"]["code"]["model_path"] == str(qwen3_4b.resolve())
+    assert protocol["training"]["steps"] == 500
+    assert protocol["training"]["configs"][-2:] == ["d3_mopd", "open_mopd"]
+    assert protocol["objective"]["weights"] == dict.fromkeys(("math", "code", "if", "science"), 0.25)
+    baselines = protocol["objective"]["paper_baselines"]
+    assert baselines["d3_mopd"]["scheduler"] == {
+        "update_cadence": 10,
+        "window": 10,
+        "windows": 3,
+        "initial_steps": 5,
+        "ema_window": 10,
+        "kl_denominator_floor": 0.15,
+        "temperature": 0.5,
+        "mixture_floor": 0.1,
+        "jitter": 0.3,
+    }
+    assert baselines["open_mopd"]["variant"] == "K=1 sampled-token in-protocol adaptation"
+    assert baselines["open_mopd"]["share_target"] == dict.fromkeys(("math", "code", "if", "science"), 0.25)
+    assert baselines["open_mopd"]["gap_alpha"] == 1.0
+    assert baselines["open_mopd"]["gap_factor_bounds"] == [0.05, 20.0]
 
 
 def test_capability_eval_resolves_the_worker_data_root(tmp_path, monkeypatch):
@@ -230,10 +330,10 @@ def test_capability_eval_resolves_the_worker_data_root(tmp_path, monkeypatch):
 
 
 def test_complete_worker_run_can_be_packaged_for_analysis(tmp_path):
-    config = "uniform_k1_conventional"
+    config = "uniform"
     output_root = tmp_path / "outputs"
     run = output_root / f"{config}-seed42"
-    capability = run / "capability_eval/response_64000"
+    capability = run / "capability_eval/response_32000"
     for path in (
         run / "provenance",
         run / "allocation",
@@ -244,7 +344,7 @@ def test_complete_worker_run_can_be_packaged_for_analysis(tmp_path):
         path.mkdir(parents=True, exist_ok=True)
         (path / "artifact.json").write_text("{}\n", encoding="utf-8")
     (run / "run_complete.json").write_text('{"status":"complete"}\n', encoding="utf-8")
-    (run / "allocation/allocation.jsonl").write_text('{"attempted_responses_after":64000}\n', encoding="utf-8")
+    (run / "allocation/allocation.jsonl").write_text('{"attempted_responses_after":32000}\n', encoding="utf-8")
     (capability / "run_complete.json").write_text('{"status":"complete"}\n', encoding="utf-8")
 
     package_dir = tmp_path / "packages"
@@ -297,9 +397,8 @@ def test_resume_rewinds_append_only_outputs_to_latest_complete_checkpoint(tmp_pa
     torch.save(
         {
             "controller": {
-                "completed_operations": 2,
-                "attempted_responses": 16_384,
-                "resident_teacher": 1,
+                "completed_steps": 2,
+                "attempted_responses": 128,
                 "pending": None,
             }
         },
@@ -311,7 +410,7 @@ def test_resume_rewinds_append_only_outputs_to_latest_complete_checkpoint(tmp_pa
                 {
                     "rollout_id": 9,
                     "operation_index": 1,
-                    "attempted_responses": 16_384,
+                    "attempted_responses": 128,
                     "optimizer_updates": 2,
                 }
             ]
@@ -327,7 +426,7 @@ def test_resume_rewinds_append_only_outputs_to_latest_complete_checkpoint(tmp_pa
     metrics = run / "metrics"
     metrics.mkdir()
     (metrics / "mopd.jsonl").write_text(
-        "".join(json.dumps({"metrics": {"mopd/update": index}}) + "\n" for index in range(3)),
+        "".join(json.dumps({"metrics": {"mopd/update": index}}) + "\n" for index in range(1, 4)),
         encoding="utf-8",
     )
     (run / "wandb_run_id.txt").write_text("stale_run\n", encoding="utf-8")
@@ -335,7 +434,6 @@ def test_resume_rewinds_append_only_outputs_to_latest_complete_checkpoint(tmp_pa
 
     state = inspect_resume(run)
     assert state["rollout_id"] == 9
-    assert state["resident_task"] == "code"
     assert state["rewind_required"]
     assert state["eval_on_start"]
 

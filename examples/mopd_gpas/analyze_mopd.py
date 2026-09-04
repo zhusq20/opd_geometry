@@ -1,35 +1,36 @@
 #!/usr/bin/env python3
-"""Build response/GPU-hour curves and the complete eight-configuration outcome table."""
+"""Analyze the frozen eight-run, 500-step MOPD experiment."""
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 TASKS = ("math", "code", "if", "science")
-SEED = 42
 CONFIGS = (
-    "uniform_k1_conventional",
-    "uniform_k1_taskwise",
-    "gpas_k1_taskwise",
-    "cost_gpas_k1_taskwise",
-    "uniform_k2_taskwise",
-    "cost_gpas_k2_taskwise",
-    "all_k4_taskwise",
-    "all_k4_conventional",
+    "uniform",
+    "gpas",
+    "cost_gpas",
+    "raw_noise",
+    "loss_gap",
+    "std_mopd",
+    "d3_mopd",
+    "open_mopd",
 )
-THRESHOLD = 0.75
-INITIAL_LOSSES = {
-    task: float(value)
-    for task, value in json.loads(
-        (Path(__file__).resolve().parent / "configs/initial_teacher_losses.json").read_text(encoding="utf-8")
-    )["values"].items()
-}
+NON_FIXED_OBJECTIVE = {"std_mopd", "d3_mopd", "open_mopd"}
+SEED = 42
+STEPS = tuple(range(0, 501, 50))
+RESPONSES_PER_STEP = 64
+RESPONSE_BUDGET = 32_000
+BOOTSTRAP_REPLICATES = 1_000
+BASELINE = "uniform"
 
 
 def jsonl(path: Path) -> list[dict[str, Any]]:
@@ -37,345 +38,333 @@ def jsonl(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in stream if line.strip()]
 
 
-def _metric_rows(path: Path) -> list[dict[str, Any]]:
-    return [row["metrics"] for row in jsonl(path) if "metrics" in row]
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
-def _completion(path: Path) -> dict[str, Any]:
-    marker = path / "run_complete.json"
-    if not marker.is_file():
-        raise ValueError(f"incomplete run: {path}")
-    value = json.loads(marker.read_text(encoding="utf-8"))
-    if value.get("status") != "complete":
-        raise ValueError(f"failed run: {path}")
-    return value
+def _protocol(path: Path) -> tuple[dict[str, float], dict[str, float]]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if int(value["schema_version"]) != 4 or tuple(value["training"]["configs"]) != CONFIGS:
+        raise ValueError(f"unexpected MOPD protocol: {path}")
+    weights = {task: float(value["objective"]["weights"][task]) for task in TASKS}
+    losses = {task: float(value["initial_kl"]["tasks"][task]["ell0"]) for task in TASKS}
+    return weights, losses
 
 
-def _evaluation(metrics: dict[str, Any]) -> dict[str, Any]:
+def _completion(path: Path) -> None:
+    value = json.loads((path / "run_complete.json").read_text(encoding="utf-8"))
+    if value.get("status") != "complete" or int(value["final_num_updates"]) != 500:
+        raise ValueError(f"incomplete 500-step run: {path}")
+
+
+def _evaluations(path: Path, weights: dict[str, float]) -> dict[int, dict[str, Any]]:
+    rows = [row["metrics"] for row in jsonl(path / "metrics/eval.jsonl") if "metrics" in row]
+    output: dict[int, dict[str, Any]] = {}
+    for metrics in rows:
+        if "eval/weighted_teacher_loss" not in metrics:
+            continue
+        step = int(metrics["eval/num_updates"])
+        raw = {task: float(metrics[f"eval/teacher_loss/{task}"]) for task in TASKS}
+        output[step] = {
+            "step": step,
+            "raw_losses": raw,
+            "normalized_losses": {task: float(metrics[f"eval/normalized_teacher_loss/{task}"]) for task in TASKS},
+            "weighted_loss": sum(weights[task] * raw[task] for task in TASKS),
+        }
+    if tuple(sorted(output)) != STEPS:
+        raise ValueError(f"expected held-out evaluations at steps {STEPS}, got {tuple(sorted(output))}: {path}")
+    return output
+
+
+def _system_trace(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    trace = []
+    for row in rows:
+        feedback = row["feedback"]
+        counts = {task: int(row["counts"][task]) for task in TASKS}
+        task_seconds_ema = {task: float(row["task_seconds_after"][task]) for task in TASKS}
+        variable_ema = sum(counts[task] * task_seconds_ema[task] for task in TASKS)
+        fixed_ema = float(row["fixed_seconds_after"])
+        before_task_seconds = row["task_seconds_before"]
+        before_fixed_seconds = row["fixed_seconds_before"]
+        predicted = None
+        if before_fixed_seconds is not None and all(before_task_seconds[task] is not None for task in TASKS):
+            predicted = float(before_fixed_seconds) + sum(
+                counts[task] * float(before_task_seconds[task]) for task in TASKS
+            )
+        total_wall_seconds = float(feedback["total_wall_seconds"])
+        trace.append(
+            {
+                "step": int(row["optimizer_updates_after"]),
+                "attempted_responses": int(row["attempted_responses_after"]),
+                "counts": counts,
+                "H": float(row["H"]),
+                "raw_noise": {task: float(row["raw_noise_after"][task]) for task in TASKS},
+                "scaled_noise": {task: float(row["scaled_noise_after"][task]) for task in TASKS},
+                "loss_ema": {task: float(row["loss_ema_after"][task]) for task in TASKS},
+                "task_seconds_ema": task_seconds_ema,
+                "fixed_seconds_ema": fixed_ema,
+                "fixed_to_variable_ratio": fixed_ema / variable_ema,
+                "time_model_prediction_before": predicted,
+                "time_model_residual_seconds": (None if predicted is None else total_wall_seconds - predicted),
+                "aggregate_grad_norm": float(feedback["aggregate_grad_norm"]),
+                "aggregate_grad_clipped": bool(feedback["aggregate_grad_clipped"]),
+                "total_wall_seconds": total_wall_seconds,
+                "valid_response_tokens": int(feedback["valid_response_tokens"]),
+                "generated_tokens": int(feedback["generated_tokens"]),
+                "truncated_responses": int(feedback["truncated_responses"]),
+                "invalid_responses": int(feedback["invalid_responses"]),
+                "student_peak_hbm_gib": float(feedback["peak_hbm_bytes"]) / 2**30,
+                "inference_peak_hbm_gib": float(feedback["teacher_peak_memory_mib"]) / 1024,
+                "allocation_details": row.get("allocation_details"),
+                "open_mopd_weights": {
+                    unit["task"]: {
+                        key: unit[key]
+                        for key in (
+                            "open_mopd_token_share",
+                            "open_mopd_share_weight",
+                            "open_mopd_gap_factor",
+                            "open_mopd_loss_weight",
+                            "open_mopd_effective_share",
+                        )
+                        if key in unit
+                    }
+                    for unit in feedback["task_units"]
+                },
+            }
+        )
+    return trace
+
+
+def _mechanism_summary(trace: list[dict[str, Any]]) -> dict[str, Any]:
+    noise = {}
+    for kind in ("raw_noise", "scaled_noise"):
+        cross_task_ratios = []
+        for row in trace:
+            values = [float(row[kind][task]) for task in TASKS]
+            cross_task_ratios.append(max(values) / max(min(values), 1e-30))
+        all_values = [float(row[kind][task]) for row in trace for task in TASKS]
+        noise[kind] = {
+            "minimum": min(all_values),
+            "maximum": max(all_values),
+            "cross_task_ratio_median": float(np.median(cross_task_ratios)),
+            "cross_task_ratio_p95": float(np.percentile(cross_task_ratios, 95)),
+            "final_over_initial": {
+                task: float(trace[-1][kind][task]) / max(float(trace[0][kind][task]), 1e-30) for task in TASKS
+            },
+        }
+
+    ranking_disagreements = 0
+    for row in trace:
+        raw_order = sorted(TASKS, key=lambda task: (row["raw_noise"][task], task))
+        scaled_order = sorted(TASKS, key=lambda task: (row["scaled_noise"][task], task))
+        ranking_disagreements += raw_order != scaled_order
+
+    h_values = [float(row["H"]) for row in trace]
+    residuals = [
+        float(row["time_model_residual_seconds"]) for row in trace if row["time_model_residual_seconds"] is not None
+    ]
     return {
-        "rollout_id": int(metrics["eval/rollout_id"]),
-        "optimizer_updates": int(metrics["eval/num_updates"]),
-        "mean_relative_loss": float(metrics["eval/mean_relative_teacher_loss"]),
-        "relative_losses": {task: float(metrics[f"eval/relative_teacher_loss/{task}"]) for task in TASKS},
-        "raw_losses": {task: float(metrics[f"eval/teacher_loss/{task}"]) for task in TASKS},
+        "noise": noise,
+        "raw_scaled_ranking_disagreement_fraction": ranking_disagreements / len(trace),
+        "count_at_lower_bound_fraction": {
+            task: sum(row["counts"][task] == 2 for row in trace) / len(trace) for task in TASKS
+        },
+        "count_at_upper_bound_fraction": {
+            task: sum(row["counts"][task] == 8 for row in trace) / len(trace) for task in TASKS
+        },
+        "H": {
+            "q25": float(np.percentile(h_values, 25)),
+            "median": float(np.median(h_values)),
+            "q75": float(np.percentile(h_values, 75)),
+        },
+        "time_model_forecast_residual_seconds": {
+            "q25": float(np.percentile(residuals, 25)),
+            "median": float(np.median(residuals)),
+            "q75": float(np.percentile(residuals, 75)),
+            "absolute_p95": float(np.percentile(np.abs(residuals), 95)),
+        },
     }
 
 
 def _interpolate(curve: list[dict[str, Any]], coordinate: str, threshold: float) -> float | None:
     for index, row in enumerate(curve):
-        if row["mean_relative_loss"] > threshold:
+        current = float(row["weighted_loss"])
+        if current > threshold:
             continue
         if index == 0:
             return float(row[coordinate])
         previous = curve[index - 1]
-        high, low = float(previous["mean_relative_loss"]), float(row["mean_relative_loss"])
-        fraction = 1.0 if high == low else np.clip((high - threshold) / (high - low), 0.0, 1.0)
+        previous_loss = float(previous["weighted_loss"])
+        fraction = (
+            1.0
+            if previous_loss == current
+            else np.clip((previous_loss - threshold) / (previous_loss - current), 0.0, 1.0)
+        )
         return float(previous[coordinate] + fraction * (row[coordinate] - previous[coordinate]))
     return None
 
 
-def _system_trace(allocations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
-            "operation_index": int(row["operation_index"]),
-            "rollout_id": int(row["rollout_id"]),
-            "attempted_responses_before": int(row["attempted_responses_before"]),
-            "attempted_responses_after": int(row["attempted_responses_after"]),
-            "operation": str(row["operation"]),
-            "selected_set": list(row["selected_set"]),
-            "execution_order": list(row["execution_order"]),
-            "resident_teacher_before": row["resident_teacher_before"],
-            "resident_teacher_after": row["resident_teacher_after"],
-            "optimizer_updates_after": int(row["optimizer_updates_after"]),
-            "processed_task_units_after": int(row["processed_task_units_after"]),
-            "probe_count_after": int(row["probe_count_after"]),
-            "inclusion_probabilities": {task: float(row["inclusion_probabilities"][task]) for task in TASKS},
-            "set_distribution": {
-                str(task_set): float(probability) for task_set, probability in row["set_distribution"].items()
-            },
-            "score_ages": {task: int(row["score_ages_after"][task]) for task in TASKS},
-            "raw_gradient_rms": {task: float(row["raw_gradient_rms_after"][task]) for task in TASKS},
-            "adam_gradient_rms": {task: float(row["adam_gradient_rms_after"][task]) for task in TASKS},
-            "predicted_set_seconds": {
-                str(task_set): float(seconds) for task_set, seconds in row["predicted_set_seconds"].items()
-            },
-            "allocated_gpu_count": int(row["feedback"]["allocated_gpu_count"]),
-            "total_wall_seconds": float(row["feedback"]["total_wall_seconds"]),
-            "total_gpu_seconds": float(row["feedback"]["total_gpu_seconds"]),
-            "active_gpu_seconds": float(row["feedback"]["active_gpu_seconds"]),
-            "valid_response_tokens": int(row["feedback"]["valid_response_tokens"]),
-            "completed_responses": int(row["feedback"]["completed_responses"]),
-            "invalid_responses": int(row["feedback"]["invalid_responses"]),
-            "truncated_responses": int(row["feedback"]["truncated_responses"]),
-            "component_gpu_seconds": {
-                key: float(row["feedback"][key])
-                for key in (
-                    "rollout_gpu_seconds",
-                    "teacher_gpu_seconds",
-                    "actor_forward_backward_gpu_seconds",
-                    "optimizer_gpu_seconds",
-                )
-            },
-            "component_wall_seconds": {
-                key: float(row["feedback"][key])
-                for key in (
-                    "rollout_wall_seconds",
-                    "teacher_wall_seconds",
-                    "rollout_and_teacher_wall_seconds",
-                    "actor_forward_backward_wall_seconds",
-                    "optimizer_wall_seconds",
-                )
-            },
-            "student_peak_hbm_gib": float(row["feedback"]["peak_hbm_bytes"]) / 2**30,
-            "teacher_peak_hbm_gib": float(row["feedback"]["teacher_peak_memory_mib"]) / 1024,
-            "task_units": [
-                {
-                    **{
-                        key: unit[key]
-                        for key in (
-                            "task",
-                            "switched",
-                            "teacher_switch_seconds",
-                            "teacher_transfer_tail_seconds",
-                            "teacher_memory_mib",
-                            "student_rollout_seconds",
-                            "teacher_scoring_seconds",
-                            "actor_forward_backward_wall_seconds",
-                            "optimizer_wall_seconds",
-                        )
-                    },
-                    "student_peak_hbm_gib": float(unit["student_peak_hbm_bytes"]) / 2**30,
-                }
-                for unit in row["feedback"]["task_units"]
-            ],
-        }
-        for row in allocations
-    ]
-
-
-def _load_warm(root: Path) -> tuple[dict[str, Any], float, int, list[dict[str, Any]]]:
-    path = root / f"warm_start-seed{SEED}"
-    _completion(path)
-    allocations = jsonl(path / "allocation/allocation.jsonl")
-    if len(allocations) != 8 or int(allocations[-1]["attempted_responses_after"]) != 512:
-        raise ValueError("warm start must contain eight task units and 512 attempted responses")
-    gpu_hours = sum(float(row["feedback"]["total_gpu_seconds"]) for row in allocations) / 3600.0
-    tokens = sum(int(row["feedback"]["valid_response_tokens"]) for row in allocations)
-    evals = [
-        _evaluation(row)
-        for row in _metric_rows(path / "metrics/eval.jsonl")
-        if "eval/mean_relative_teacher_loss" in row
-    ]
-    if len(evals) != 1:
-        raise ValueError("warm start must have exactly one final held-out evaluation")
-    return evals[0], gpu_hours, tokens, _system_trace(allocations)
-
-
-def load_run(
-    root: Path,
-    config: str,
-    warm_eval: dict[str, Any],
-    warm_gpu: float,
-    warm_tokens: int,
-    response_budget: int,
-) -> dict[str, Any]:
+def load_run(root: Path, config: str, weights: dict[str, float]) -> dict[str, Any]:
     path = root / f"{config}-seed{SEED}"
     _completion(path)
     allocations = jsonl(path / "allocation/allocation.jsonl")
-    if not allocations or [int(row["operation_index"]) for row in allocations] != list(range(len(allocations))):
-        raise ValueError(f"non-contiguous allocation log: {path}")
-    if int(allocations[0]["attempted_responses_before"]) != 512:
-        raise ValueError(f"{config} did not branch from the common post-warm response clock")
-    if int(allocations[-1]["attempted_responses_after"]) != response_budget:
-        raise ValueError(f"{config} did not reach exactly {response_budget} attempted responses")
+    if len(allocations) != 500:
+        raise ValueError(f"{config} has {len(allocations)} allocation records, expected 500")
+    for index, row in enumerate(allocations):
+        if (
+            int(row["operation_index"]) != index
+            or int(row["optimizer_updates_after"]) != index + 1
+            or int(row["attempted_responses_after"]) != (index + 1) * RESPONSES_PER_STEP
+        ):
+            raise ValueError(f"non-contiguous step/response clock in {path} at record {index}")
+    if int(allocations[-1]["attempted_responses_after"]) != RESPONSE_BUDGET:
+        raise ValueError(f"{config} did not reach exactly {RESPONSE_BUDGET} responses")
 
-    cumulative_gpu = warm_gpu
-    cumulative_tokens = warm_tokens
-    coordinates: dict[int, tuple[int, float, int]] = {}
+    evaluations = _evaluations(path, weights)
+    cumulative_gpu_hours = [0.0]
+    cumulative_tokens = [0]
     for row in allocations:
         feedback = row["feedback"]
-        cumulative_gpu += float(feedback["total_gpu_seconds"]) / 3600.0
-        cumulative_tokens += int(feedback["valid_response_tokens"])
-        coordinates[int(row["rollout_id"])] = (
-            int(row["attempted_responses_after"]),
-            cumulative_gpu,
-            cumulative_tokens,
-        )
+        wall = float(feedback["total_wall_seconds"])
+        if not np.isclose(float(feedback["total_gpu_seconds"]), 2.0 * wall, rtol=1e-6, atol=1e-6):
+            raise ValueError(f"GPU-hour accounting is not wall time x 2 in {path}")
+        cumulative_gpu_hours.append(cumulative_gpu_hours[-1] + 2.0 * wall / 3600.0)
+        cumulative_tokens.append(cumulative_tokens[-1] + int(feedback["valid_response_tokens"]))
 
-    evaluations = [
-        _evaluation(row)
-        for row in _metric_rows(path / "metrics/eval.jsonl")
-        if "eval/mean_relative_teacher_loss" in row
-    ]
-    curve = [
-        {
-            "attempted_responses": 0,
-            "gpu_hours": 0.0,
-            "valid_response_tokens": 0,
-            "mean_relative_loss": 1.0,
-            "relative_losses": {task: 1.0 for task in TASKS},
-            "raw_losses": dict(INITIAL_LOSSES),
-        },
-        {
-            "attempted_responses": 512,
-            "gpu_hours": warm_gpu,
-            "valid_response_tokens": warm_tokens,
-            **{key: warm_eval[key] for key in ("mean_relative_loss", "relative_losses", "raw_losses")},
-        },
-    ]
-    for evaluation in evaluations:
-        responses, gpu_hours, tokens = coordinates[evaluation["rollout_id"]]
+    curve = []
+    for step in STEPS:
         curve.append(
             {
-                "attempted_responses": responses,
-                "gpu_hours": gpu_hours,
-                "valid_response_tokens": tokens,
-                **{key: evaluation[key] for key in ("mean_relative_loss", "relative_losses", "raw_losses")},
+                **evaluations[step],
+                "attempted_responses": step * RESPONSES_PER_STEP,
+                "gpu_hours": cumulative_gpu_hours[step],
+                "valid_response_tokens": cumulative_tokens[step],
             }
         )
-    if curve[-1]["attempted_responses"] != response_budget:
-        raise ValueError(f"{config} is missing its final response-clock evaluation")
-
-    feedbacks = [row["feedback"] for row in allocations]
-    units = [unit for feedback in feedbacks for unit in feedback["task_units"]]
+    trace = _system_trace(allocations)
     final = curve[-1]
-    total_gpu = final["gpu_hours"]
-    probe_feedback = [feedback for feedback in feedbacks if feedback["operation"] == "probe"]
-    last_train = next((row for row in reversed(allocations) if row["operation"] == "train"), None)
-    if last_train is None:
-        raise ValueError(f"{config} contains no optimizer update")
-    final_inclusion = last_train["inclusion_probabilities"]
-    system_trace = _system_trace(allocations)
-    endpoint = {
-        "mean_relative_loss": final["mean_relative_loss"],
-        "relative_losses": final["relative_losses"],
-        "raw_losses": final["raw_losses"],
-        "attempted_responses": response_budget,
-        "gpu_hours": total_gpu,
-        "responses_per_gpu_hour": response_budget / total_gpu,
-        "tokens_per_gpu_hour": final["valid_response_tokens"] / total_gpu,
-        "peak_hbm_gib": max(
-            max(float(feedback["peak_hbm_bytes"]) / 2**30 for feedback in feedbacks),
-            max(float(feedback["teacher_peak_memory_mib"]) / 1024 for feedback in feedbacks),
-        ),
-        "switch_rate": float(np.mean([bool(unit["switched"]) for unit in units])),
-        "transfer_tail_p95_seconds": float(
-            np.percentile([float(unit["teacher_transfer_tail_seconds"]) for unit in units], 95)
-        ),
-        "operation_time_p50_seconds": float(np.percentile([row["total_step_seconds"] for row in feedbacks], 50)),
-        "operation_time_p95_seconds": float(np.percentile([row["total_step_seconds"] for row in feedbacks], 95)),
-        "probe_count": len(probe_feedback),
-        "probe_gpu_hours": sum(float(row["total_gpu_seconds"]) for row in probe_feedback) / 3600.0,
-        "max_score_age": max(max(map(int, row["score_ages_after"].values())) for row in allocations),
-        "final_train_operation_index": int(last_train["operation_index"]),
-        "final_inclusion_probabilities": final_inclusion,
-        "final_importance_multipliers": {task: 0.25 / float(final_inclusion[task]) for task in TASKS},
-        "responses_to_threshold": _interpolate(curve, "attempted_responses", THRESHOLD),
-        "gpu_hours_to_threshold": _interpolate(curve, "gpu_hours", THRESHOLD),
+    outcome = {
+        **final,
+        "objective_comparable": config not in NON_FIXED_OBJECTIVE,
+        "gpu_hours": cumulative_gpu_hours[-1],
+        "responses_per_gpu_hour": RESPONSE_BUDGET / cumulative_gpu_hours[-1],
+        "tokens_per_gpu_hour": cumulative_tokens[-1] / cumulative_gpu_hours[-1],
+        "responses_to_uniform_final": None,
+        "gpu_hours_to_uniform_final": None,
+        "step_time_p50_seconds": float(np.percentile([row["total_wall_seconds"] for row in trace], 50)),
+        "step_time_p95_seconds": float(np.percentile([row["total_wall_seconds"] for row in trace], 95)),
+        "H_median": float(np.median([row["H"] for row in trace])),
+        "fixed_to_variable_ratio_median": float(np.median([row["fixed_to_variable_ratio"] for row in trace])),
+        "truncation_rate": sum(row["truncated_responses"] for row in trace) / RESPONSE_BUDGET,
+        "invalid_rate": sum(row["invalid_responses"] for row in trace) / RESPONSE_BUDGET,
+        "peak_training_hbm_gib": max(row["student_peak_hbm_gib"] for row in trace),
+        "peak_inference_hbm_gib": max(row["inference_peak_hbm_gib"] for row in trace),
+        "final_counts": trace[-1]["counts"],
     }
-    return {
-        "path": str(path),
-        "curve": curve,
-        "endpoint": endpoint,
-        "system_trace": system_trace,
-        "final_rollout_id": int(allocations[-1]["rollout_id"]),
-    }
+    return {"path": str(path), "curve": curve, "outcome": outcome, "system_trace": trace}
 
 
-def _final_prompt_losses(run: dict[str, Any]) -> dict[str, tuple[list[str], np.ndarray]]:
-    path = Path(run["path"])
+def _artifact_for_step(path: Path, step: int) -> dict[str, Any]:
     matches = [
         row
         for row in jsonl(path / "teacher_loss_eval/index.jsonl")
-        if int(row["rollout_id"]) == int(run["final_rollout_id"])
+        if int(row["num_updates"]) == step and row["eval_phase"] == "step_clock"
     ]
     if len(matches) != 1:
-        raise ValueError(f"expected one final eval artifact index under {path}")
+        raise ValueError(f"expected one step-{step} held-out artifact index under {path}")
+    return matches[0]
+
+
+def _prompt_losses(path: Path, step: int) -> dict[str, tuple[list[str], np.ndarray]]:
+    index = _artifact_for_step(path, step)
     output = {}
     for task in TASKS:
-        records = jsonl(Path(matches[0]["datasets"][task]["path"]))
-        records.sort(key=lambda row: int(row["prompt_index"]))
-        if len(records) != 191 or [int(row["prompt_index"]) for row in records] != list(range(191)):
-            raise ValueError(f"paired bootstrap requires 191 ordered prompts for {task}: {path}")
-        prompts = [str(row["prompt"]) for row in records]
-        values = np.asarray([float(row["metadata"]["relative_teacher_loss"]) for row in records], dtype=np.float64)
-        output[task] = prompts, values
+        descriptor = index["datasets"][task]
+        artifact = Path(descriptor["path"])
+        if not artifact.is_file():
+            artifact = path / descriptor["run_relative_path"]
+        if sha256(artifact) != descriptor["sha256"]:
+            raise ValueError(f"held-out artifact hash mismatch: {artifact}")
+        records = sorted(jsonl(artifact), key=lambda row: int(row["prompt_index"]))
+        if len(records) != 128 or [int(row["prompt_index"]) for row in records] != list(range(128)):
+            raise ValueError(f"paired bootstrap requires 128 ordered prompts for {task}: {artifact}")
+        prompt_keys = [json.dumps(row["prompt"], ensure_ascii=False, sort_keys=True) for row in records]
+        losses = np.asarray([float(row["metadata"]["sampled_reverse_kl"]) for row in records])
+        output[task] = prompt_keys, losses
     return output
 
 
-def _paired_bootstrap(runs: dict[str, dict[str, Any]], replicates: int = 10_000) -> dict[str, Any]:
-    values = {config: _final_prompt_losses(run) for config, run in runs.items()}
-    baseline = CONFIGS[0]
-    for task in TASKS:
-        reference = values[baseline][task][0]
-        if any(values[config][task][0] != reference for config in CONFIGS[1:]):
-            raise ValueError(f"final held-out prompts are not paired for task {task}")
+def paired_bootstrap(
+    runs: dict[str, dict[str, Any]], weights: dict[str, float], replicates: int = BOOTSTRAP_REPLICATES
+) -> dict[str, Any]:
     rng = np.random.default_rng(SEED)
-    resamples = {task: rng.integers(0, 191, size=(replicates, 191)) for task in TASKS}
-    task_bootstraps = {}
-    for config in CONFIGS:
-        task_bootstraps[config] = {task: values[config][task][1][resamples[task]].mean(axis=1) for task in TASKS}
-    bootstraps = {config: sum(task_bootstraps[config].values()) / len(TASKS) for config in CONFIGS}
-    report = {"replicates": replicates, "seed": SEED, "baseline": baseline, "configs": {}}
-    for config in CONFIGS:
-        samples = bootstraps[config]
-        delta = samples - bootstraps[baseline]
-        report["configs"][config] = {
-            "mean_relative_loss_95ci": list(map(float, np.percentile(samples, [2.5, 97.5]))),
-            "paired_delta_vs_baseline": float(np.mean(delta)),
-            "paired_delta_95ci": list(map(float, np.percentile(delta, [2.5, 97.5]))),
-            "worst_task_loss_95ci": list(
-                map(
-                    float,
-                    np.percentile(
-                        np.max(np.column_stack(list(task_bootstraps[config].values())), axis=1),
-                        [2.5, 97.5],
-                    ),
-                )
-            ),
-            "tasks": {
-                task: {
-                    "relative_loss_95ci": list(map(float, np.percentile(task_bootstraps[config][task], [2.5, 97.5]))),
-                    "paired_delta_vs_baseline": float(
-                        np.mean(task_bootstraps[config][task] - task_bootstraps[baseline][task])
-                    ),
-                    "paired_delta_95ci": list(
-                        map(
-                            float,
-                            np.percentile(
-                                task_bootstraps[config][task] - task_bootstraps[baseline][task],
-                                [2.5, 97.5],
-                            ),
-                        )
-                    ),
-                }
-                for task in TASKS
-            },
+    result: dict[str, Any] = {
+        "replicates": replicates,
+        "seed": SEED,
+        "baseline": BASELINE,
+        "checkpoints": {},
+    }
+    for step in STEPS:
+        losses = {config: _prompt_losses(Path(run["path"]), step) for config, run in runs.items()}
+        resamples = {task: rng.integers(0, 128, size=(replicates, 128)) for task in TASKS}
+        for task in TASKS:
+            reference = losses[BASELINE][task][0]
+            if any(losses[config][task][0] != reference for config in CONFIGS[1:]):
+                raise ValueError(f"held-out prompts are not paired at step {step} for {task}")
+        task_samples = {
+            config: {task: losses[config][task][1][resamples[task]].mean(axis=1) for task in TASKS}
+            for config in CONFIGS
         }
-    return report
+        weighted = {config: sum(weights[task] * task_samples[config][task] for task in TASKS) for config in CONFIGS}
+        checkpoint: dict[str, Any] = {}
+        for config in CONFIGS:
+            tasks = {}
+            for task in TASKS:
+                samples = task_samples[config][task]
+                delta = samples - task_samples[BASELINE][task]
+                tasks[task] = {
+                    "loss_95ci": list(map(float, np.percentile(samples, [2.5, 97.5]))),
+                    "paired_delta_vs_uniform": float(np.mean(delta)),
+                    "paired_delta_95ci": list(map(float, np.percentile(delta, [2.5, 97.5]))),
+                }
+            item: dict[str, Any] = {"objective_comparable": config not in NON_FIXED_OBJECTIVE, "tasks": tasks}
+            if config not in NON_FIXED_OBJECTIVE:
+                delta = weighted[config] - weighted[BASELINE]
+                item.update(
+                    {
+                        "weighted_loss_95ci": list(map(float, np.percentile(weighted[config], [2.5, 97.5]))),
+                        "paired_delta_vs_uniform": float(np.mean(delta)),
+                        "paired_delta_95ci": list(map(float, np.percentile(delta, [2.5, 97.5]))),
+                    }
+                )
+            checkpoint[config] = item
+        result["checkpoints"][str(step)] = checkpoint
+    return result
 
 
-def _write_outcome_table(path: Path, outcomes: dict[str, dict[str, Any]]) -> None:
+def _write_outcomes(path: Path, outcomes: dict[str, dict[str, Any]]) -> None:
     fields = [
         "config",
-        "final_mean_relative_loss",
-        *(f"relative_loss_{task}" for task in TASKS),
-        "responses_to_threshold",
-        "gpu_hours_to_threshold",
+        "objective_comparable",
+        "final_weighted_loss",
+        *(f"final_loss_{task}" for task in TASKS),
+        "responses_to_uniform_final",
+        "gpu_hours_to_uniform_final",
         "gpu_hours",
         "responses_per_gpu_hour",
         "tokens_per_gpu_hour",
-        "peak_hbm_gib",
-        "switch_rate",
-        "transfer_tail_p95_seconds",
-        "operation_time_p50_seconds",
-        "operation_time_p95_seconds",
-        "probe_count",
-        "probe_gpu_hours",
-        "max_score_age",
+        "step_time_p50_seconds",
+        "step_time_p95_seconds",
+        "H_median",
+        "fixed_to_variable_ratio_median",
+        "truncation_rate",
+        "invalid_rate",
     ]
-    temporary = path.with_name(f".{path.name}.tmp")
-    with temporary.open("w", encoding="utf-8", newline="") as stream:
+    with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         for config in CONFIGS:
@@ -383,53 +372,61 @@ def _write_outcome_table(path: Path, outcomes: dict[str, dict[str, Any]]) -> Non
             writer.writerow(
                 {
                     "config": config,
-                    "final_mean_relative_loss": outcome["mean_relative_loss"],
-                    **{f"relative_loss_{task}": outcome["relative_losses"][task] for task in TASKS},
-                    **{field: outcome[field] for field in fields[6:]},
+                    "objective_comparable": outcome["objective_comparable"],
+                    "final_weighted_loss": "" if config in NON_FIXED_OBJECTIVE else outcome["weighted_loss"],
+                    **{f"final_loss_{task}": outcome["raw_losses"][task] for task in TASKS},
+                    **{field: outcome[field] for field in fields[7:]},
                 }
             )
-    temporary.replace(path)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    here = Path(__file__).resolve().parent
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument(
+        "--protocol",
+        type=Path,
+        default=Path(os.environ.get("MOPD_GENERATED_DIR", here.parents[1] / "local/mopd_generated")) / "protocol.json",
+    )
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--response-budget", type=int, default=64_000)
     args = parser.parse_args()
-    warm_eval, warm_gpu, warm_tokens, warm_trace = _load_warm(args.root)
-    runs = {
-        config: load_run(args.root, config, warm_eval, warm_gpu, warm_tokens, args.response_budget)
-        for config in CONFIGS
-    }
-    paired_bootstrap = _paired_bootstrap(runs)
+
+    weights, initial_losses = _protocol(args.protocol)
+    runs = {config: load_run(args.root, config, weights) for config in CONFIGS}
+    threshold = float(runs[BASELINE]["curve"][-1]["weighted_loss"])
+    for config, run in runs.items():
+        if config in NON_FIXED_OBJECTIVE:
+            continue
+        run["outcome"]["responses_to_uniform_final"] = _interpolate(run["curve"], "attempted_responses", threshold)
+        run["outcome"]["gpu_hours_to_uniform_final"] = _interpolate(run["curve"], "gpu_hours", threshold)
+
     result = {
-        "schema_version": 2,
+        "schema_version": 4,
         "seed": SEED,
-        "response_budget": args.response_budget,
         "configs": list(CONFIGS),
-        "common_threshold": THRESHOLD,
-        "warm_start": {
-            "initial_teacher_losses": dict(INITIAL_LOSSES),
-            "attempted_responses": 512,
-            "gpu_hours": warm_gpu,
-            "mean_relative_loss": warm_eval["mean_relative_loss"],
-            "system_trace": warm_trace,
-        },
+        "steps": list(STEPS),
+        "response_budget": RESPONSE_BUDGET,
+        "responses_per_step": RESPONSES_PER_STEP,
+        "target_weights": weights,
+        "initial_teacher_losses": initial_losses,
+        "common_threshold": threshold,
+        "non_fixed_objective_note": (
+            "StdMOPD, D3-MOPD, and Open-MOPD change the training objective; compare per-task loss and "
+            "capability, not fixed-objective threshold efficiency."
+        ),
         "curves": {config: run["curve"] for config, run in runs.items()},
-        "outcomes": {config: run["endpoint"] for config, run in runs.items()},
-        "system_traces": {
-            "warm_start": warm_trace,
-            **{config: run["system_trace"] for config, run in runs.items()},
-        },
-        "paired_bootstrap": paired_bootstrap,
+        "outcomes": {config: run["outcome"] for config, run in runs.items()},
+        "system_traces": {config: run["system_trace"] for config, run in runs.items()},
+        "mechanism_summary": {config: _mechanism_summary(run["system_trace"]) for config, run in runs.items()},
+        "paired_bootstrap": paired_bootstrap(runs, weights),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    outcome_table = args.output.with_name("mopd_outcomes.csv")
-    _write_outcome_table(outcome_table, result["outcomes"])
-    result["outcome_table_csv"] = str(outcome_table.resolve())
+    table = args.output.with_name("mopd_outcomes.csv")
+    _write_outcomes(table, result["outcomes"])
+    result["outcome_table_csv"] = str(table.resolve())
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"MOPD v2 report written to {args.output}")
+    print(f"MOPD protocol-v4 report written to {args.output}")
 
 
 if __name__ == "__main__":
