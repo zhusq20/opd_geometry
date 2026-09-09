@@ -228,7 +228,12 @@ class Dataset:
         seed=42,
         apply_chat_template=False,
         apply_chat_template_kwargs=None,
+        chat_template_suffix_to_remove=None,
     ):
+        if chat_template_suffix_to_remove is not None and not isinstance(chat_template_suffix_to_remove, str):
+            raise TypeError("chat_template_suffix_to_remove must be a string or None")
+        if chat_template_suffix_to_remove and not apply_chat_template:
+            raise ValueError("chat_template_suffix_to_remove requires apply_chat_template=True")
         origin_samples = []
         for data in read_file(path):
             # Both chat templates and multimodal inputs require conversation format (list of message dicts)
@@ -254,6 +259,13 @@ class Dataset:
                     add_generation_prompt=True,
                     **(apply_chat_template_kwargs or {}),
                 )
+                if chat_template_suffix_to_remove:
+                    if not output_prompt.endswith(chat_template_suffix_to_remove):
+                        raise ValueError(
+                            "Rendered chat template does not end with chat_template_suffix_to_remove; "
+                            "check the tokenizer template and rendering arguments"
+                        )
+                    output_prompt = output_prompt.removesuffix(chat_template_suffix_to_remove)
             else:
                 output_prompt = prompt
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.metadata
+import io
 import json
 import os
 import platform
@@ -134,18 +135,34 @@ def source_snapshot(repo: Path, run_dir: Path, values: list[str], name: str) -> 
     destination = run_dir / "provenance" / name
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    records = []
     with tarfile.open(temporary, "w:gz") as archive:
         for relative, path in sorted(files.items()):
-            archive.add(path, arcname=relative, recursive=False)
+            # Editors can replace or truncate source files while a job starts.
+            # Archive and hash the same captured bytes, not later file reads.
+            for _ in range(3):
+                with path.open("rb") as stream:
+                    before = os.fstat(stream.fileno())
+                    content = stream.read()
+                    after = os.fstat(stream.fileno())
+                if (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns) and len(
+                    content
+                ) == after.st_size:
+                    break
+            else:
+                raise RuntimeError(f"Source kept changing while creating its snapshot: {path}")
+            info = tarfile.TarInfo(relative)
+            info.size = len(content)
+            info.mtime = before.st_mtime
+            info.mode = before.st_mode & 0o7777
+            archive.addfile(info, io.BytesIO(content))
+            records.append({"path": relative, "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()})
     os.replace(temporary, destination)
     return {
         "path": str(destination),
         "bytes": destination.stat().st_size,
         "sha256": sha256(destination),
-        "files": [
-            {"path": relative, "bytes": path.stat().st_size, "sha256": sha256(path)}
-            for relative, path in sorted(files.items())
-        ],
+        "files": records,
     }
 
 
@@ -234,6 +251,25 @@ def selected_command_options(command: list[str]) -> dict[str, Any]:
         "eval-config",
         "eval-function-path",
         "mopd-seed",
+        "mopd-loss",
+        "mopd-topk",
+        "mopd-profile",
+        "mopd-tasks",
+        "mopd-reduction",
+        "mopd-responses-per-update",
+        "mopd-skip-task-rewards",
+        "mopd-skip-paper-measurements",
+        "rollout-max-response-len",
+        "hf-checkpoint",
+        "sglang-enable-deterministic-inference",
+        "sglang-sampling-backend",
+        "sglang-attention-backend",
+        "mopd-reference-bank",
+        "mopd-common-checkpoint",
+        "mopd-diagnostic-data",
+        "mopd-occupied-gpus",
+        "custom-loss-function-path",
+        "disable-compute-advantages-and-returns",
         "mopd-allocation",
         "mopd-total-steps",
         "mopd-microbatches-per-step",
@@ -301,13 +337,19 @@ def start(args: argparse.Namespace) -> dict[str, Any]:
             "ray_dashboard_port": os.environ.get("RAY_DASHBOARD_PORT"),
             "ray_gcs_port": os.environ.get("RAY_GCS_PORT"),
             "ray_aux_port_base": os.environ.get("RAY_AUX_PORT_BASE"),
+            "nccl_p2p_disable": os.environ.get("NCCL_P2P_DISABLE"),
+            "mopd_hardware_profile": os.environ.get("MOPD_HARDWARE_PROFILE", "frozen-96gb-tp1"),
             "mopd_training_gpu": os.environ.get("MOPD_TRAIN_GPU"),
+            "mopd_training_gpus": os.environ.get("MOPD_TRAIN_GPUS", os.environ.get("MOPD_TRAIN_GPU")),
             "mopd_inference_gpu": os.environ.get("MOPD_INFERENCE_GPU"),
             "mopd_teacher_ports": {
                 task: os.environ.get(f"MOPD_TEACHER_{task.upper()}_PORT") for task in ("math", "code", "if", "science")
             },
+            "mopd_teacher_gpus": {
+                task: os.environ.get(f"MOPD_TEACHER_{task.upper()}_GPU") for task in ("math", "code", "if", "science")
+            },
             "mopd_teacher_hf_root": os.environ.get("MOPD_TEACHER_HF_ROOT"),
-            "mopd_qwen3_4b": os.environ.get("MOPD_QWEN3_4B"),
+            "mopd_student_revision": os.environ.get("MOPD_STUDENT_REVISION"),
         },
         "hardware": hardware_record(),
     }
@@ -326,6 +368,17 @@ def resume(args: argparse.Namespace) -> dict[str, Any]:
     if (run_dir / "run_complete.json").is_file():
         raise ValueError(f"completed run cannot be resumed: {run_dir}")
     manifest = json.loads(path.read_text(encoding="utf-8"))
+    previous_loss = manifest.get("protocol_cli", {}).get("mopd_loss")
+    resumed_loss = selected_command_options(args.training_command).get("mopd_loss")
+    if previous_loss != resumed_loss and (previous_loss is not None or resumed_loss is not None):
+        raise ValueError(
+            f"Cannot resume {previous_loss!r} as {resumed_loss!r}; use a new run ID for a different loss."
+        )
+    if previous_loss in {"student_topk", "topk_intersection"}:
+        previous_k = int(manifest.get("protocol_cli", {}).get("mopd_topk", 16))
+        resumed_k = int(selected_command_options(args.training_command).get("mopd_topk", 16))
+        if previous_k != resumed_k:
+            raise ValueError(f"Cannot resume student Top{previous_k} as Top{resumed_k}; use a new run ID.")
     ordinal = len(manifest.get("resume_events") or []) + 1
     event = {
         "ordinal": ordinal,

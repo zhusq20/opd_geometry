@@ -666,6 +666,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--apply-chat-template", action="store_true", default=False)
             # Temporarily be JSON-serialized str, will be a real dict after using Omegaconf
             parser.add_argument("--apply-chat-template-kwargs", type=json.loads, default="{}")
+            parser.add_argument(
+                "--chat-template-suffix-to-remove",
+                type=str,
+                default=None,
+                help=(
+                    "Remove this exact suffix from rendered chat prompts before tokenization. "
+                    "For a Qwen3 Base student, use the empty thinking block while keeping the teacher prefix. "
+                    "Requires --apply-chat-template; fails if the rendered suffix differs."
+                ),
+            )
             parser.add_argument("--input-key", type=str, default="input", help="JSON dataset key")
             parser.add_argument("--label-key", type=str, default=None, help="JSON dataset key")
             parser.add_argument(
@@ -799,6 +809,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
 
             # change the default value of eval_interval from Megatron to None
             reset_arg(parser, "--eval-interval", type=int, default=None)
+            parser.add_argument(
+                "--eval-checkpoint-step",
+                type=int,
+                default=None,
+                help="Optimizer step represented by the loaded checkpoint in evaluation-only runs.",
+            )
 
             parser.add_argument(
                 "--eval-prompt-data",
@@ -1632,8 +1648,42 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_mopd_arguments(parser):
-            group = parser.add_argument_group("Four-task micro-batch MOPD/GPAS experiment")
+            group = parser.add_argument_group("Multi-teacher OPD experiments")
             group.add_argument("--mopd-enabled", action="store_true", default=False)
+            group.add_argument("--mopd-profile", choices=["qwen3", "smollm3"], default=None)
+            group.add_argument("--mopd-tasks", type=str, default=None, help="Comma-separated active domains.")
+            group.add_argument("--mopd-domain-weights", type=str, default=None)
+            group.add_argument("--mopd-responses-per-update", type=int, default=64)
+            group.add_argument(
+                "--mopd-skip-task-rewards", action="store_true", default=False,
+                help="Skip training-only verifier observations; teacher distillation is unchanged. "
+                     "Capability evaluation still requires its verifiers.",
+            )
+            group.add_argument(
+                "--mopd-skip-paper-measurements", action="store_true", default=False,
+                help="Disable single-GPU parameter geometry snapshots; retain training metrics and model checkpoints.",
+            )
+            group.add_argument(
+                "--mopd-pg-advantage-clip",
+                type=float,
+                default=0.0,
+                help="Symmetric sampled log-ratio clip; zero disables clipping.",
+            )
+            group.add_argument(
+                "--mopd-reduction",
+                choices=["global_token", "domain_token", "domain_response"],
+                default="domain_response",
+            )
+            group.add_argument(
+                "--mopd-loss", choices=["student_topk", "topk_intersection", "teacher_topk", "sampled_reverse_kl"], default="student_topk",
+                help="student_topk: student TopK normalized advantages; topk_intersection: mask those advantages to shared teacher/student TopK IDs; teacher_topk: legacy corrected teacher Top64.",
+            )
+            group.add_argument("--mopd-topk", type=int, choices=[16, 64], default=16,
+                               help="Student-selected distillation support size; separate from rollout sampling top-k.")
+            group.add_argument("--mopd-reference-bank", type=str, default=None)
+            group.add_argument("--mopd-occupied-gpus", type=int, default=None)
+            group.add_argument("--mopd-common-checkpoint", action="store_true", default=False)
+            group.add_argument("--mopd-diagnostic-data", type=str, default=None)
             group.add_argument("--mopd-smoke-test", action="store_true", default=False)
             group.add_argument("--mopd-quick-smoke-test", action="store_true", default=False)
             group.add_argument("--mopd-heldout-variance", action="store_true", default=False)
@@ -1655,6 +1705,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "std_mopd",
                     "d3_mopd",
                     "open_mopd",
+                    "d3_fixed",
                 ],
                 default="uniform",
             )
@@ -1666,11 +1717,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             group.add_argument("--mopd-min-microbatches", type=int, default=2)
             group.add_argument("--mopd-max-microbatches", type=int, default=8)
             group.add_argument("--mopd-response-budget", type=int, default=32_000)
-            group.add_argument("--mopd-checkpoint-steps", type=str, default="50,100,150,200,250,300,350,400,450,500")
+            group.add_argument("--mopd-checkpoint-steps", type=str, default="100,200,250,300,400,500")
             group.add_argument(
                 "--mopd-eval-responses",
                 type=str,
-                default="3200,6400,9600,12800,16000,19200,22400,25600,28800,32000",
+                default="6400,12800,19200,25600,32000",
                 help="Comma-separated attempted-response milestones for held-out teacher-loss evaluation.",
             )
             group.add_argument("--mopd-failure-penalty", type=float, default=10.0)
@@ -2228,7 +2279,12 @@ def slime_validate_args(args):
 
             configure_optimizer_runtime(args)
 
-    if getattr(args, "mopd_enabled", False):
+    if getattr(args, "mopd_enabled", False) and getattr(args, "mopd_profile", None):
+        from slime_plugins.mopd.arguments import validate_paper_args
+
+        validate_paper_args(args)
+
+    if getattr(args, "mopd_enabled", False) and not getattr(args, "mopd_profile", None):
         from slime_plugins.mopd.sampler import (
             ALLOCATIONS,
             MAIN_CHECKPOINT_STEPS,
@@ -2280,15 +2336,41 @@ def slime_validate_args(args):
             raise ValueError("MOPD requires decoupled AdamW weight decay semantics.")
         if args.n_samples_per_prompt != 1:
             raise ValueError("MOPD requires one response per prompt.")
-        if not args.use_rollout_logprobs:
+        if args.mopd_loss in {"student_topk", "topk_intersection"}:
+            raise ValueError("Student TopK requires the paper profile (--mopd-profile) and its fresh-rollout pipeline.")
+        dense_loss = args.mopd_loss == "teacher_topk"
+        if dense_loss:
+            from slime_plugins.mopd.sampler import CORE_ALLOCATIONS
+
+            if args.mopd_allocation not in CORE_ALLOCATIONS:
+                raise ValueError("The two-week protocol contains only Uniform, GPAS, raw noise, and D³ fixed weights.")
+            if (
+                args.loss_type != "custom_loss"
+                or args.custom_loss_function_path != "slime_plugins.mopd.loss.teacher_topk_loss"
+            ):
+                raise ValueError("Dense MOPD requires the teacher top-64 corrected reverse-KL loss.")
+            if args.compute_advantages_and_returns or args.use_opd:
+                raise ValueError(
+                    "Dense MOPD differentiates the loss directly; disable advantages and sampled-token OPD."
+                )
+            if not args.mopd_reference_bank and not quick_smoke_test:
+                raise ValueError("Dense MOPD requires --mopd-reference-bank for the shared initial responses.")
+            if args.mopd_common_checkpoint and (
+                not args.mopd_diagnostic_data
+                or args.mopd_allocation != "uniform"
+                or args.ckpt_step != 249
+                or args.no_load_optim
+                or args.no_load_rng
+                or args.start_rollout_id != 250
+            ):
+                raise ValueError("The common-checkpoint comparison restores the complete Uniform/250 state.")
+        if not dense_loss and not args.use_rollout_logprobs:
             raise ValueError(
                 "MOPD requires --use-rollout-logprobs so sampled OPD uses the on-policy SGLang "
                 "log-probabilities without an extra actor forward pass."
             )
         token_aggregations = {"std_mopd", "d3_mopd", "open_mopd"}
-        if bool(args.calculate_per_token_loss) != (
-            not variance_probe and args.mopd_allocation in token_aggregations
-        ):
+        if bool(args.calculate_per_token_loss) != (not variance_probe and args.mopd_allocation in token_aggregations):
             raise ValueError("StdMOPD, D³-MOPD, and Open-MOPD require --calculate-per-token-loss.")
         if args.use_critic:
             raise ValueError("MOPD does not use a critic.")
@@ -2305,20 +2387,32 @@ def slime_validate_args(args):
             raise ValueError("MOPD gradient capture requires synchronous parameter gather and step.")
         if args.colocate:
             raise ValueError("MOPD reserves separate training and inference GPUs; disable --colocate.")
+        training_gpus = int(args.actor_num_nodes) * int(args.actor_num_gpus_per_node)
         if (
-            int(args.actor_num_nodes),
-            int(args.actor_num_gpus_per_node),
-            int(args.rollout_num_gpus),
-            int(args.rollout_num_gpus_per_engine),
-        ) != (1, 1, 1, 1):
-            raise ValueError("MOPD requires one training GPU and one single-GPU rollout engine.")
+            int(args.actor_num_nodes) != 1
+            or training_gpus not in {1, 2}
+            or int(args.rollout_num_gpus) != 1
+            or int(args.rollout_num_gpus_per_engine) != 1
+        ):
+            raise ValueError("MOPD requires one TP=1 or two TP=2 training GPUs and one single-GPU rollout engine.")
+        if (
+            int(args.tensor_model_parallel_size) != training_gpus
+            or int(args.pipeline_model_parallel_size) != 1
+            or int(args.context_parallel_size) != 1
+        ):
+            raise ValueError("MOPD uses one training replica: TP must equal the training GPU count, with PP=CP=1.")
         if bool(getattr(args, "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False)):
             raise ValueError("MOPD requires FP32 Adam moments; disable precision-aware optimizer state.")
-        if not args.use_opd or args.opd_type != "sglang" or not args.opd_teacher_router_config:
+        if (not dense_loss and (not args.use_opd or args.opd_type != "sglang")) or not args.opd_teacher_router_config:
             raise ValueError("MOPD requires the four resident teachers through an SGLang router.")
         if args.custom_rm_path != "slime_plugins.m2rl.opd.teacher_reward":
             raise ValueError("MOPD requires the multi-teacher reward adapter.")
-        if args.custom_reward_post_process_path != "slime_plugins.m2rl.opd.post_process_rewards":
+        expected_postprocessor = (
+            "slime_plugins.mopd.loss.post_process_rewards"
+            if dense_loss
+            else "slime_plugins.m2rl.opd.post_process_rewards"
+        )
+        if args.custom_reward_post_process_path != expected_postprocessor:
             raise ValueError("MOPD requires the teacher-logprob reward postprocessor.")
         if args.opd_task_reward_weight != 0:
             raise ValueError("MOPD is pure teacher distillation with task-reward weight zero.")
@@ -2371,6 +2465,8 @@ def slime_validate_args(args):
                 expected_steps = MAIN_STEPS
                 expected_budget = MAIN_RESPONSE_BUDGET
                 expected_checkpoints = MAIN_CHECKPOINT_STEPS
+                if dense_loss and args.mopd_allocation not in {"uniform", "gpas"}:
+                    expected_checkpoints = tuple(step for step in MAIN_CHECKPOINT_STEPS if step != 250)
                 expected_eval_responses = MAIN_EVAL_RESPONSES
             frozen_protocol = (
                 args.mopd_allocation in ALLOCATIONS
@@ -2408,7 +2504,7 @@ def slime_validate_args(args):
             if quick_smoke_test and args.eval_interval is not None:
                 raise ValueError("The quick smoke test skips held-out evaluation.")
             if not quick_smoke_test and args.eval_interval is None:
-                raise ValueError("MOPD requires held-out evaluation at step zero and every 50 steps.")
+                raise ValueError("MOPD requires the shared fixed-bank loss at step zero and every 100 steps.")
             if not args.save or not args.save_hf:
                 raise ValueError("MOPD training requires full resume checkpoints and periodic HuggingFace weights.")
         expected_response_len = QUICK_SMOKE_MAX_RESPONSE_LEN if quick_smoke_test else 4096

@@ -1,5 +1,6 @@
 import copy
 import logging
+import os
 import socket
 
 import ray
@@ -124,6 +125,20 @@ def create_placement_groups(args):
 
     logger.info(f"Creating placement group with {num_gpus} GPUs...")
     pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
+    if getattr(args, "mopd_profile", None) and os.environ.get("CUDA_VISIBLE_DEVICES"):
+        # Local paper launchers list the learner first and rollout GPU second.
+        # Ray's physical GPU IDs must follow that order before assigning roles;
+        # numeric sorting would swap the roles for e.g. CUDA_VISIBLE_DEVICES=3,1.
+        visible_order = {
+            int(device.strip()): position
+            for position, device in enumerate(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
+        }
+        ordered = sorted(
+            zip(actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids, strict=True),
+            key=lambda pair: visible_order[int(pair[1])],
+        )
+        actor_pg_reordered_bundle_indices = [bundle_index for bundle_index, _ in ordered]
+        actor_pg_reordered_gpu_ids = [gpu_id for _, gpu_id in ordered]
     rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
     rollout_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[rollout_offset:]
 

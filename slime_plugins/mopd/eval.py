@@ -1,8 +1,9 @@
-"""Paired held-out teacher loss for the fixed four-task objective."""
+"""Capability evaluation for paper profiles and legacy held-out teacher loss."""
 
 from __future__ import annotations
 
 from argparse import Namespace
+from copy import copy
 from typing import Any
 
 import numpy as np
@@ -16,6 +17,45 @@ from slime_plugins.m2rl.opd import _teacher_log_probs
 
 from .sampler import TASKS
 from .teacher_slot import score_teacher_samples
+
+
+def generate_capability_eval(
+    args: Namespace, rollout_id: int, data_source: Any, evaluation: bool = False
+) -> RolloutFnEvalOutput:
+    """Evaluate generated answers with each dataset's native task verifier."""
+    if not evaluation:
+        raise ValueError("generate_capability_eval is evaluation-only")
+    eval_args = copy(args)
+    eval_args.custom_rm_path = "slime_plugins.m2rl.rewards.reward"
+    # Capability evaluation only needs sampled answers and verifier rewards.
+    # Avoid retaining a TopK payload for every token of long eval responses.
+    eval_args.mopd_enabled = False
+    output = default_generate_rollout(eval_args, rollout_id, data_source, evaluation=True)
+    metrics = dict(output.metrics or {})
+    for name, info in output.data.items():
+        rewards = info["rewards"]
+        metrics[f"eval/capability/{name}"] = float(np.mean(rewards))
+        metrics[f"eval/capability/{name}/responses"] = len(rewards)
+        samples = info["samples"]
+        metrics[f"eval/capability/{name}/truncation_rate"] = float(
+            np.mean([sample.status == Sample.Status.TRUNCATED for sample in samples])
+        )
+        budgets = [
+            sample.metadata["generation_max_new_tokens"]
+            for sample in samples
+            if sample.metadata and "generation_max_new_tokens" in sample.metadata
+        ]
+        if budgets:
+            metrics[f"eval/capability/{name}/generation_max_new_tokens_mean"] = float(np.mean(budgets))
+            metrics[f"eval/capability/{name}/generation_max_new_tokens_min"] = min(budgets)
+        contexts = [
+            sample.metadata["generation_context_length"]
+            for sample in samples
+            if sample.metadata and "generation_context_length" in sample.metadata
+        ]
+        if contexts:
+            metrics[f"eval/capability/{name}/generation_context_length"] = max(contexts)
+    return RolloutFnEvalOutput(data=output.data, metrics=metrics)
 
 
 async def generation_only_reward(args: Namespace, sample: Sample | list[Sample], **kwargs: Any) -> float | list[float]:
@@ -112,4 +152,4 @@ def generate_teacher_loss_eval(
     return RolloutFnEvalOutput(data=output.data, metrics=metrics)
 
 
-__all__ = ["generation_only_reward", "generate_teacher_loss_eval"]
+__all__ = ["generation_only_reward", "generate_teacher_loss_eval", "generate_capability_eval"]

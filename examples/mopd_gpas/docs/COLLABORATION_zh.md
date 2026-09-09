@@ -1,15 +1,9 @@
-# 多机协作手册
+# 两周核心实验协作
 
-八个主配置互相独立，可各占一个同型 slot 并发运行；一个 slot 是一张 96GB 训练卡加一张 48GB 推理卡。用 `configs/campaign.example.yaml` 记录 owner、machine、GPU 编号和状态，配置 ID 不得重复认领。
+仅认领 `uniform-s1`、`gpas-s1`、`gpas-raw-s1`、`d3-fixed-s1` 四个 run，均 seed 42。U/G 优先；有空闲同型 slot 时并行加速已有清单。用 `configs/campaign.example.yaml` 记录 owner、machine、GPU 分配和状态。
 
-共享前置产物只有：student/base Megatron checkpoint、math/IF teacher、Qwen3-4B、训练数据、128×4 held-out、`initial_kl.json` 和由它冻结的 `protocol.json`。协调者先生成并校验这些文件，再分发同一份哈希；不存在共享 warm-start。Uniform 执行者还需回传 step 50/250/500 的完整 optimizer/controller checkpoint，供三个 scalar-only variance probe 使用。
+共享相同的 student/base Megatron、指定 teachers、数据和 v5 `protocol.json`。初始 reference bank 及其评分只创建一次；并行进程使用文件锁，跨机器执行时分发同一份 bank 和哈希。无需 initial-KL 资格测量。四域 RL teacher 的实际权重哈希必须一致。
 
-建议状态流：`pending -> running -> capability -> packaged -> complete`。执行者提交 `${CONFIG_ID}-seed42-analysis.tar.gz`，包内包含 provenance、allocation、metrics、teacher-loss artifacts 和 capability artifacts，不包含 checkpoint/W&B cache。
+Uniform 执行者保留第 250 步完整模型/优化器/数据/随机状态，供唯一的共同 checkpoint 对照。各执行者交付 0/100/200/300/400/500 fixed loss、final fresh loss、500 条 allocation logs、指定能力评估与 provenance。U/G 还交付 250 步能力结果。
 
-```bash
-bash examples/mopd_gpas/run_stage.sh train "${CONFIG_ID}"
-bash examples/mopd_gpas/run_stage.sh capability "${CONFIG_ID}"
-bash examples/mopd_gpas/run_stage.sh package "${CONFIG_ID}"
-```
-
-协调者把八个 run 目录恢复到同一个 `${MOPD_OUTPUT_ROOT}`，运行 `run_stage.sh variance all` 和 `run_stage.sh capability all`，再运行 `run_stage.sh analyze`。分析会严格检查 500-step / 32k clock、step 0–500 的 11 个 held-out 点、两 GPU wall-time 计费、128 prompt 配对关系和三个 16/16 held-out 方差交叉拟合。单种子结论的区间只表示 held-out prompt bootstrap，不表示种子间不确定性。
+恢复使用 `run_stage.sh resume RUN_ID`，不用新 run 覆盖旧输出。归档使用 `run_stage.sh package RUN_ID`；公共 reference bank 和 U/250 完整 checkpoint 另外共享。最后统一执行 `run_stage.sh analyze`，保留无收益及未达目标的结果，不新增种子或可选方法。

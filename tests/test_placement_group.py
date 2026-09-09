@@ -50,5 +50,27 @@ def test_create_zero_gpu_placement_group_is_empty():
     assert _create_placement_group(0) == (None, [], [])
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("profile", ["qwen3", "smollm3", None])
+def test_paper_roles_follow_reversed_visible_gpu_order(monkeypatch, profile):
+    from slime.ray import placement_group as module
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,1")
+    pg = object()
+    # The scheduler allocated physical GPU 3 to bundle 5 and GPU 1 to bundle 7;
+    # _create_placement_group returns those bundles sorted by physical GPU ID.
+    monkeypatch.setattr(module, "_create_placement_group", lambda count: (pg, [7, 5], [1.0, 3.0]))
+    groups = module.create_placement_groups(
+        _args(actor_num_nodes=1, actor_num_gpus_per_node=1, rollout_num_gpus=1,
+              use_critic=False, mopd_profile=profile)
+    )
+    if profile:
+        assert groups["actor"] == (pg, [5, 7], [3.0, 1.0])
+        assert groups["rollout"] == (pg, [7], [1.0])
+    else:
+        assert groups["actor"] == (pg, [7, 5], [1.0, 3.0])
+        assert groups["rollout"] == (pg, [5], [3.0])
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

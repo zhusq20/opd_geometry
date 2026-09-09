@@ -16,20 +16,17 @@ source local/mopd.env
 bash examples/mopd_gpas/run_stage.sh fetch-assets
 ```
 
-该命令下载固定 model/data bundle，并把 `Qwen/Qwen3-4B` revision `1cfa9a7208912126459214e8b04321603b3df60c` 单独下载到 `${MOPD_QWEN3_4B}`。默认本仓库路径是 `local/mopd_assets/models/qwen3-4b`。
+该命令下载固定 model/data bundle，并把 `Qwen/Qwen3-1.7B-Base` revision `ea980cb0a6c2ae4b936e82123acc929f1cec04c1` 下载到 `${MOPD_HF_CHECKPOINT}`，使用与四个 RL teacher 相同的 tokenizer 和生成配置。默认本仓库路径是 `local/mopd_assets/models/qwen3-1.7b-base`。
 
-依次生成 held-out 集、转换 math/IF teacher、实测初始 KL 并冻结协议：
+准备 Base student 和四域 RL teacher，然后生成两周核心协议：
 
 ```bash
-bash examples/mopd_gpas/run_stage.sh prepare-heldout
 bash examples/mopd_gpas/run_stage.sh convert-teachers
-CUDA_VISIBLE_DEVICES="${MOPD_INFERENCE_GPU}" \
-  bash examples/mopd_gpas/run_stage.sh measure-initial
 bash examples/mopd_gpas/run_stage.sh prepare
-bash examples/mopd_gpas/run_stage.sh preflight
+bash examples/mopd_gpas/run_stage.sh dry-run
 ```
 
-`prepare-heldout` 从每任务原始流 `[16384:16575]` 经同一 non-thinking 模板和 2048-token 长度过滤后固定前 128 条。训练只使用 `[0:16384]` 的候选；长度过滤和 seed-42 确定性洗牌后，每个任务截取恰好 16,000 条作为固定流。`measure-initial` 在 128×4 条 held-out prompt 上实测 sampled reverse KL；若最大/最小值之比大于 10，协议自动固定等权，否则固定为 inverse-initial-loss 权重。
+`prepare` 从每任务原始流 `[16384:16575]` 经 student 模板渲染、删除末尾空 thinking 块和 2048-token 长度过滤后固定前 64 条为长期 loss prompts，其余作为独立 diagnostic pool。训练只使用 `[0:16384]` 的候选；相同输入处理和 seed-42 确定性洗牌后，每个任务截取恰好 16,000 条作为固定流。teacher 对同一 response 评分时由 router 插回空 thinking 块。目标始终为四域等权，无需初始 KL 测量。请将现有环境文件中的输出目录改为 `local/mopd_no_think_generated` 和 `outputs/mopd_no_think`，重新 prepare 并从初始 Base 训练；旧 bank 和 checkpoint 不可跨前缀协议复用。完整运行步骤见[实验手册](EXPERIMENTS_zh.md)。
 
 ## 常驻 teacher
 
@@ -40,7 +37,7 @@ bash examples/mopd_gpas/run_stage.sh status-teacher
 bash examples/mopd_gpas/run_stage.sh stop-teacher
 ```
 
-四个 SGLang server 都绑定 `${MOPD_INFERENCE_GPU}`，端口默认为 31001–31004。训练过程中不做 checkpoint 热切换。student rollout engine 的静态显存比例默认 0.32；teacher 的默认比例总和为 0.56，可在 48GB 卡的正式 smoke test 后通过环境变量微调。
+四个 SGLang server 默认绑定 `${MOPD_INFERENCE_GPU}`，端口默认为 31001–31004。训练过程中不做 checkpoint 热切换。student rollout engine 的静态显存比例默认 0.32；teacher 的默认比例总和为 0.36。Teacher 使用 SGLang 原生分块 logprob 计算，默认每块 512 个位置（`TEACHER_LOGPROBS_CHUNK_SIZE`），限制 dense 全词表 logits 的临时显存及各服务保留的 allocator cache；每个位置仍使用完整词表归一化。原有 TP2 learner 和分布式 teacher 参数仍保留，使用时记录实际硬件与 GPU 占用。
 
 所有模型、数据和代码快照会写入每个 run 的 `provenance/run_manifest.json`。访问令牌只放在本机环境，不写入仓库。
 

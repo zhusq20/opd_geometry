@@ -24,6 +24,14 @@ def _jsonl(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in stream if line.strip()]
 
 
+def _allocation_path(run_dir: Path) -> Path:
+    paths = [run_dir / "allocation.jsonl", run_dir / "allocation/allocation.jsonl"]
+    existing = [path for path in paths if path.is_file()]
+    if len(existing) > 1:
+        raise ValueError(f"Ambiguous allocation logs under {run_dir}")
+    return existing[0] if existing else paths[1]
+
+
 def _atomic_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -80,14 +88,20 @@ def _checkpoint(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     return max(complete, key=lambda item: int(item[0]["attempted_responses"]))
 
 
-def inspect(run_dir: Path) -> dict[str, Any]:
+def inspect(run_dir: Path, *, protocol_path: Path | None = None) -> dict[str, Any]:
     run_dir = run_dir.resolve()
     if (run_dir / "run_complete.json").is_file():
         raise ValueError(f"Run is already complete and cannot be resumed: {run_dir}")
     entry, state = _checkpoint(run_dir)
+    if protocol_path is not None:
+        from slime_plugins.mopd.prompting import protocol_identity
+
+        if state.get("protocol_sha256") != protocol_identity(protocol_path):
+            raise ValueError("Saved MOPD prompt protocol differs; start a new run for asymmetric prefixes")
     rollout_id = int(entry["rollout_id"])
     operation_index = int(entry["operation_index"])
-    allocations = _jsonl(run_dir / "allocation/allocation.jsonl")
+    step = int(entry["optimizer_updates"])
+    allocations = _jsonl(_allocation_path(run_dir))
     if not allocations or int(allocations[-1]["operation_index"]) < operation_index:
         raise ValueError("The allocation log does not reach the selected checkpoint")
     selected = [row for row in allocations if int(row["operation_index"]) == operation_index]
@@ -102,6 +116,10 @@ def inspect(run_dir: Path) -> dict[str, Any]:
             Path(record["path"]).is_file() and _sha256(Path(record["path"])) == record["sha256"]
             for record in matching_eval[0]["datasets"].values()
         )
+    if (run_dir / "fixed_loss").is_dir():
+        eval_complete = step % 100 != 0 or (run_dir / "fixed_loss" / f"step_{step:04d}.json").is_file()
+        if step == 500:
+            eval_complete = eval_complete and (run_dir / "fixed_loss/fresh_final.json").is_file()
     metric_limits = {
         "eval.jsonl": ("eval/rollout_id", rollout_id),
         "mopd.jsonl": ("mopd/update", int(entry["optimizer_updates"])),
@@ -113,6 +131,11 @@ def inspect(run_dir: Path) -> dict[str, Any]:
         for name, (key, limit) in metric_limits.items()
     )
     eval_tail = any(int(row["rollout_id"]) > rollout_id for row in eval_rows)
+    fixed_loss_tail = any(
+        int(json.loads(path.read_text(encoding="utf-8"))["step"]) > step
+        for path in (run_dir / "fixed_loss").glob("*.json")
+    )
+    checkpoint_cost_tail = any(int(row["step"]) > step for row in _jsonl(run_dir / "checkpoint_costs.jsonl"))
     return {
         "run_dir": str(run_dir),
         "checkpoint_root": str((run_dir / "checkpoints").resolve()),
@@ -122,7 +145,13 @@ def inspect(run_dir: Path) -> dict[str, Any]:
         "attempted_responses": int(entry["attempted_responses"]),
         "optimizer_updates": int(entry["optimizer_updates"]),
         "allocation_frontier": int(allocations[-1]["operation_index"]),
-        "rewind_required": (int(allocations[-1]["operation_index"]) > operation_index or metric_tail or eval_tail),
+        "rewind_required": (
+            int(allocations[-1]["operation_index"]) > operation_index
+            or metric_tail
+            or eval_tail
+            or fixed_loss_tail
+            or checkpoint_cost_tail
+        ),
         "eval_on_start": not eval_complete,
     }
 
@@ -134,13 +163,16 @@ def _archive_mutable_state(run_dir: Path) -> Path:
     if destination.exists():
         raise FileExistsError(destination)
     candidates = [
-        run_dir / "allocation/allocation.jsonl",
+        _allocation_path(run_dir),
         run_dir / "checkpoints/mopd_checkpoint_index.json",
         run_dir / "run_failed.json",
         run_dir / "wandb_run_id.txt",
         run_dir / "provenance/run_manifest.json",
         *sorted((run_dir / "metrics").glob("*.jsonl")),
         *sorted((run_dir / "teacher_loss_eval").rglob("*")),
+        *sorted((run_dir / "fixed_loss").glob("*.json")),
+        run_dir / "fixed_loss/fresh_bank.pt",
+        run_dir / "checkpoint_costs.jsonl",
     ]
     with tarfile.open(destination, "w:gz") as archive:
         for path in candidates:
@@ -149,14 +181,14 @@ def _archive_mutable_state(run_dir: Path) -> Path:
     return destination
 
 
-def apply(run_dir: Path) -> dict[str, Any]:
-    result = inspect(run_dir)
+def apply(run_dir: Path, *, protocol_path: Path | None = None) -> dict[str, Any]:
+    result = inspect(run_dir, protocol_path=protocol_path)
     run_dir = Path(result["run_dir"])
     rollout_id = int(result["rollout_id"])
     operation_index = int(result["operation_index"])
     archive = _archive_mutable_state(run_dir)
 
-    allocation_path = run_dir / "allocation/allocation.jsonl"
+    allocation_path = _allocation_path(run_dir)
     _atomic_jsonl(
         allocation_path,
         [row for row in _jsonl(allocation_path) if int(row["operation_index"]) <= operation_index],
@@ -194,10 +226,20 @@ def apply(run_dir: Path) -> dict[str, Any]:
         if path != eval_index and str(path.resolve()) not in referenced:
             path.unlink()
 
+    step = int(result["optimizer_updates"])
+    for path in (run_dir / "fixed_loss").glob("*.json"):
+        if int(json.loads(path.read_text(encoding="utf-8"))["step"]) > step:
+            path.unlink()
+    if step < 500:
+        (run_dir / "fixed_loss/fresh_bank.pt").unlink(missing_ok=True)
+
     # A rewind starts a linked W&B run so stale post-checkpoint points cannot
     # remain mixed with the canonical resumed trajectory.
     if result["rewind_required"]:
         (run_dir / "wandb_run_id.txt").unlink(missing_ok=True)
+    costs_path = run_dir / "checkpoint_costs.jsonl"
+    if costs_path.is_file():
+        _atomic_jsonl(costs_path, [row for row in _jsonl(costs_path) if int(row["step"]) <= step])
     result["archive"] = str(archive)
     return result
 
@@ -205,9 +247,14 @@ def apply(run_dir: Path) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--protocol", type=Path, help="Require checkpoint identity to match this prompt protocol")
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
-    result = apply(args.run_dir) if args.apply else inspect(args.run_dir)
+    result = (
+        apply(args.run_dir, protocol_path=args.protocol)
+        if args.apply
+        else inspect(args.run_dir, protocol_path=args.protocol)
+    )
     print(json.dumps(result, sort_keys=True))
 
 

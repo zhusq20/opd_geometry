@@ -95,6 +95,11 @@ class MegatronTrainRayActor(TrainRayActor):
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
+        if role == "actor" and getattr(args, "mopd_profile", None):
+            from slime_plugins.mopd.paper_measurements import initialize_paper_measurements
+
+            measurement_step = args.start_rollout_id if args.start_rollout_id is not None else loaded_rollout_id + 1
+            initialize_paper_measurements(args, self.model, self.optimizer, measurement_step)
 
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
         if vpp_size > 1:
@@ -391,6 +396,65 @@ class MegatronTrainRayActor(TrainRayActor):
             self.sleep()
 
         return result
+
+    def score_mopd_bank(self, path):
+        from slime_plugins.mopd.loss import score_topk
+
+        if self.args.offload_train:
+            self.wake_up()
+        try:
+            samples = torch.load(path, map_location="cpu", weights_only=False)["samples"]
+            device = torch.cuda.current_device()
+            data = {
+                "tokens": [torch.tensor(sample["tokens"], device=device) for sample in samples],
+                "total_lengths": [len(sample["tokens"]) for sample in samples],
+                "response_lengths": [sample["response_length"] for sample in samples],
+                "loss_masks": [torch.tensor(sample["loss_mask"], device=device) for sample in samples],
+                "metadata": [sample["metadata"] for sample in samples],
+                "micro_batch_indices": [[i] for i in range(len(samples))],
+            }
+            result = forward_only(
+                score_topk,
+                self.args,
+                self.model,
+                get_data_iterator(data),
+                [len(samples)],
+                extra_batch_keys=("metadata", "loss_masks"),
+            )
+            return [float(value) for value in result["teacher_loss"]] if dist.get_rank() == 0 else None
+        finally:
+            if self.args.offload_train:
+                self.sleep()
+
+    def mopd_diagnostic(self, phase, rollout_data_ref):
+        from slime_plugins.mopd.diagnostic import restore_actor, snapshot_actor
+
+        if phase == "summary":
+            result = {
+                branch: {"trials": value["count"], "variance": value["m2"] / (value["count"] - 1)}
+                for branch, value in self.optimizer._mopd_trial_variance.items()
+            }
+            if set(result) != {"uniform", "gpas"} or any(value["trials"] != 10 for value in result.values()):
+                raise ValueError("the common-checkpoint experiment requires ten independent draws per branch")
+            return result if dist.get_rank() == 0 else None
+        if self.args.offload_train:
+            self.wake_up()
+        try:
+            if phase == "calibration":
+                self._mopd_common_state = snapshot_actor(self)
+                self.optimizer._mopd_trial_variance = {}
+            elif phase in {"uniform", "gpas"}:
+                restore_actor(self, self._mopd_common_state)
+                self.optimizer._mopd_trial_branch = phase
+            else:
+                raise ValueError(f"unknown common-checkpoint phase {phase}")
+            result = self.train_actor(249, self._get_rollout_data(rollout_data_ref))
+            if phase in {"uniform", "gpas"} and result is not None:
+                result["checkpoint_restore_verified"] = True
+            return result
+        finally:
+            if self.args.offload_train:
+                self.sleep()
 
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch):
         """Train critic and return CPU values (used as old-values for the next actor train)."""

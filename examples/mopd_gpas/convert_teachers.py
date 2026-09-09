@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert the math/IF RL experts and verify the shared pretrained 4B teacher."""
+"""Convert and verify the four Qwen3-1.7B domain-RL teachers."""
 
 from __future__ import annotations
 
@@ -33,10 +33,8 @@ def load_config(path: Path, root: Path, output_root: Path):
     text = path.read_text(encoding="utf-8")
     replacements = {
         "SLIME_ROOT": str(root),
-        "MOPD_HF_CHECKPOINT": os.environ.get("MOPD_HF_CHECKPOINT", "/workspace/dev/checkpoints/Qwen3-1.7B"),
-        "MOPD_BASE_MEGATRON": os.environ.get("MOPD_BASE_MEGATRON", "/workspace/dev/checkpoints/Qwen3-1.7B_torch_dist"),
+        "MOPD_TEACHER_BASE_HF": os.environ.get("MOPD_TEACHER_BASE_HF", "/workspace/dev/checkpoints/Qwen3-1.7B"),
         "MOPD_TEACHER_HF_ROOT": str(output_root),
-        "MOPD_QWEN3_4B": os.environ.get("MOPD_QWEN3_4B", str(root / "local/mopd_assets/models/qwen3-4b")),
     }
     for name, value in replacements.items():
         text = text.replace("${" + name + "}", value)
@@ -197,24 +195,13 @@ def verify_compatibility(base_hf: Path, teacher_hf: Path) -> None:
         if base_config.get(key) != teacher_config.get(key)
     }
     if mismatches:
-        raise ValueError(f"Teacher architecture differs from the Qwen3-1.7B student: {mismatches}")
+        raise ValueError(f"Teacher architecture differs from its Qwen3-1.7B source: {mismatches}")
     for name in TOKENIZER_FILES:
         base_path = base_hf / name
         teacher_path = teacher_hf / name
         if not base_path.is_file() or sha256(base_path) != sha256(teacher_path):
-            raise ValueError(f"Teacher tokenizer anchor differs from the student: {teacher_path}")
+            raise ValueError(f"Teacher tokenizer anchor differs from its source: {teacher_path}")
     verify_conversion_manifest(teacher_hf)
-
-
-def verify_pretrained_teacher(base_hf: Path, teacher_hf: Path) -> None:
-    if not complete_hf(teacher_hf):
-        raise FileNotFoundError(f"Incomplete pretrained teacher: {teacher_hf}")
-    config = json.loads((teacher_hf / "config.json").read_text(encoding="utf-8"))
-    if config.get("model_type") != "qwen3" or config.get("architectures") != ["Qwen3ForCausalLM"]:
-        raise ValueError(f"Expected Qwen3ForCausalLM teacher at {teacher_hf}")
-    for name in TOKENIZER_FILES:
-        if sha256(base_hf / name) != sha256(teacher_hf / name):
-            raise ValueError(f"Pretrained teacher {name} differs from the student tokenizer")
 
 
 def main() -> None:
@@ -245,10 +232,6 @@ def main() -> None:
     for task in tasks:
         item = config["teachers"][task]
         output_dir = Path(item["model_path"])
-        if item["kind"] == "pretrained_qwen3_4b":
-            verify_pretrained_teacher(base_hf, output_dir)
-            print(f"[{task}] verified pretrained Qwen3-4B {output_dir}")
-            continue
         step = int(item["step"])
         input_dir = Path(item["checkpoint_root"]) / f"iter_{step:07d}"
         if args.verify_only:

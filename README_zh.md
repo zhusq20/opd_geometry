@@ -1,5 +1,7 @@
 # slime
 
+[SmolLM3 MixSFT：PG / Top64 交集实验运行说明](examples/mopd_gpas/README_SMOLLM3_zh.md)
+
 [English](./README.md)
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://thudm.github.io/slime/)
@@ -100,7 +102,7 @@ slime 被当作 RL 基础设施来开发，因为“脚本能跑起来”远远�
 
 我们还提供了一些未在快速开始中覆盖的使用示例，请查看 [examples](examples/)。
 
-Qwen3-1.7B 四任务 exact-set MOPD/GPAS 研究（含 frozen-gradient bank、八条匹配轨迹和最终能力评测）
+Qwen3-1.7B-Base 四任务 micro-batch MOPD/GPAS 研究（含 共享 fixed-response bank、四条单种子轨迹和最终能力评测）
 位于 [`examples/mopd_gpas`](examples/mopd_gpas/README_zh.md)。
 
 ### Agentic RL 示例

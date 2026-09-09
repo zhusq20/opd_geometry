@@ -4,7 +4,7 @@
 
 ## 为什么独立运行
 
-当前主实验固定为 Qwen3-1.7B、四任务、每个 rollout 64 条 response、每个 rollout 一次 AdamW update、4096 response cap，并通过 SGLang teacher endpoint 只取得 sampled-token log-prob。论文完整系统改动了 student、任务数、数据、response cap、batch size、teacher 打分张量和每次 rollout 的更新次数。把它直接替换进八条主轨迹会同时改变多个控制变量，所以完整系统只作为论文复现/外部参考报告，不进入 Qwen3 四任务主表；主表中的 `open_mopd` 继续承担同协议 K=1 baseline。
+当前主实验固定为 Qwen3-1.7B-Base、四任务、每个 rollout 64 条 response、每个 rollout 一次 AdamW update、4096 response cap，并通过 SGLang teacher endpoint 只取得 sampled-token log-prob。论文完整系统改动了 student、任务数、数据、response cap、batch size、teacher 打分张量和每次 rollout 的更新次数。把它直接替换进八条主轨迹会同时改变多个控制变量，所以完整系统只作为论文复现/外部参考报告，不进入 Qwen3 四任务主表；主表中的 `open_mopd` 继续承担同协议 K=1 baseline。
 
 ## 固定内容
 

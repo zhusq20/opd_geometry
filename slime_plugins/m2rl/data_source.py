@@ -280,6 +280,9 @@ class MultiTaskRolloutDataSource(DataSource):
                 tool_key=config.get("tool_key", args.tool_key),
                 apply_chat_template=config.get("apply_chat_template", args.apply_chat_template),
                 apply_chat_template_kwargs=config.get("apply_chat_template_kwargs", args.apply_chat_template_kwargs),
+                chat_template_suffix_to_remove=config.get(
+                    "chat_template_suffix_to_remove", getattr(args, "chat_template_suffix_to_remove", None)
+                ),
                 seed=shuffle_seed,
             )
             required_samples = config.get("required_samples")

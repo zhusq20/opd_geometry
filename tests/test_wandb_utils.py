@@ -102,6 +102,11 @@ def test_wandb_plot_artifact_contains_lossless_metrics_and_allocation(tmp_path, 
     allocation.write_text('{"update":0}\n')
     completion = tmp_path / "run_complete.json"
     completion.write_text('{"status":"complete"}\n')
+    paper = tmp_path / "paper"
+    paper.mkdir()
+    measurement = paper / "measurements.jsonl"
+    measurement.write_text('{"kind":"sparsity","step":1,"metrics":{"l2":0.1}}\n')
+    (paper / "checkpoint_step_0001.pt").write_bytes(b"master weights stay local")
     added = []
 
     class Artifact:
@@ -126,6 +131,8 @@ def test_wandb_plot_artifact_contains_lossless_metrics_and_allocation(tmp_path, 
     assert (str(mopd), "metrics/mopd.jsonl") in added
     assert (str(allocation), "allocation/allocation.jsonl") in added
     assert (str(completion), "run_complete.json") in added
+    assert (str(measurement), "paper/measurements.jsonl") in added
+    assert not any(str(path).endswith(".pt") for path, _name in added)
     assert added[-1][1] == "logged"
 
 
@@ -182,6 +189,7 @@ def test_real_offline_wandb_persists_id_metrics_provenance_and_completion(tmp_pa
         logging_utils.log(resumed, {"rollout/step": 1, "rollout/reward/code": 0.5}, "rollout/step")
         logging_utils.log(resumed, {"eval/step": 1, "eval/livecodebench/pass@1": 0.4}, "eval/step")
         logging_utils.log(resumed, {"mopd/update": 1, "mopd/adam_score": 0.01}, "mopd/update")
+        logging_utils.log(resumed, {"paper/step": 1, "paper/sparsity/update/l2": 0.01}, "paper/step")
         logging_utils.mark_run_complete(resumed, final_num_updates=1)
     finally:
         logging_utils.finish_tracking(resumed)
@@ -195,5 +203,6 @@ def test_real_offline_wandb_persists_id_metrics_provenance_and_completion(tmp_pa
         "mopd.jsonl",
         "rollout.jsonl",
         "train.jsonl",
+        "paper.jsonl",
     }
     assert any(path.suffix == ".wandb" for path in (tmp_path / "wandb").rglob("*"))

@@ -96,6 +96,7 @@ class OptimizerParameterView:
     optimizer_kind: str
     start: int = 0
     stop: int | None = None
+    contributes_to_norm: bool = True
 
     def _slice(self, value: torch.Tensor) -> torch.Tensor:
         return _local_tensor(value).reshape(-1)[self.start : self.stop]
@@ -140,9 +141,11 @@ def _add_view(
     kind: str,
     start: int = 0,
     stop: int | None = None,
+    include_replicated: bool = False,
 ) -> None:
     name, model_parameter, _groups = entry
-    if not _is_unique_model_parallel_parameter(model_parameter):
+    contributes = _is_unique_model_parallel_parameter(model_parameter)
+    if not contributes and not include_replicated:
         return
     output.append(
         OptimizerParameterView(
@@ -152,6 +155,7 @@ def _add_view(
             inner_optimizer=inner,
             optimizer_group=_group_for_parameter(inner, optimizer_parameter),
             optimizer_kind=kind,
+            contributes_to_norm=contributes,
             start=start,
             stop=stop,
         )
@@ -163,6 +167,7 @@ def build_optimizer_parameter_views(
     optimizer: Any,
     *,
     requested_optimizer: str,
+    include_replicated: bool = False,
 ) -> list[OptimizerParameterView]:
     """Map selected model parameters onto their real AdamW tensors/shards."""
 
@@ -187,6 +192,7 @@ def build_optimizer_parameter_views(
                     optimizer_parameter=inner.param_groups[group_id]["params"][parameter_id],
                     inner=inner,
                     kind=kind,
+                    include_replicated=include_replicated,
                     start=int(parameter_range.start),
                     stop=int(parameter_range.end),
                 )
@@ -213,6 +219,7 @@ def build_optimizer_parameter_views(
                         optimizer_parameter=optimizer_parameter,
                         inner=inner,
                         kind=kind,
+                        include_replicated=include_replicated,
                     )
         if aligned:
             continue
@@ -229,6 +236,7 @@ def build_optimizer_parameter_views(
                         optimizer_parameter=parameter,
                         inner=inner,
                         kind=kind,
+                        include_replicated=include_replicated,
                     )
 
     identities = [(id(view.model_parameter), view.start, view.stop) for view in output]

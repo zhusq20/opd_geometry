@@ -2,6 +2,8 @@
 set -euo pipefail
 
 EXAMPLE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${EXAMPLE_DIR}/_profile.sh"
+export PYTHONPATH="$(cd -- "${EXAMPLE_DIR}/../.." && pwd):${PYTHONPATH:-}"
 STAGE="${1:-}"
 TARGET="${2:-all}"
 
@@ -12,7 +14,7 @@ case "${STAGE}" in
     CUDA_VISIBLE_DEVICES="${MOPD_INFERENCE_GPU:-1}" python3 "${EXAMPLE_DIR}/measure_initial_kl.py"
     ;;
   prepare)
-    python3 "${EXAMPLE_DIR}/prepare_mopd.py"
+    python3 "${EXAMPLE_DIR}/prepare_paper.py"
     ;;
   preflight)
     python3 "${EXAMPLE_DIR}/prepare_mopd.py"
@@ -20,7 +22,19 @@ case "${STAGE}" in
     DRY_RUN=1 bash "${EXAMPLE_DIR}/run_stage.sh" dry-run
     ;;
   verify-teachers) bash "${EXAMPLE_DIR}/convert_teachers.sh" --verify-only ;;
-  convert-teachers) bash "${EXAMPLE_DIR}/convert_teachers.sh" ;;
+  convert-teachers)
+    bash "${EXAMPLE_DIR}/convert_teachers.sh" --verify-only
+    STUDENT_MEGATRON="${MOPD_BASE_MEGATRON:-/workspace/dev/checkpoints/Qwen3-1.7B-Base_torch_dist}"
+    if [[ ! -f "${STUDENT_MEGATRON}/latest_checkpointed_iteration.txt" ]]; then
+      SLIME_ROOT="$(cd -- "${EXAMPLE_DIR}/../.." && pwd)"
+      source "${SLIME_ROOT}/scripts/models/qwen3-1.7B.sh"
+      CUDA_VISIBLE_DEVICES="${MOPD_TRAIN_GPU:-0}" \
+      PYTHONPATH="${SLIME_ROOT}:${MEGATRON_PATH:-/root/Megatron-LM}${PYTHONPATH:+:${PYTHONPATH}}" \
+        python3 "${SLIME_ROOT}/tools/convert_hf_to_torch_dist.py" "${MODEL_ARGS[@]}" \
+        --hf-checkpoint "${MOPD_HF_CHECKPOINT:-/workspace/dev/checkpoints/Qwen3-1.7B-Base}" \
+        --save "${STUDENT_MEGATRON}" --bf16
+    fi
+    ;;
   start-teacher) bash "${EXAMPLE_DIR}/serve_teachers.sh" start ;;
   status-teacher) bash "${EXAMPLE_DIR}/serve_teachers.sh" status ;;
   stop-teacher) bash "${EXAMPLE_DIR}/serve_teachers.sh" stop ;;
@@ -29,12 +43,17 @@ case "${STAGE}" in
   smoke) bash "${EXAMPLE_DIR}/run_mopd.sh" gpas-smoke ;;
   train)
     if [[ "${TARGET}" == all ]]; then
-      bash "${EXAMPLE_DIR}/run_mopd_matrix.sh"
+      for config in s-pg s-tk m-pg m-tk-dr m-tk-dt m-tk-gt; do
+        bash "${EXAMPLE_DIR}/run_mopd.sh" "${config}"
+      done
     else
       bash "${EXAMPLE_DIR}/run_mopd.sh" "${TARGET}"
     fi
     ;;
-  baselines) bash "${EXAMPLE_DIR}/run_paper_baselines.sh" ;;
+  baselines)
+    for config in s-pg s-tk m-pg m-tk-dr m-tk-dt m-tk-gt; do
+      bash "${EXAMPLE_DIR}/run_mopd.sh" "${config}"
+    done ;;
   open-full-fetch)
     shift
     bash "${EXAMPLE_DIR}/open_mopd_full/fetch.sh" "$@"
@@ -49,28 +68,26 @@ case "${STAGE}" in
     ;;
   capability)
     if [[ "${TARGET}" == all ]]; then
-      bash "${EXAMPLE_DIR}/run_capability_matrix.sh"
+      bash "${EXAMPLE_DIR}/_evaluate_paper.sh" initial_student
+      for task in "${MOPD_PROFILE_TASKS[@]}"; do bash "${EXAMPLE_DIR}/_evaluate_paper.sh" "teacher_${task}"; done
     else
-      bash "${EXAMPLE_DIR}/run_capability_eval.sh" "${TARGET}"
+      bash "${EXAMPLE_DIR}/_evaluate_paper.sh" "${TARGET}"
     fi
     ;;
-  variance)
-    if [[ "${TARGET}" == all ]]; then
-      bash "${EXAMPLE_DIR}/run_heldout_variance_matrix.sh"
-    else
-      bash "${EXAMPLE_DIR}/run_heldout_variance.sh" "${TARGET}"
-    fi
+  variance|mechanism)
+    [[ "${TARGET}" == all || "${TARGET}" == 250 ]] || { echo "The core diagnostic uses only Uniform/250." >&2; exit 2; }
+    bash "${EXAMPLE_DIR}/run_common_checkpoint.sh"
     ;;
   package) bash "${EXAMPLE_DIR}/validate_and_package_run.sh" "${TARGET}" ;;
   analyze) bash "${EXAMPLE_DIR}/analyze_all.sh" ;;
   dry-run)
     export DRY_RUN=1
-    for config in uniform gpas cost_gpas raw_noise loss_gap std_mopd d3_mopd open_mopd; do
+    for config in s-pg s-tk m-pg m-tk-dr m-tk-dt m-tk-gt; do
       bash "${EXAMPLE_DIR}/run_mopd.sh" "${config}"
     done
     ;;
   *)
-    echo "Usage: $0 {fetch-assets|convert-teachers|prepare-heldout|measure-initial|prepare|preflight|start-teacher|status-teacher|stop-teacher|quick-smoke|smoke|train [CONFIG|all]|baselines|open-full-fetch [source|assets|all]|open-full-train [--dry-run|--run]|open-full-eval [--dry-run|--run]|resume CONFIG|capability [TARGET|all]|variance [50|250|500|all]|package CONFIG|analyze|dry-run}" >&2
+    echo "Usage: $0 {fetch-assets|convert-teachers|prepare|preflight|start-teacher|status-teacher|stop-teacher|train [RUN|all]|baselines|resume RUN|capability [TARGET|all]|mechanism|package RUN|analyze|dry-run}" >&2
     exit 2
     ;;
 esac

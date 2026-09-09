@@ -1,62 +1,37 @@
-schema_version: 2
-campaign_id: qwen3-1.7b-4t-microbatch-mopd-gpas-v4
+schema_version: 6
+campaign_id: qwen3-1.7b-base-4t-gpas-no-think-2026-09-06
 seed: 42
 code_revision: FILL_BEFORE_ASSIGNING_RUNS
-assets:
-  student: Qwen3-1.7B
-  qwen3_4b_repository: Qwen/Qwen3-4B
-  qwen3_4b_revision: 1cfa9a7208912126459214e8b04321603b3df60c
-  model_repo: zsqzz/mopd-gpas-64k-models
-  model_revision: 46c307ad13f274d8db7c1df949e4df8359ae6b32
-  data_repo: zsqzz/mopd-gpas-64k-data
-  data_revision: e3ead6f98b7089e0def39516cd06cf711b10b1ec
-shared_dependencies:
-  - converted math and IF teachers
-  - measured initial_kl.json
-  - frozen protocol.json and 128-prompt held-out sets
+prompt_format:
+  student_chat_template_suffix_to_remove: "<think>\n\n</think>\n\n"
+  teacher_prompt_suffix: "<think>\n\n</think>\n\n"
+objective:
+  loss: teacher_top64_corrected_reverse_kl
+  task_weights: [0.25, 0.25, 0.25, 0.25]
+  noise_ema_decay: 0.9
+  integer_candidates: 149
+teachers:
+  math: Qwen3-1.7B math RL teacher
+  if: Qwen3-1.7B IF RL teacher
+  code: Qwen3-1.7B code RL teacher
+  science: Qwen3-1.7B science RL teacher
 resources_per_run:
   training_gpus_96gb: 1
   inference_gpus_48gb: 1
 runs:
-  - id: uniform
-    owner: null
-    machine: null
-    status: pending
-    optimizer: conventional_adamw
-  - id: gpas
-    owner: null
-    machine: null
-    status: pending
-    optimizer: conventional_adamw
-  - id: cost_gpas
-    owner: null
-    machine: null
-    status: pending
-    optimizer: conventional_adamw
-  - id: raw_noise
-    owner: null
-    machine: null
-    status: pending
-    optimizer: conventional_adamw
-  - id: loss_gap
-    owner: null
-    machine: null
-    status: pending
-    optimizer: conventional_adamw
-  - id: std_mopd
-    owner: null
-    machine: null
-    status: pending
-    optimizer: conventional_adamw
-  - id: d3_mopd
-    owner: null
-    machine: null
-    status: pending
-    optimizer: conventional_adamw
-    paper_hyperparameters: arXiv:2608.24987-table-3
-  - id: open_mopd
-    owner: null
-    machine: null
-    status: pending
-    optimizer: conventional_adamw
-    paper_variant: K1-sampled-token-share-gap
+  - {id: uniform-s1, allocation: uniform, steps: 500, owner: null, status: pending}
+  - {id: gpas-s1, allocation: gpas, steps: 500, owner: null, status: pending}
+  - {id: gpas-raw-s1, allocation: raw_noise, steps: 500, owner: null, status: pending}
+  - {id: d3-fixed-s1, allocation: d3_fixed, steps: 500, owner: null, status: pending}
+common_checkpoint:
+  source: uniform-s1
+  step: 250
+  calibration_microbatches_per_task: 16
+  trials_per_branch: 10
+  branches: [uniform, gpas]
+  evaluation_prompts_per_task: 64
+budget:
+  training_responses: 128000
+  local_comparison_responses: 1792
+  longitudinal_bank_responses: 1280
+  responses_before_capability_and_retries: 131072

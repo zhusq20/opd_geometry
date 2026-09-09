@@ -1,83 +1,79 @@
-# v4 实验协议与运行手册
+# 两周核心实验协议（v6，2026-09-06 前缀修正）
 
-## 冻结协议
+本实现以相邻论文的 `EXPERIMENT_PLAN_QWEN3_1.7B_4T_MOPD_GPAS_zh.md` 为依据。完整训练仅四个 run；s1 对应整数 42。所有结果须由实际运行产生，仓库中的旧输出不属于这次实验。
 
-- student：Qwen3-1.7B，non-thinking。
-- teacher：math/IF 为同源 1.7B RL teacher；code/science 为原版 Qwen3-4B，non-thinking。
-- seed 42；500 step；每步 `G=16` 个 task micro-batch，每个 `b=4` prompt，每 prompt 一条回复；`2 <= m_i <= 8` 且 `sum_i m_i=16`。
-- 每任务独立 matched prompt stream，不重复；每任务准备 16,000 条。每步恰好 64 条 response，总预算 32,000。
-- response cap 4096；AdamW 与学习率 schedule 在八个配置间一致。论文 baseline 只引入它们的算法超参，不修改共享 student/data/response budget/optimizer，不做调参。
-- held-out 每任务固定 128 prompt，在 step 0、50、…、500 评测；方法差值使用 prompt-level paired bootstrap 1,000 次。
-- checkpoint 每 50 step 保存 Hugging Face 权重；完整 optimizer/controller/prompt cursor 状态只保留最新 resume 点，Uniform 额外永久保留 step 50/250/500。
+## 训练目标与分配
 
-## 八个配置
+学生 Qwen3-1.7B-Base，non-thinking；math/code/IF/science 分别使用对应领域的 Qwen3-1.7B RL teacher。每域冻结 16,000 条有效 prompt，使用相同域内排列且无放回消费。每个 micro-batch 为同域 4 prompts × 1 response；每步 16 个 micro-batches，计数边界 `[2,8]`，500 步共 32,000 条计划 responses。
 
-| 配置 | 分配或 loss |
-|---|---|
-| `uniform` | 每步 `[4,4,4,4]`，固定目标 |
-| `gpas` | `m_i` 按 `w_i sqrt(e_i)` 有界整数分配 |
-| `cost_gpas` | 穷举使 `(C + sum m_i tau_i) sum w_i^2 e_i/m_i` 最小 |
-| `raw_noise` | 用 raw-gradient noise 替换 AdamW-scaled noise |
-| `loss_gap` | 按固定权重乘 teacher-loss EMA 分配 |
-| `std_mopd` | `[4,4,4,4]`，整步所有有效 token 直接求均值 |
-| `d3_mopd` | D³-MOPD 的 remaining-gap × descent-velocity 动态采样，加 batch jitter；整步 token mean |
-| `open_mopd` | `[4,4,4,4]`；按当前 batch 的 token share 与 forward reward gap 重加权 |
+师生使用不同前缀。student 的 chat template 仍设置 `enable_thinking=false`，之后仅删除末尾精确字符串 `<think>\n\n</think>\n\n`，角色边界保持不变。student rollout 和 learner 前向均接收 `prompt + response`。teacher router 的每个 route 配置同一 `prompt_suffix`，在 student prompt 与 response 的 token 边界插入它，接收 `prompt + 空 thinking 块 + 同一 response`。仅按 response 相对位置取 teacher 分布；额外前缀不占 student loss 位置，response token IDs、EOS 和 top-64 目标不变。
 
-原有自适应方法首步为 Uniform；D³-MOPD 依论文在 warmup 期也启用 jitter。`e_i` 使用当前步直接估计；`tau_i`、`C` 和 loss 使用 0.9 EMA。固定目标方法先 token mean、再 response mean、再 micro-batch mean，任务聚合系数为 `w_i/m_i`，最后只执行一次普通 AdamW update 和一次全局 clipping。StdMOPD、D³-MOPD 与 Open-MOPD 会改变有效训练目标，因此只比较各任务 `L_i` 与 benchmark，不把到固定目标阈值的 GPU-hour 与其他方法并列。
+`protocol.json` schema 为 6，`prompt_format` 同时记录 `student_chat_template_suffix_to_remove` 与 `teacher_prompt_suffix`。训练 manifest 保留 version 4，并新增相同声明。预渲染的 heldout/diagnostic prompts 已完成删除，对应数据配置将 `chat_template_suffix_to_remove` 显式设为 null，避免重复处理。能力评测的学生输入遵循相同规则；教师能力评测覆盖此配置为 null，以保留其空 thinking 块。
 
-### 论文 baseline 忠实性边界
+每个 response 先对有效位置平均，再对 responses 平均。每位置 loss 为 teacher top-64 上的 `sum[p*(log p-log q)-p+q]`；p/q 均保留完整词表归一化，保留 `-p` 的梯度。SGLang 返回 teacher 的 `input_top_logprobs`；learner 从完整 logits 中提取相同 token IDs。截断 response 保留有效 token。缺失或无效的 dense teacher targets 会使本次执行失败，不以 sampled-token loss 或虚构 penalty 替代；恢复和失败记录由 provenance 保留。
 
-- D³-MOPD 使用论文 Table 3：`n=10, W=10, R=3, S0=5, EMA window=10, epsilon_KL=0.15, T=0.5, epsilon=0.10, eta=0.30`。watcher 在 controller 的同一 rollout frontier 同步计算，与论文异步 status-file 版在数学上等价，且可随 checkpoint 原子恢复。论文概率经 jitter 后，再投影到本主协议共享的 `[2,8]` 计数边界；这是为了不突破每任务 16k 非重复 prompt stream。
-- Open-MOPD 使用论文 Eq. 8/9 与 Table 8：四任务等目标 `g*=1/4`、`alpha=1.0`、forward gap factor clip `[0.05,20]`，`m_d` 是当前 batch 的每 token 绝对 sampled-OPD reward magnitude，并保证 `sum_d w_d s_d^tok=1`。主协议每 rollout 只有一次 optimizer update，所以论文明示的 K=1 情形下 reward refresh 为 identity。这是可公平接入当前 sampled-token OPD 的 MVP baseline，不是论文 SmolLM3-3B、K=4、dense student-top-k=16 整套系统的 bitwise reproduction。
+| Run ID | 分配统计 | 梯度汇总 |
+|---|---|---|
+| `uniform-s1` | `(4,4,4,4)` | `sum_i (1/4)*mean_s(g_i,s)` |
+| `gpas-s1` | 更新前 bias-corrected Adam 二阶矩定义 D；Welford 估计噪声 | 同上 |
+| `gpas-raw-s1` | 统计使用 D=I，优化器仍为 AdamW | 同上 |
+| `d3-fixed-s1` | remaining gap × descent velocity | 同上 |
 
-### 完整 Open-MOPD 外部参考
+G/R 首步 Uniform、D=I，噪声 EMA decay=0.9，首个观测直接初始化。下一步读取已完成步骤的 EMA。穷举 149 个计数向量，最小化 `sum(w_i²*e_i/m_i)`；并列优先最近 Uniform，再按 math/code/if/science 字典序。U/H 不采集 micro-batch 噪声。G/R 的统计耗时和内存计入自己的运行成本。
 
-`examples/mopd_gpas/open_mopd_full/` 另外提供论文 final-stage 的完整复现通道。该通道固定官方 commit 和公开资产，恢复三领域 hard routing、batch 1024 / minibatch 256 的 K=4、student top-k=16 dense reward、1/3 token-share target、forward gap-following 与每个 inner update 的 reward refresh。由于它同时改用 SmolLM3-3B、三任务公开数据、16K/2K response cap 和 1x8 GPU，因此只单列为 paper-protocol reference，不作为第九条主协议曲线，也不参与 32,000-response 同预算排名。完整配置和命令见 [`../open_mopd_full/README_zh.md`](../open_mopd_full/README_zh.md)。
+D³ 保留固定实现的 first-5 initial loss、EMA window 10、W=10、最多 3 个窗口、每 10 步更新、KL floor 0.15、max-normalization、temperature 0.5、probability floor 0.10、jitter 0.30。warmup 也使用 jitter，最早在第 20 个观测后更新调度信号；概率通过最小化 `sum(m_i-16*p_i)²` 投影到相同的 149 个向量。版本记为 `d3-table3-synchronous-v1-integer-projection`，方法名为 **D³ signal, fixed weights**。
 
-## 命令
+AdamW 配方沿用已有 lr=2.5e-7、betas=(0.9,0.98)、eps=1e-8、constant schedule、weight decay=0、全局 clipping=1。每批仅做一次更新，之后同步学生权重。
 
-```bash
-source local/mopd.env
-bash examples/mopd_gpas/run_stage.sh start-teacher
-bash examples/mopd_gpas/run_stage.sh smoke
-bash examples/mopd_gpas/run_stage.sh train gpas
-```
+## 固定 loss 和能力评估
 
-可用配置就是上表八项。只运行新增论文 baseline：
+`prepare` 生成等权 `train.yaml`、每域 64 prompts 的 `teacher_loss_eval.yaml`、独立 `diagnostic.yaml` 和 `protocol.json`。无需 `initial_kl.json`。旧 v3 训练 manifest 不能用于 dense 新协议。
 
-```bash
-bash examples/mopd_gpas/run_stage.sh baselines
-```
+本次默认使用 `local/mopd_no_think_generated` 与 `outputs/mopd_no_think`。现有环境文件须更新这两个目录并重新 `prepare`，从初始 Base 开始训练。旧 v5 的 bank、diagnostic prompts 和 sampler/checkpoint 状态不符合 v6，不能跨协议恢复。旧评测结果保持原始记录，分析脚本仍支持显式指定 v5 输入。
 
-中断恢复：
+训练自动创建公共 `reference_bank.pt`：初始学生生成一次 256 responses、缓存 teacher top-64；初始评分也共享一次。所有方法在 0/100/200/300/400/500 步由 learner 评分同一 bank。最终模型另生成一次 fresh bank，0 步 fresh loss 等于初始 bank loss。固定与 fresh loss 写到每个 run 的 `fixed_loss/`。
 
-```bash
-bash examples/mopd_gpas/run_stage.sh resume gpas
-```
-
-Uniform 的 held-out 梯度方差检查：
-
-```bash
-bash examples/mopd_gpas/run_stage.sh variance all
-```
-
-每个检查点、每个任务重新生成 32 个 micro-batch；16/16 两半交叉估计与评估，并报告 2/4 micro-batch 在线子集误差。artifact 只包含 raw/AdamW-scaled 范数、loss 和计时标量，不保存梯度向量；Cost-GPAS 使用 Uniform checkpoint 内的训练期 EMA `tau_i` 与 `C`，不使用 probe 自身的额外测量开销。
-
-最终能力评测与打包：
+能力评估采用 MATH-500 greedy pass@1、固定 LiveCodeBench 切片 pass@1、IFBench strict accuracy、GPQA-Diamond average@4。GPQA 先平均同题四次回答，再平均题目。仅评初始学生一次；U/G 的 250、500；R/H 的 500，合计七组学生 checkpoint。四个 Qwen3-1.7B RL teacher 各评对应域。
 
 ```bash
 bash examples/mopd_gpas/run_stage.sh capability all
-bash examples/mopd_gpas/run_stage.sh package gpas
+# 可选：只产生 math/IF/science 三域结果，沿用现有无沙箱子集。
+MOPD_CAPABILITY_SUITE=noncode bash examples/mopd_gpas/run_stage.sh capability uniform-s1
 ```
 
-`capability all` 包含四个唯一 reference 模型（初始学生、math teacher、IF teacher、code/science 共用的 Qwen3-4B）和八个最终配置。分析按任务选择对应 teacher，计算 `(s-s_init)/(s_teacher-s_init)`；teacher/student 差距小于 0.03 时在报告中标为不可靠。
+非代码子集写入 `capability_eval_noncode` / `capability_references_noncode`，不进入四域完整主表。完整 Code benchmark 沿用现有 SandboxFusion 配置；其他任务不要求 Code 沙箱。保存题目级结果，按配对题目 bootstrap；GPQA 的四次回答作为一簇。只有一个训练种子，不报告跨训练种子的标准差。
 
-八条主轨迹、三个方差 probe 和十二个唯一模型的能力结果到齐后：
+## Uniform/250 机制对照
 
 ```bash
+bash examples/mopd_gpas/run_stage.sh mechanism
+```
+
+只恢复 `uniform-s1/checkpoints/iter_0000249`（第 250 次更新后）。evaluation bank 为每域 64 个独立 diagnostic prompts；calibration 为每域 16 个 micro-batches。先固定 GPAS 计数，再分别独立生成两分支各 10 次 64 responses。每次 trial 恢复相同模型、AdamW、LR 和随机状态，rollout engine 始终保留更新前模型，更新后的模型仅评分同一 evaluation bank。
+
+用固定 pre-step D 对 clipping 前 A 的 trial 间方差做 Welford 累积，只保留每分支一个 CPU 均值 buffer。输出原始方差、G/U 方差比、逐域实际 loss 下降、非下降频率和全部 trial 点。evaluation-bank bootstrap 索引在全部 trials 中共享，trial 重采样在分支间独立。不测 evaluation 梯度、不构造方向协方差或 K 矩阵，也不选择其他 checkpoint 来替代无收益的结果。
+
+产物位于 `common-checkpoint-250/`，包括 `calibration.json`、`before.json`、20 条 `trials/*.json` 和 `common_checkpoint.json`。生成预算 1,792 responses，更新后评分 5,120 次 response forwards。
+
+## 运行、恢复与分析
+
+```bash
+bash examples/mopd_gpas/run_stage.sh prepare
+bash examples/mopd_gpas/run_stage.sh start-teacher
+bash examples/mopd_gpas/run_stage.sh dry-run
+bash examples/mopd_gpas/run_stage.sh train all
+bash examples/mopd_gpas/run_stage.sh resume gpas-s1  # 仅中断时
+bash examples/mopd_gpas/run_stage.sh capability all
+bash examples/mopd_gpas/run_stage.sh mechanism
 bash examples/mopd_gpas/run_stage.sh analyze
 ```
 
-成功条件是 `run_complete.json` 标记 500 updates、allocation log 恰好 500 行且最终 response clock 为 32,000，并存在 11 个 held-out step-clock artifact。GPU-hour 统一按完整 step wall time 乘两张分配 GPU 计算。
+`uniform`、`gpas`、`raw_noise`、`d3_fixed` 仍可作为四个 run ID 的简写。主训练保存 100/200/300/400/500 步 HF 权重，U/G 额外保存 250；完整状态保留最新恢复点与 U/250。20-step 和 1-step smoke 命令保留为手动工程调试工具，不属于核心实验清单或开跑 gate。
 
-正式运行前先用 `run_stage.sh smoke` 跑冻结的 GPAS 20-step smoke test；它在 step 10/20 存 checkpoint 并在 step 0/10/20 评测。检查单步不超过约两分钟、截断率不超过 5%、显存峰值和 `e_i` 变化；需要验证恢复时，在 step 10 后中断并执行 `run_stage.sh resume gpas-smoke`。正式八条轨迹始终使用 500-step 参数。
+默认 `analyze` 使用 `analyze_core.py`，输出原始百分比分数、算术均值、逐域及最差域相对 Uniform 的差值、fixed/fresh loss 和训练 GPU hours。达到共同目标 `F_ref,U(500)` 的成本按首次向下穿越的相邻点插值；未达标记 `unreached`，不外推。图包括固定 loss 对 steps/GPU hours、U/G 的三点能力曲线、局部机制图和 GPAS 分配/噪声轨迹。
+
+训练计时包括 rollout、teacher scoring、梯度、统计、同步和等待；checkpoint 的占用另记 `checkpoint_costs.jsonl` 并纳入分析。`--mopd-occupied-gpus` 包含实际独占的 learner、rollout 和外部 teacher GPUs；设备型号及分配由 provenance 记录。不同硬件配置须在结果中分列。评估和机制诊断独立计费，失败重算由 provenance/resume archive 单列。默认两卡设置为一张 96GB learner 加一张 48GB inference；已有 TP2/分布式 teacher 环境参数仍可使用，必须记录实际设备和成本。
+
+研究总 GPU hours 按 provenance 中各次执行的起止时间累计，包含失败重算及启动开销，排除中断后等待恢复的离线间隔。若强制退出未留下终止时间，则总成本标记为未知，保留已记录的训练、评估和诊断分项。
+
+总计划生成量为 128,000 训练 + 1,280 长期 loss banks + 1,792 局部诊断 = 131,072 responses，能力 benchmark 和重算另计。旧八配置、单任务参照、cost-aware、完整外部配方及旧多 checkpoint probe 均不进入本轮自动执行和分析。

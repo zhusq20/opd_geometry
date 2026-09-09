@@ -119,9 +119,14 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
 
 
 def _is_megatron_checkpoint(path: str | Path) -> bool:
-    return (Path(path) / "latest_checkpointed_iteration.txt").is_file() or bool(
-        re.fullmatch(r"iter_\d{7}", Path(path).name)
-    )
+    path = Path(path)
+    if (path / "latest_checkpointed_iteration.txt").is_file():
+        return True
+    # HF exports also use iter_XXXXXXX directories. Inspect their weights
+    # before using the Megatron iteration-directory naming convention.
+    if (path / "model.safetensors.index.json").is_file() or any(path.glob("*.safetensors")):
+        return False
+    return bool(re.fullmatch(r"iter_\d{7}", path.name))
 
 
 def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):

@@ -140,6 +140,19 @@ def _hf_validate_args(args, hf_config):
                 f"rotary_base {getattr(args, 'rotary_base', None)}, please check the config."
             )
 
+    if getattr(hf_config, "model_type", None) == "smollm3":
+        # HF uses 1 for a layer with RoPE; Megatron uses 1 for a layer without it.
+        hf_mask = getattr(hf_config, "no_rope_layers", None)
+        if hf_mask is None:
+            interval = int(hf_config.no_rope_layer_interval)
+            hf_mask = [int((index + 1) % interval != 0) for index in range(hf_config.num_hidden_layers)]
+        expected = [1 - int(value) for value in hf_mask]
+        observed = getattr(args, "no_rope_freq", None)
+        if isinstance(observed, int):
+            observed = [int((index + 1) % observed == 0) for index in range(hf_config.num_hidden_layers)]
+        if observed != expected:
+            errors.append(f"SmolLM3 no-RoPE layers differ: expected {expected}, got {observed}")
+
     if len(errors) > 0:
         raise AssertionError("hf_validate_args failed: " + "; ".join(errors))
 

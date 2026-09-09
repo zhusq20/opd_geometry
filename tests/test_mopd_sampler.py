@@ -120,6 +120,63 @@ def test_training_source_truncates_each_seeded_stream_to_16000(tmp_path, monkeyp
         assert source.dataset.origin_samples is source.dataset.samples
 
 
+@pytest.mark.parametrize("saved_identity", [None, "previous-prefix-protocol"])
+@pytest.mark.parametrize("common_checkpoint", [False, True])
+def test_sampler_rejects_resume_from_another_prompt_protocol(tmp_path, saved_identity, common_checkpoint):
+    source = object.__new__(MOPDRolloutDataSource)
+    source.args = SimpleNamespace(
+        load=str(tmp_path), start_rollout_id=1, mopd_common_checkpoint=common_checkpoint
+    )
+    source.protocol_sha256 = "current-prefix-protocol"
+    state = {"schema_version": source.STATE_SCHEMA_VERSION}
+    if saved_identity is not None:
+        state["protocol_sha256"] = saved_identity
+    path = source._state_path(str(tmp_path), 0)
+    path.parent.mkdir()
+    torch.save(state, path)
+
+    with pytest.raises(ValueError, match="prompt protocol differs"):
+        source.load(0)
+
+
+def test_sampler_restores_a_checkpoint_with_the_same_prompt_protocol(tmp_path):
+    source = object.__new__(MOPDRolloutDataSource)
+    source.args = SimpleNamespace(save=str(tmp_path), load=str(tmp_path), start_rollout_id=1, rollout_shuffle=False)
+    source.protocol_sha256 = "current-prefix-protocol"
+    source.sources = [
+        SimpleNamespace(config={"name": task}, dataset=[0, 1], offset=1, epoch=0) for task in TASKS
+    ]
+    source.controller = MOPDController()
+    source.sample_group_index = 4
+    source.sample_index = 4
+    source.allocation_log = tmp_path / "allocation.jsonl"
+    source.save(0)
+    source.sample_index = 0
+    for stream in source.sources:
+        stream.offset = 0
+
+    source.load(0)
+
+    assert source.sample_index == source.sample_group_index == 4
+    assert all(stream.offset == 1 for stream in source.sources)
+
+
+def test_sampler_checks_legacy_dense_manifest_before_loading_datasets(tmp_path, monkeypatch):
+    protocol = tmp_path / "protocol.json"
+    protocol.write_text(json.dumps({"schema_version": 5}))
+    manifest = tmp_path / "train.json"
+    manifest.write_text(json.dumps({"version": 4, "protocol": PROTOCOL, "sources": _sources()}))
+    args = SimpleNamespace(
+        mopd_loss="teacher_topk", experiment_data_index=str(protocol), prompt_data=str(manifest)
+    )
+    monkeypatch.setattr(
+        MultiTaskRolloutDataSource, "__init__", lambda *_args: pytest.fail("legacy dataset was loaded")
+    )
+
+    with pytest.raises(ValueError, match="Regenerate"):
+        MOPDRolloutDataSource(args)
+
+
 def test_variance_manifest_freezes_128_heldout_prompts_per_task():
     manifest = {"version": 3, "protocol": VARIANCE_PROTOCOL, "sampling": {"repeat": False}}
     sources = _sources()
@@ -199,9 +256,9 @@ def test_variance_source_uses_uniform_checkpoint_cost_state_and_writes_scalars(t
 
 
 def test_frozen_step_and_response_clocks_match_the_plan():
-    assert MAIN_CHECKPOINT_STEPS == tuple(range(50, 501, 50))
-    assert MAIN_CHECKPOINT_RESPONSES == tuple(range(3_200, 32_001, 3_200))
-    assert MAIN_EVAL_RESPONSES == MAIN_CHECKPOINT_RESPONSES
+    assert MAIN_CHECKPOINT_STEPS == (100, 200, 250, 300, 400, 500)
+    assert MAIN_CHECKPOINT_RESPONSES == (6400, 12800, 16000, 19200, 25600, 32000)
+    assert MAIN_EVAL_RESPONSES == (6400, 12800, 19200, 25600, 32000)
     assert MAIN_RESPONSE_BUDGET == 32_000
     assert SMOKE_STEPS == 20
     assert SMOKE_CHECKPOINT_STEPS == (10, 20)
@@ -233,7 +290,7 @@ def test_cost_gpas_enumerates_the_exact_integer_minimum():
     assert tuple(observed) == expected
 
 
-@pytest.mark.parametrize("allocation", [value for value in ALLOCATIONS if value != "d3_mopd"])
+@pytest.mark.parametrize("allocation", [value for value in ALLOCATIONS if value not in {"d3_mopd", "d3_fixed"}])
 def test_every_configuration_starts_with_uniform_allocation(allocation):
     controller = MOPDController(allocation=allocation)
     plan = controller.plan(0)
@@ -313,7 +370,7 @@ def test_adaptive_rules_use_their_documented_signal(allocation, expected):
     assert second["H"] <= 2
 
 
-def test_noise_is_current_step_while_time_and_loss_are_ema_smoothed():
+def test_noise_ema_uses_completed_steps_and_initializes_from_first_observation():
     controller = MOPDController(allocation="gpas")
     first = controller.plan(0)
     controller.complete(0, _feedback(first))
@@ -327,8 +384,8 @@ def test_noise_is_current_step_while_time_and_loss_are_ema_smoothed():
             loss=(5.0, 6.0, 7.0, 8.0),
         ),
     )
-    assert list(record["scaled_noise_after"].values()) == [5.0, 6.0, 7.0, 8.0]
-    assert list(record["raw_noise_after"].values()) == [8.0, 7.0, 6.0, 5.0]
+    assert list(record["scaled_noise_after"].values()) == pytest.approx([1.4, 4.2, 8.8, 15.2])
+    assert list(record["raw_noise_after"].values()) == pytest.approx([15.2, 8.8, 4.2, 1.4])
     assert list(record["loss_ema_after"].values()) == pytest.approx([1.4, 2.4, 3.4, 4.4])
     assert list(record["task_seconds_after"].values()) == pytest.approx([1.0, 2.0, 3.0, 4.0])
     assert record["fixed_seconds_after"] == pytest.approx(8.0)
@@ -351,5 +408,51 @@ def test_pending_plan_and_completed_state_resume_exactly():
     assert next_controller.plan(2) == resumed.plan(2)
 
 
+def test_exact_integer_noise_allocation_and_probability_projection():
+    from slime_plugins.mopd.sampler import integer_allocation
+
+    candidates = list(feasible_allocations())
+    assert len(candidates) == 149
+    assert integer_allocation([0] * 4, weights=[0.25] * 4) == [4] * 4
+    for noise in ([1, 2, 7, 81], [0, 0, 0, 1], [1, 3, 2, 3]):
+        counts = integer_allocation(noise, weights=[0.25] * 4)
+        objective = lambda m: sum(e / n for e, n in zip(noise, m, strict=True))
+        assert objective(counts) == pytest.approx(min(map(objective, candidates)))
+    probabilities = [0.7, 0.1, 0.1, 0.1]
+    projected = integer_allocation(probabilities)
+    objective = lambda m: sum((n - 16 * p) ** 2 for n, p in zip(m, probabilities, strict=True))
+    assert objective(projected) == pytest.approx(min(map(objective, candidates)))
+    assert projected == [8, 2, 3, 3]
+
+
+def test_d3_fixed_uses_task_means_and_does_not_require_noise_feedback():
+    controller = MOPDController(allocation="d3_fixed")
+    for step in range(22):
+        plan = controller.plan(step)
+        assert plan["aggregation"] == "fixed_objective"
+        assert [unit["target_weight"] for unit in plan["task_units"]] == [0.25] * 4
+        feedback = _feedback(plan)
+        for unit in feedback["task_units"]:
+            unit["raw_noise"] = unit["scaled_noise"] = None
+        controller.complete(step, feedback)
+    assert controller.scaled_noise == [None] * 4
+    assert controller.d3_initial_kl == [1, 2, 3, 4]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+@pytest.mark.parametrize("tasks,microbatches", [(('math',), 16), (('math', 'code', 'if'), 12), (TASKS, 16)])
+def test_paper_profile_uses_equal_task_quotas_and_preserves_reduction_on_resume(tasks, microbatches):
+    count = microbatches // len(tasks)
+    controller = MOPDController(tasks, reduction="domain_token", microbatches_per_step=microbatches,
+                                min_microbatches=count, max_microbatches=count)
+    plan = controller.plan(0)
+    assert plan["aggregation"] == "domain_token"
+    assert plan["counts"] == dict.fromkeys(tasks, count)
+    assert plan["prompt_count"] == microbatches * 4
+    resumed = MOPDController(tasks, reduction="domain_token", microbatches_per_step=microbatches,
+                             min_microbatches=count, max_microbatches=count)
+    resumed.load_state_dict(controller.state_dict())
+    assert resumed.plan(0) == plan

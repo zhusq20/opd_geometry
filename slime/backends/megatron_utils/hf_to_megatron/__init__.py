@@ -18,6 +18,7 @@ _LOADERS = {
     "glm_moe_dsa": deepseek_hf_tensor,
     "kimi_k2": deepseek_hf_tensor,
     "llama": qwen_hf_tensor,
+    "smollm3": qwen_hf_tensor,
     "mimo": mimo_hf_tensor,
     "minimax_m2": minimax_m2_hf_tensor,
     "qwen2": qwen_hf_tensor,

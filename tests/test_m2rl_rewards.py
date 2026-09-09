@@ -167,6 +167,30 @@ def _livecodebench_sample():
     )
 
 
+@pytest.mark.parametrize(
+    "status,outcome,infrastructure,execution",
+    [("Failed", "execution_error", 0, 1), ("SandboxError", "sandbox_error", 1, 0)],
+)
+def test_unit_test_diagnostics_separate_candidate_failure_from_service_failure(
+    monkeypatch, status, outcome, infrastructure, execution
+):
+    calls = []
+    responses = [_FakeResponse(200, payload={"status": status})]
+    monkeypatch.setattr(rewards.aiohttp, "ClientSession", _fake_client_session(responses, calls))
+    monkeypatch.setattr(rewards, "validate_preflight_marker", lambda *_args: None)
+    sample = Sample(
+        response="```python\nraise ValueError('candidate failed')\n```",
+        metadata={"unit_tests": {"inputs": [""], "outputs": [""]}},
+    )
+    score = asyncio.run(rewards.code_reward(SimpleNamespace(), sample, {"url": "http://sandbox/run_code"}))
+    diagnostics = sample.metadata["sandbox_eval"]
+    assert score == 0.0
+    assert diagnostics["outcome"] == outcome
+    assert diagnostics["infrastructure_errors"] == infrastructure
+    assert diagnostics["execution_errors"] == execution
+    assert diagnostics["status_counts"] == {status.lower(): 1}
+
+
 def test_livecodebench_reward_fails_closed_without_preflight_marker():
     with pytest.raises(ValueError, match="preflight_marker"):
         asyncio.run(

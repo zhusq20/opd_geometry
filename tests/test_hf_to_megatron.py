@@ -35,6 +35,7 @@ from slime.backends.megatron_utils.megatron_to_hf.deepseekv3 import convert_deep
 from slime.backends.megatron_utils.megatron_to_hf.glm4 import convert_glm4_to_hf
 from slime.backends.megatron_utils.megatron_to_hf.glm4moe import convert_glm4moe_to_hf
 from slime.backends.megatron_utils.megatron_to_hf.mimo import convert_mimo_to_hf
+from slime.backends.megatron_utils.megatron_to_hf.llama import convert_llama_to_hf
 from slime.backends.megatron_utils.megatron_to_hf.minimax_m2 import convert_minimax_m2_to_hf
 from slime.backends.megatron_utils.megatron_to_hf.qwen2 import convert_qwen2_to_hf
 from slime.backends.megatron_utils.megatron_to_hf.qwen3_next import convert_qwen3_next_to_hf
@@ -80,6 +81,13 @@ _EXPORT_ARGS = types.SimpleNamespace(
 @pytest.mark.parametrize(
     ("loader", "exporter", "model_type", "name", "shape"),
     [
+        (
+            qwen_hf_tensor,
+            convert_llama_to_hf,
+            "smollm3",
+            "module.module.decoder.layers.3.self_attention.linear_qkv.weight",
+            (16, 8),
+        ),
         (
             qwen_hf_tensor,
             convert_qwen2_to_hf,
@@ -330,6 +338,7 @@ def test_loader_scope_stays_explicit():
         "glm_moe_dsa",
         "kimi_k2",
         "llama",
+        "smollm3",
         "mimo",
         "minimax_m2",
         "qwen2",

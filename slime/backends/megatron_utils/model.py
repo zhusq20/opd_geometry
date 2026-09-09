@@ -403,6 +403,7 @@ def forward_only(
     num_microbatches: Sequence[int],
     store_prefix: str = "",
     use_rollout_top_p_replay: bool = False,
+    extra_batch_keys: Sequence[str] = (),
 ) -> dict[str, list[torch.Tensor]]:
     """Run forward passes only and collect non-loss outputs (e.g., logprobs).
 
@@ -443,6 +444,7 @@ def forward_only(
     ]
     if use_rollout_top_p_replay:
         batch_keys = _with_rollout_top_p_token_keys(args, batch_keys)
+    batch_keys = list(dict.fromkeys([*batch_keys, *extra_batch_keys]))
 
     def forward_step(
         data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
@@ -494,6 +496,7 @@ def forward_only(
         }
         if use_rollout_top_p_replay:
             output_kwargs.update(get_rollout_top_p_logprob_kwargs(args, batch))
+        output_kwargs.update({key: batch[key] for key in extra_batch_keys})
 
         return output_tensor, partial(f, **output_kwargs)
 
@@ -960,7 +963,14 @@ def train(
         if len(set(operations)) != 1 or len(set(aggregations)) != 1:
             raise ValueError("one MOPD rollout must use one operation type and one aggregation rule")
         mopd_operation = str(operations[0])
-        begin_mopd_operation(optimizer, mopd_operation, str(aggregations[0]))
+        noise_mode = "legacy"
+        if getattr(args, "mopd_loss", None) == "teacher_topk":
+            noise_mode = {"gpas": "scaled", "raw_noise": "raw"}.get(args.mopd_allocation, "none")
+            if mopd_operation == "calibration":
+                noise_mode = "scaled"
+            elif mopd_operation == "diagnostic_trial":
+                noise_mode = "none"
+        begin_mopd_operation(optimizer, mopd_operation, str(aggregations[0]), noise_mode=noise_mode)
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
@@ -1103,10 +1113,6 @@ def train(
         _cuda_sync()
         final_optimizer_start = time.perf_counter()
         update_successful, aggregate_norm, mopd_final_feedback = finish_mopd_operation(args, optimizer)
-        _cuda_sync()
-        final_optimizer_wall, final_optimizer_gpu = _distributed_stage_seconds(
-            time.perf_counter() - final_optimizer_start
-        )
         if mopd_operation == "train" and not update_successful:
             raise RuntimeError("MOPD AdamW rejected the combined task-set update")
 
@@ -1115,6 +1121,15 @@ def train(
         # scheduler untouched.
         if mopd_operation == "train":
             opt_param_scheduler.step(increment=1)
+            measurements = getattr(optimizer, "_paper_measurements", None)
+            if measurements is not None and update_successful:
+                # The portable checkpoint must contain the LR for the next
+                # proposed step, matching the saved model/optimizer frontier.
+                measurements.after_step()
+        _cuda_sync()
+        final_optimizer_wall, final_optimizer_gpu = _distributed_stage_seconds(
+            time.perf_counter() - final_optimizer_start
+        )
 
         if args.custom_megatron_after_train_step_hook_path and mopd_operation == "train":
             from slime.utils.misc import load_function

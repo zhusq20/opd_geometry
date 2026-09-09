@@ -3,15 +3,15 @@ set -euo pipefail
 
 CONFIG_ID="${1:-}"
 case "${CONFIG_ID}" in
-  uniform|gpas|cost_gpas|raw_noise|loss_gap|std_mopd|d3_mopd|open_mopd) ;;
+  uniform-s1|gpas-s1|gpas-raw-s1|d3-fixed-s1) ;;
   *) echo "Usage: $0 CONFIG_ID" >&2; exit 2 ;;
 esac
 
 EXAMPLE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SLIME_ROOT="$(cd -- "${EXAMPLE_DIR}/../.." && pwd)"
-OUTPUT_ROOT="${MOPD_OUTPUT_ROOT:-${SLIME_ROOT}/outputs/mopd_gpas_v4}"
-PACKAGE_DIR="${MOPD_PACKAGE_DIR:-${SLIME_ROOT}/outputs/mopd_packages_v4}"
-RUN_NAME="${CONFIG_ID}-seed42"
+OUTPUT_ROOT="${MOPD_OUTPUT_ROOT:-${SLIME_ROOT}/outputs/mopd_no_think}"
+PACKAGE_DIR="${MOPD_PACKAGE_DIR:-${SLIME_ROOT}/outputs/mopd_no_think_packages}"
+RUN_NAME="${CONFIG_ID}"
 RUN_DIR="${OUTPUT_ROOT}/${RUN_NAME}"
 CAPABILITY_DIR="${RUN_DIR}/capability_eval/response_32000"
 
@@ -40,6 +40,7 @@ tar -czf "${PACKAGE_DIR}/${RUN_NAME}-analysis.tar.gz" -C "${OUTPUT_ROOT}" \
   "${RUN_NAME}/provenance" \
   "${RUN_NAME}/allocation" \
   "${RUN_NAME}/metrics" \
-  "${RUN_NAME}/teacher_loss_eval" \
+  "${RUN_NAME}/fixed_loss" \
+  "${RUN_NAME}/checkpoint_costs.jsonl" \
   "${RUN_NAME}/capability_eval"
 echo "Analysis package written to ${PACKAGE_DIR}/${RUN_NAME}-analysis.tar.gz"

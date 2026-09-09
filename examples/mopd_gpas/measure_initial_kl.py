@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure ell_i(0) on the frozen 128-prompt held-out sets and choose fixed weights."""
+"""Legacy same-prefix initial KL measurement for the 128-prompt protocol."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ def main() -> None:
     root = here.parents[1]
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--student", default=os.environ.get("MOPD_HF_CHECKPOINT", "/workspace/dev/checkpoints/Qwen3-1.7B")
+        "--student", default=os.environ.get("MOPD_HF_CHECKPOINT", "/workspace/dev/checkpoints/Qwen3-1.7B-Base")
     )
     parser.add_argument(
         "--math-teacher",
@@ -67,7 +67,13 @@ def main() -> None:
         default=os.environ.get("MOPD_TEACHER_HF_ROOT", str(root / "local/mopd_assets/models/teachers_hf")) + "/if",
     )
     parser.add_argument(
-        "--qwen3-4b", default=os.environ.get("MOPD_QWEN3_4B", str(root / "local/mopd_assets/models/qwen3-4b"))
+        "--code-teacher",
+        default=os.environ.get("MOPD_TEACHER_HF_ROOT", str(root / "local/mopd_assets/models/teachers_hf")) + "/code",
+    )
+    parser.add_argument(
+        "--science-teacher",
+        default=os.environ.get("MOPD_TEACHER_HF_ROOT", str(root / "local/mopd_assets/models/teachers_hf"))
+        + "/science",
     )
     parser.add_argument(
         "--heldout-dir",
@@ -90,13 +96,21 @@ def main() -> None:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.75)
     args = parser.parse_args()
 
+    protocol_path = args.heldout_dir.parent / "protocol.json"
+    if protocol_path.exists():
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        if protocol.get("schema_version", 0) >= 6 or "prompt_format" in protocol:
+            raise ValueError(
+                "measure-initial only supports the legacy same-prefix protocol; "
+                "asymmetric OPD uses equal task weights and builds its reference bank during training"
+            )
     if args.seed != 42 or args.max_response_len != 4_096 or args.temperature != 1.0:
         raise ValueError("the initial-KL protocol freezes seed=42, temperature=1, and max_response_len=4096")
     teacher_paths = {
         "math": str(Path(args.math_teacher).resolve()),
-        "code": str(Path(args.qwen3_4b).resolve()),
+        "code": str(Path(args.code_teacher).resolve()),
         "if": str(Path(args.if_teacher).resolve()),
-        "science": str(Path(args.qwen3_4b).resolve()),
+        "science": str(Path(args.science_teacher).resolve()),
     }
     prompts = {task: read_prompts(args.heldout_dir / f"{task}.jsonl") for task in TASKS}
 

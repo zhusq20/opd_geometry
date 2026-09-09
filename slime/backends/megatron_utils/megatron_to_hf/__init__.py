@@ -58,7 +58,7 @@ def _convert_to_hf_core(args, model_name, name, param):
         converted_named_tensors = convert_qwen3moe_to_hf(args, name, param)
     elif "qwen2" in model_name or "qwen3" in model_name:
         converted_named_tensors = convert_qwen2_to_hf(args, name, param)
-    elif "llama" in model_name:
+    elif "llama" in model_name or "smollm3" in model_name:
         converted_named_tensors = convert_llama_to_hf(args, name, param)
     elif "mimo" in model_name:
         converted_named_tensors = convert_mimo_to_hf(args, name, param)

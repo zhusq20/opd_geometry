@@ -148,6 +148,14 @@ class RayTrainGroup:
             for actor in self._actor_handlers
         ]
 
+    def score_mopd_bank(self, path):
+        values = ray.get([actor.score_mopd_bank.remote(path) for actor in self._actor_handlers])
+        return next(value for value in values if value is not None)
+
+    def mopd_diagnostic(self, phase, rollout_data_ref):
+        values = ray.get([actor.mopd_diagnostic.remote(phase, rollout_data_ref) for actor in self._actor_handlers])
+        return next(value for value in values if value is not None)
+
     def save_model(self, rollout_id, force_sync=False):
         """Save actor model"""
         ret = ray.get([actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in self._actor_handlers])

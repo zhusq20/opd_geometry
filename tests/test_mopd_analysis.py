@@ -384,5 +384,136 @@ def test_protocol_preparation_rejects_an_additional_seed(monkeypatch):
         prepare_mopd.main()
 
 
+@pytest.mark.parametrize("protocol_version", [5, 6])
+def test_core_report_uses_raw_scores_fixed_banks_and_twenty_local_updates(tmp_path, monkeypatch, protocol_version):
+    from examples.mopd_gpas import analyze_core as core
+    from slime_plugins.mopd.reference_bank import write_json
+    from slime_plugins.mopd.prompting import PROMPT_FORMAT
+    from slime_plugins.mopd.sampler import CORE_RUNS, TASKS
+
+    root = tmp_path / "runs"
+    protocol = root / "protocol.json"
+    write_json(
+        protocol,
+        {
+            "schema_version": protocol_version,
+            "prompt_format": PROMPT_FORMAT if protocol_version == 6 else None,
+            "training": {"configs": list(CORE_RUNS)},
+            "teachers": {task: {"temporary_substitute": False} for task in TASKS},
+        },
+    )
+
+    def loss_record(step, value, bank="fixed"):
+        return {
+            "step": step,
+            "bank_sha256": bank,
+            "task_losses": dict.fromkeys(TASKS, value),
+            "prompt_losses": {task: [value] * 64 for task in TASKS},
+            "weighted_loss": value,
+            "evaluation_wall_seconds": 1.0,
+        }
+
+    for index, run in enumerate(CORE_RUNS):
+        directory = root / run
+        write_json(directory / "run_complete.json", {"status": "complete", "final_num_updates": 500})
+        allocations = []
+        for step in range(1, 501):
+            allocations.append(
+                {
+                    "optimizer_updates_after": step,
+                    "attempted_responses_after": step * 64,
+                    "counts": dict.fromkeys(TASKS, 4),
+                    "scaled_noise_after": dict.fromkeys(TASKS, 1.0),
+                    "feedback": {"total_gpu_seconds": 2.0},
+                }
+            )
+        _write_jsonl(directory / "allocation/allocation.jsonl", allocations)
+        _write_jsonl(directory / "checkpoint_costs.jsonl", [{"step": 500, "wall_seconds": 5.0, "occupied_gpus": 2}])
+        for step in core.STEPS:
+            write_json(
+                directory / "fixed_loss" / f"step_{step:04d}.json",
+                loss_record(step, 1.0 - step / 1000 * (1.0 + index / 10)),
+            )
+        write_json(directory / "fixed_loss/fresh_final.json", loss_record(500, 0.4, "fresh"))
+
+    def capability(path, domains):
+        # Deliberately identical initial/teacher scores: the core table must not divide by their gap.
+        score = 0.75 if "gpas-s1" in str(path) else 0.5
+        return {
+            "domains": {
+                task: {"score": score, "prompt_indices": list(range(4)), "prompt_scores": [score] * 4}
+                for task in domains
+            }
+        }
+
+    monkeypatch.setattr(core, "evaluate", capability)
+    before = loss_record(250, 0.5, "diagnostic")
+    trials = [
+        {"branch": branch, "trial": trial, "after": loss_record(251, 0.49, "diagnostic")}
+        for branch in ("uniform", "gpas")
+        for trial in range(10)
+    ]
+    write_json(
+        root / "common-checkpoint-250/common_checkpoint.json",
+        {
+            "checkpoint_step": 250,
+            "before": before,
+            "trials": trials,
+            "counts": {"uniform": [4] * 4, "gpas": [2, 3, 5, 6]},
+            "variance_ratio": 0.8,
+            "wall_seconds": 10.0,
+            "occupied_gpus": 2,
+        },
+    )
+    report = core.analyze(root, protocol, tmp_path / "report")
+    assert report["schema_version"] == protocol_version
+    assert report["prompt_format"] == (PROMPT_FORMAT if protocol_version == 6 else None)
+    gpas = next(row for row in report["main_table"] if row["target"] == "gpas-s1")
+    assert gpas["mean_score"] == 75.0
+    assert gpas["worst_domain_delta"] == 25.0
+    assert not any("normalized" in key for key in gpas)
+    assert gpas["training_gpu_hours"] == pytest.approx(1010 / 3600)
+    assert set(report["capability_curves"]) == {"uniform-s1", "gpas-s1"}
+    assert report["mechanism_summary"]["gpas"]["domains"]["math"]["non_decrease_frequency"] == 0.0
+    assert len(list((tmp_path / "report/figures").glob("*.pdf"))) == 4
+    record = root / "gpas-s1/fixed_loss/step_0500.json"
+    write_json(record, loss_record(500, 0.3, "different-bank"))
+    with pytest.raises(ValueError, match="same fixed bank"):
+        core.analyze(root, protocol, tmp_path / "bad")
+
+
+def test_core_cost_interpolation_uses_first_downcrossing_without_extrapolation():
+    from examples.mopd_gpas.analyze_core import crossing_cost
+
+    curve = [{"gpu_hours": index, "weighted_loss": value} for index, value in enumerate([1.0, 0.7, 0.9, 0.5])]
+    assert crossing_cost(curve, 0.8) == pytest.approx(2 / 3)
+    assert crossing_cost(curve, 0.4) == "unreached"
+    assert crossing_cost(curve, 1.0) == 0
+
+
+def test_research_cost_includes_failed_execution_but_excludes_resume_downtime(tmp_path):
+    from examples.mopd_gpas.analyze_core import execution_gpu_hours
+    from slime_plugins.mopd.reference_bank import write_json
+
+    failure = tmp_path / "provenance/run_failed_before_resume_001.json"
+    write_json(failure, {"at_utc": "2026-09-04T01:00:00+00:00"})
+    write_json(
+        tmp_path / "provenance/run_manifest.json",
+        {
+            "created_at_utc": "2026-09-04T00:00:00+00:00",
+            "finished_at_utc": "2026-09-05T02:00:00+00:00",
+            "resume_events": [
+                {
+                    "at_utc": "2026-09-05T00:00:00+00:00",
+                    "previous_failure_marker": {"path": f"/original-worker/provenance/{failure.name}"},
+                }
+            ],
+        },
+    )
+    assert execution_gpu_hours(tmp_path, 2) == pytest.approx(6.0)
+    failure.unlink()
+    assert execution_gpu_hours(tmp_path, 2) is None
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

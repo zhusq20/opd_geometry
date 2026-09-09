@@ -24,12 +24,12 @@ CONFIGS = (
     "open_mopd",
 )
 NON_FIXED_OBJECTIVE = {"std_mopd", "d3_mopd", "open_mopd"}
-REFERENCES = ("initial_student", "teacher_math", "teacher_if", "teacher_qwen3_4b")
+REFERENCES = ("initial_student", "teacher_math", "teacher_code", "teacher_if", "teacher_science")
 TEACHER_BY_DOMAIN = {
     "math": "teacher_math",
-    "code": "teacher_qwen3_4b",
+    "code": "teacher_code",
     "if": "teacher_if",
-    "science": "teacher_qwen3_4b",
+    "science": "teacher_science",
 }
 DOMAINS = {
     "math": ("math500_pass1", 1, 500),

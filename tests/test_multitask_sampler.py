@@ -242,5 +242,47 @@ def test_source_required_samples_checks_post_filter_length(tmp_path, monkeypatch
         MultiTaskRolloutDataSource(_data_source_args(manifest))
 
 
+@pytest.mark.unit
+def test_student_prompt_removal_and_prerendered_source_override_match(tmp_path, monkeypatch):
+    suffix = "<think>\n\n</think>\n\n"
+    student_prompt = "<|im_start|>user\nquestion<|im_end|>\n<|im_start|>assistant\n"
+    (tmp_path / "raw.jsonl").write_text(json.dumps({"prompt": "question", "label": "answer"}) + "\n")
+    (tmp_path / "rendered.jsonl").write_text(json.dumps({"prompt": student_prompt, "label": "answer"}) + "\n")
+    manifest = tmp_path / "mixed.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "sampling": {"strategy": "round_robin", "repeat": False},
+                "sources": [
+                    {"name": "raw", "path": "raw.jsonl"},
+                    {
+                        "name": "rendered",
+                        "path": "rendered.jsonl",
+                        "apply_chat_template": False,
+                        "chat_template_suffix_to_remove": None,
+                    },
+                ],
+            }
+        )
+    )
+
+    class Tokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            assert messages == [{"role": "user", "content": "question"}]
+            assert kwargs["enable_thinking"] is False
+            return student_prompt + suffix
+
+    monkeypatch.setattr("slime_plugins.m2rl.data_source.load_tokenizer", lambda *_a, **_kw: Tokenizer())
+    monkeypatch.setattr("slime_plugins.m2rl.data_source.load_processor", lambda *_a, **_kw: None)
+    args = _data_source_args(manifest)
+    args.rollout_max_prompt_len = None
+    args.rollout_shuffle = False
+    args.apply_chat_template = True
+    args.apply_chat_template_kwargs = {"enable_thinking": False}
+    args.chat_template_suffix_to_remove = suffix
+    source = MultiTaskRolloutDataSource(args)
+    assert [s.dataset.samples[0].prompt for s in source.sources] == [student_prompt, student_prompt]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

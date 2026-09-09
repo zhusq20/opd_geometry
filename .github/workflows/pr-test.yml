@@ -703,6 +703,10 @@ jobs:
             },
             {
               "num_gpus": 0,
+              "test_file": "test_mopd_student_topk.py"
+            },
+            {
+              "num_gpus": 0,
               "test_file": "test_optimizer_factory.py"
             },
             {

@@ -8,12 +8,16 @@ teachers:
   math:
     url: http://127.0.0.1:${MOPD_TEACHER_MATH_PORT}/generate
     model_path: ${MOPD_TEACHER_HF_ROOT}/math
+    prompt_suffix: "<think>\n\n</think>\n\n"
   code:
     url: http://127.0.0.1:${MOPD_TEACHER_CODE_PORT}/generate
-    model_path: ${MOPD_QWEN3_4B}
+    model_path: ${MOPD_TEACHER_HF_ROOT}/code
+    prompt_suffix: "<think>\n\n</think>\n\n"
   if:
     url: http://127.0.0.1:${MOPD_TEACHER_IF_PORT}/generate
     model_path: ${MOPD_TEACHER_HF_ROOT}/if
+    prompt_suffix: "<think>\n\n</think>\n\n"
   science:
     url: http://127.0.0.1:${MOPD_TEACHER_SCIENCE_PORT}/generate
-    model_path: ${MOPD_QWEN3_4B}
+    model_path: ${MOPD_TEACHER_HF_ROOT}/science
+    prompt_suffix: "<think>\n\n</think>\n\n"

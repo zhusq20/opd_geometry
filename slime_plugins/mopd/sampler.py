@@ -10,6 +10,30 @@ from dataclasses import asdict, dataclass
 from typing import Any, Sequence
 
 TASKS = ("math", "code", "if", "science")
+PAPER_REDUCTIONS = ("global_token", "domain_token", "domain_response")
+
+
+def active_tasks(args: Any) -> tuple[str, ...]:
+    value = getattr(args, "mopd_tasks", None)
+    if not value:
+        return TASKS[:3] if getattr(args, "mopd_profile", None) == "smollm3" else TASKS
+    tasks = tuple(item.strip() for item in value.split(",")) if isinstance(value, str) else tuple(value)
+    if not tasks or len(set(tasks)) != len(tasks) or any(task not in TASKS for task in tasks):
+        raise ValueError(f"MOPD tasks must be a unique nonempty subset of {TASKS}")
+    return tasks
+
+
+def active_domain_weights(args: Any) -> tuple[float, ...]:
+    tasks = active_tasks(args)
+    value = getattr(args, "mopd_domain_weights", None)
+    if not value:
+        return (1.0 / len(tasks),) * len(tasks)
+    weights = tuple(map(float, value.split(",") if isinstance(value, str) else value))
+    if len(weights) != len(tasks) or any(not math.isfinite(w) or w < 0 for w in weights) or not math.isclose(sum(weights), 1.0):
+        raise ValueError("MOPD domain weights must align with active tasks and sum to one")
+    return weights
+CORE_RUNS = {"uniform-s1": "uniform", "gpas-s1": "gpas", "gpas-raw-s1": "raw_noise", "d3-fixed-s1": "d3_fixed"}
+CORE_ALLOCATIONS = tuple(CORE_RUNS.values())
 ALLOCATIONS = (
     "uniform",
     "gpas",
@@ -19,6 +43,7 @@ ALLOCATIONS = (
     "std_mopd",
     "d3_mopd",
     "open_mopd",
+    "d3_fixed",
 )
 MICROBATCHES_PER_STEP = 16
 PROMPTS_PER_MICROBATCH = 4
@@ -28,9 +53,9 @@ M_MIN = 2
 M_MAX = 8
 MAIN_STEPS = 500
 MAIN_RESPONSE_BUDGET = MAIN_STEPS * RESPONSES_PER_STEP
-MAIN_CHECKPOINT_STEPS = tuple(range(50, MAIN_STEPS + 1, 50))
+MAIN_CHECKPOINT_STEPS = (100, 200, 250, 300, 400, 500)
 MAIN_CHECKPOINT_RESPONSES = tuple(step * RESPONSES_PER_STEP for step in MAIN_CHECKPOINT_STEPS)
-MAIN_EVAL_RESPONSES = MAIN_CHECKPOINT_RESPONSES
+MAIN_EVAL_RESPONSES = tuple(step * RESPONSES_PER_STEP for step in range(100, MAIN_STEPS + 1, 100))
 SMOKE_STEPS = 20
 SMOKE_RESPONSE_BUDGET = SMOKE_STEPS * RESPONSES_PER_STEP
 SMOKE_CHECKPOINT_STEPS = (10, 20)
@@ -203,6 +228,43 @@ def feasible_allocations(
             yield counts
 
 
+def integer_allocation(
+    values: Sequence[float],
+    *,
+    weights: Sequence[float] | None = None,
+    total: int = MICROBATCHES_PER_STEP,
+    lower: int = M_MIN,
+    upper: int = M_MAX,
+) -> list[int]:
+    """Enumerate variance minimization, or squared distance to a probability target.
+
+    Equal objectives prefer squared distance to Uniform, then protocol task order.
+    """
+    values = [_finite(value, "allocation signal", 0.0) for value in values]
+    if not values:
+        raise ValueError("allocation requires at least one task")
+    if weights is not None:
+        weights = [_finite(value, "target weight", 0.0) for value in weights]
+        if len(weights) != len(values):
+            raise ValueError("noise and target weights must align")
+    elif not math.isclose(sum(values), 1.0, abs_tol=1e-10):
+        raise ValueError("allocation probabilities must sum to one")
+    uniform = total / len(values)
+
+    def key(counts):
+        objective = (
+            math.fsum(w * w * e / m for w, e, m in zip(weights, values, counts, strict=True))
+            if weights is not None
+            else math.fsum((m - total * p) ** 2 for m, p in zip(counts, values, strict=True))
+        )
+        return objective, sum((m - uniform) ** 2 for m in counts), counts
+
+    candidates = list(feasible_allocations(len(values), total=total, lower=lower, upper=upper))
+    if not candidates:
+        raise ValueError("infeasible micro-batch bounds")
+    return list(min(candidates, key=key))
+
+
 def cost_gpas_allocation(
     weights: Sequence[float],
     noise: Sequence[float],
@@ -244,12 +306,13 @@ class ControllerConfig:
     prompts_per_microbatch: int
     min_microbatches: int
     max_microbatches: int
+    reduction: str | None = None
 
 
 class MOPDController:
     """Choose one bounded four-task allocation and checkpoint its online state."""
 
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 5
 
     def __init__(
         self,
@@ -266,14 +329,17 @@ class MOPDController:
         prompts_per_microbatch: int = PROMPTS_PER_MICROBATCH,
         min_microbatches: int = M_MIN,
         max_microbatches: int = M_MAX,
+        reduction: str | None = None,
     ) -> None:
         names = tuple(map(str, task_names))
-        if names != TASKS:
+        if reduction is None and names != TASKS:
             raise ValueError(f"task order must be {TASKS}, got {names}")
-        weights = tuple(float(value) for value in (target_weights or [0.25] * len(names)))
+        if reduction is not None and (reduction not in PAPER_REDUCTIONS or not names or len(set(names)) != len(names)):
+            raise ValueError("paper MOPD requires a valid reduction and unique task names")
+        weights = tuple(float(value) for value in (target_weights or [1.0 / len(names)] * len(names)))
         if (
             len(weights) != len(names)
-            or any(value <= 0 for value in weights)
+            or any(not math.isfinite(value) or value < 0 for value in weights)
             or not math.isclose(sum(weights), 1.0, abs_tol=1e-12)
         ):
             raise ValueError("target weights must contain four positive values summing to one")
@@ -309,6 +375,7 @@ class MOPDController:
             prompts_per_microbatch=int(prompts_per_microbatch),
             min_microbatches=int(min_microbatches),
             max_microbatches=int(max_microbatches),
+            reduction=reduction,
         )
         n = len(names)
         self.scaled_noise: list[float | None] = [None] * n
@@ -373,14 +440,15 @@ class MOPDController:
         # The shared experiment freezes 2 <= m_i <= 8 so every method fits the
         # same finite, non-repeating prompt streams. This is the only projection
         # applied after the paper's probability and jitter equations.
-        counts = largest_remainder_allocation(
+        counts = integer_allocation(
             jittered,
             total=self.config.microbatches_per_step,
             lower=self.config.min_microbatches,
             upper=self.config.max_microbatches,
         )
         details = {
-            "paper": "D3-MOPD",
+            "paper": "D³ signal, fixed weights" if self.config.allocation == "d3_fixed" else "D3-MOPD",
+            "implementation_version": "d3-table3-synchronous-v1-integer-projection",
             "watcher_updated": watcher_updated,
             "watcher_step": None if self.d3_last_watcher is None else self.d3_last_watcher["watcher_step"],
             "base_probabilities": dict(zip(self.task_names, self.d3_mixture, strict=True)),
@@ -415,16 +483,14 @@ class MOPDController:
                 lower=self.config.min_microbatches,
                 upper=self.config.max_microbatches,
             )
-        if self.config.allocation == "gpas":
-            signal = self.scaled_noise
-            scores = [
-                weight * math.sqrt(max(float(value), 0.0)) for weight, value in zip(weights, signal, strict=True)
-            ]
-        elif self.config.allocation == "raw_noise":
-            signal = self.raw_noise
-            scores = [
-                weight * math.sqrt(max(float(value), 0.0)) for weight, value in zip(weights, signal, strict=True)
-            ]
+        if self.config.allocation in {"gpas", "raw_noise"}:
+            return integer_allocation(
+                self.scaled_noise if self.config.allocation == "gpas" else self.raw_noise,
+                weights=weights,
+                total=self.config.microbatches_per_step,
+                lower=self.config.min_microbatches,
+                upper=self.config.max_microbatches,
+            )
         elif self.config.allocation == "loss_gap":
             scores = [weight * max(float(value), 0.0) for weight, value in zip(weights, self.loss_ema, strict=True)]
         else:
@@ -448,7 +514,7 @@ class MOPDController:
             raise StopIteration("MOPD step budget is complete")
 
         allocation_details: dict[str, Any] | None = None
-        if self.config.allocation == "d3_mopd":
+        if self.config.allocation in {"d3_mopd", "d3_fixed"}:
             counts, allocation_details = self._d3_counts()
         else:
             counts = self._counts()
@@ -476,7 +542,7 @@ class MOPDController:
             for index, task in enumerate(self.task_names)
         ]
         prompt_count = self.config.microbatches_per_step * self.config.prompts_per_microbatch
-        if self.completed_steps == 0:
+        if any(value is None for value in self.scaled_noise):
             variance_gain = 1.0
         else:
             uniform = self._uniform_counts()
@@ -498,7 +564,7 @@ class MOPDController:
             "run_mode": "train",
             "allocation": self.config.allocation,
             "aggregation": (
-                "token_mean"
+                self.config.reduction if self.config.reduction is not None else "token_mean"
                 if self.config.allocation in {"std_mopd", "d3_mopd"}
                 else "open_mopd" if self.config.allocation == "open_mopd" else "fixed_objective"
             ),
@@ -537,8 +603,13 @@ class MOPDController:
         previous_scaled = list(self.scaled_noise)
         decay = self.config.ema_decay
         for index, unit in enumerate(units):
-            self.scaled_noise[index] = _finite(unit["scaled_noise"], "scaled_noise", 0.0)
-            self.raw_noise[index] = _finite(unit["raw_noise"], "raw_noise", 0.0)
+            for name in ("scaled_noise", "raw_noise"):
+                if unit.get(name) is not None:
+                    observed = _finite(unit[name], name, 0.0)
+                    history = getattr(self, name)
+                    history[index] = (
+                        observed if history[index] is None else decay * history[index] + (1 - decay) * observed
+                    )
             observed_seconds = _finite(unit["microbatch_seconds"], "microbatch_seconds", 0.0)
             observed_loss = _finite(unit["teacher_loss"], "teacher_loss")
             old_seconds = self.task_seconds[index]
@@ -549,7 +620,7 @@ class MOPDController:
             self.loss_ema[index] = (
                 observed_loss if old_loss is None else decay * old_loss + (1 - decay) * observed_loss
             )
-            if self.config.allocation == "d3_mopd":
+            if self.config.allocation in {"d3_mopd", "d3_fixed"}:
                 self.d3_raw_kl_history[index].append(observed_loss)
                 alpha = 2.0 / (D3_EMA_WINDOW + 1.0)
                 history = self.d3_ema_kl_history[index]
@@ -577,7 +648,7 @@ class MOPDController:
                 "fixed_seconds_after": self.fixed_seconds,
                 "d3_initial_kl_after": (
                     dict(zip(self.task_names, self.d3_initial_kl, strict=True))
-                    if self.config.allocation == "d3_mopd"
+                    if self.config.allocation in {"d3_mopd", "d3_fixed"}
                     else None
                 ),
                 "d3_ema_kl_after": (
@@ -585,7 +656,7 @@ class MOPDController:
                         task: (None if not history else history[-1])
                         for task, history in zip(self.task_names, self.d3_ema_kl_history, strict=True)
                     }
-                    if self.config.allocation == "d3_mopd"
+                    if self.config.allocation in {"d3_mopd", "d3_fixed"}
                     else None
                 ),
                 "scaled_noise_relative_change": {
@@ -624,6 +695,7 @@ class MOPDController:
         if int(state.get("schema_version", -1)) != self.SCHEMA_VERSION:
             raise ValueError("unsupported MOPD controller checkpoint schema")
         config = dict(state["config"])
+        config.setdefault("reduction", None)
         for key in ("task_names", "target_weights", "checkpoint_steps"):
             config[key] = tuple(config[key])
         if config != asdict(self.config):

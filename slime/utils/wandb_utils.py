@@ -152,22 +152,33 @@ def log_run_data_artifact(args) -> None:
     artifact = wandb.Artifact(
         name=f"{wandb.run.id}-plot-data",
         type="experiment-data",
-        description="Lossless JSONL metrics, allocation decisions, and completion metadata.",
+        description="Lossless metrics, paper measurements, allocation decisions, and completion metadata.",
     )
     added = 0
     metrics_value = getattr(args, "metrics_output_dir", None)
     if metrics_value:
         metrics = Path(os.path.expandvars(os.path.expanduser(metrics_value)))
         if metrics.is_dir():
-            for path in sorted(metrics.glob("*.jsonl")):
-                artifact.add_file(str(path), name=f"metrics/{path.name}")
+            for path in sorted(metrics.rglob("*")):
+                if not path.is_file() or path.suffix not in {".json", ".jsonl", ".csv"}:
+                    continue
+                artifact.add_file(str(path), name=f"metrics/{path.relative_to(metrics)}")
                 added += 1
     allocation_value = getattr(args, "mopd_output_dir", None)
     if allocation_value:
-        allocation = Path(os.path.expandvars(os.path.expanduser(allocation_value))) / "allocation.jsonl"
+        output_dir = Path(os.path.expandvars(os.path.expanduser(allocation_value)))
+        allocation = output_dir / "allocation.jsonl"
         if allocation.is_file():
             artifact.add_file(str(allocation), name="allocation/allocation.jsonl")
             added += 1
+        # The paper probes keep compact measurement records next to training
+        # artifacts; master-weight snapshots are deliberately separate assets.
+        for directory in (output_dir / "paper", output_dir.parent / "paper"):
+            if directory.is_dir():
+                for path in sorted(directory.rglob("*")):
+                    if path.is_file() and path.suffix in {".json", ".jsonl", ".csv"}:
+                        artifact.add_file(str(path), name=f"paper/{path.relative_to(directory)}")
+                        added += 1
     marker_value = getattr(args, "completion_marker_path", None)
     if marker_value:
         marker = Path(os.path.expandvars(os.path.expanduser(marker_value)))
@@ -279,3 +290,5 @@ def _init_wandb_common():
     wandb.define_metric("perf/*", step_metric="rollout/step")
     wandb.define_metric("mopd/update")
     wandb.define_metric("mopd/*", step_metric="mopd/update")
+    wandb.define_metric("paper/step")
+    wandb.define_metric("paper/*", step_metric="paper/step")

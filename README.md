@@ -1,5 +1,7 @@
 # slime
 
+[SmolLM3 MixSFT：PG / Top64 交集实验运行说明](examples/mopd_gpas/README_SMOLLM3_zh.md)
+
 [中文版](./README_zh.md)
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://thudm.github.io/slime/)
@@ -98,7 +100,7 @@ For a comprehensive quick start guide covering environment setup, data preparati
 
 We also provide examples for some use cases not covered in the quick start guide; please check [examples](examples/).
 
-The Qwen3-1.7B four-task exact-set MOPD/GPAS study, including frozen-gradient
+The Qwen3-1.7B-Base four-task micro-batch MOPD/GPAS study, including frozen-gradient
 banks, eight matched trajectories, and final capability evaluation, lives in
 [`examples/mopd_gpas`](examples/mopd_gpas/README.md).
 

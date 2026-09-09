@@ -11,8 +11,9 @@ from typing import Any
 
 import torch
 
-from slime_plugins.m2rl.data_source import MultiTaskRolloutDataSource
+from slime_plugins.m2rl.data_source import MultiTaskRolloutDataSource, load_manifest
 
+from .prompting import validate_prompt_runtime
 from .sampler import (
     MICROBATCHES_PER_STEP,
     PROMPTS_PER_MICROBATCH,
@@ -23,6 +24,8 @@ from .sampler import (
     VARIANCE_MICROBATCHES_PER_TASK,
     VARIANCE_RESPONSE_BUDGET,
     MOPDController,
+    active_tasks,
+    active_domain_weights,
 )
 
 PROTOCOL = "qwen3_1.7b_4t_microbatch_mopd_gpas"
@@ -30,8 +33,8 @@ VARIANCE_PROTOCOL = "qwen3_1.7b_4t_heldout_gradient_variance"
 
 
 def _validate_protocol_manifest(manifest: dict[str, Any], source_configs: list[dict[str, Any]]) -> None:
-    if manifest.get("version") != 3 or manifest.get("protocol") != PROTOCOL:
-        raise ValueError(f"MOPD requires the {PROTOCOL!r} version-3 manifest")
+    if manifest.get("version") not in {3, 4} or manifest.get("protocol") != PROTOCOL:
+        raise ValueError(f"MOPD requires the {PROTOCOL!r} manifest")
     if tuple(config.get("name") for config in source_configs) != TASKS:
         raise ValueError(f"task order must be {TASKS}")
     weights = []
@@ -43,6 +46,8 @@ def _validate_protocol_manifest(manifest: dict[str, Any], source_configs: list[d
         weights.append(float(config.get("target_weight", 0.0)))
     if any(weight <= 0 for weight in weights) or abs(sum(weights) - 1.0) > 1e-12:
         raise ValueError("the four fixed target weights must be positive and sum to one")
+    if manifest.get("version") == 4 and any(weight != 0.25 for weight in weights):
+        raise ValueError("the two-week protocol requires equal task weights of 1/4")
     if bool((manifest.get("sampling") or {}).get("repeat", True)):
         raise ValueError("MOPD training prompt streams must not repeat")
 
@@ -102,23 +107,43 @@ class MOPDRolloutDataSource(MultiTaskRolloutDataSource):
     STATE_SCHEMA_VERSION = 4
 
     def __init__(self, args: Any):
+        manifest = load_manifest(args.prompt_data)[0] if getattr(args, "prompt_data", None) else None
+        self.protocol_sha256 = validate_prompt_runtime(args, manifest)
         super().__init__(args)
+        paper_profile = bool(getattr(args, "mopd_profile", None))
+        self.tasks = active_tasks(args) if paper_profile else TASKS
+        if paper_profile:
+            by_name = {source.config["name"]: source for source in self.sources}
+            self.sources = [by_name[task] for task in self.tasks]
         source_configs = [source.config for source in self.sources]
-        _validate_protocol_manifest(self.manifest, source_configs)
+        if paper_profile:
+            if self.manifest.get("version") != 7 or self.manifest.get("protocol") != "mopd_paper":
+                raise ValueError("Paper profiles require the version-7 mopd_paper manifest")
+            for task, config in zip(self.tasks, source_configs, strict=True):
+                if config.get("teacher") != task:
+                    raise ValueError(f"Source {task} must use its matching teacher")
+        else:
+            _validate_protocol_manifest(self.manifest, source_configs)
+        if not paper_profile and getattr(args, "mopd_loss", None) == "teacher_topk" and self.manifest.get("version") != 4:
+            raise ValueError("Regenerate the two-week manifest; dense MOPD cannot consume the old weighted protocol")
         for source in self.sources:
-            required = int(source.config["required_samples"])
+            required = int(source.config.get("required_samples", len(source.dataset)))
             if len(source.dataset) < required:
                 raise ValueError(
-                    f"source {source.config['name']} has {len(source.dataset)} usable prompts; 16,000 are required"
+                    f"source {source.config['name']} has {len(source.dataset)} usable prompts; {required} are required"
                 )
             selected = list(source.dataset.samples[:required])
             source.dataset.origin_samples = selected
             source.dataset.samples = selected
         checkpoints = tuple(int(value) for value in str(args.mopd_checkpoint_steps).split(",") if value)
+        microbatches = int(args.mopd_microbatches_per_step)
+        if paper_profile and microbatches % len(self.tasks):
+            raise ValueError("Equal paper prompt quotas require microbatches divisible by active task count")
+        count = microbatches // len(self.tasks)
         self.controller = MOPDController(
-            TASKS,
-            target_weights=[float(config["target_weight"]) for config in source_configs],
-            allocation=args.mopd_allocation,
+            self.tasks,
+            target_weights=active_domain_weights(args) if paper_profile else [float(config["target_weight"]) for config in source_configs],
+            allocation="uniform" if paper_profile else args.mopd_allocation,
             seed=args.mopd_seed,
             rollout_offset=0,
             ema_decay=args.mopd_ema_decay,
@@ -126,8 +151,9 @@ class MOPDRolloutDataSource(MultiTaskRolloutDataSource):
             checkpoint_steps=checkpoints,
             microbatches_per_step=args.mopd_microbatches_per_step,
             prompts_per_microbatch=args.mopd_prompts_per_microbatch,
-            min_microbatches=args.mopd_min_microbatches,
-            max_microbatches=args.mopd_max_microbatches,
+            min_microbatches=count if paper_profile else args.mopd_min_microbatches,
+            max_microbatches=count if paper_profile else args.mopd_max_microbatches,
+            reduction=args.mopd_reduction if paper_profile else None,
         )
         output = args.mopd_output_dir or str(Path(args.save).resolve().parent / "allocation")
         self.output_dir = Path(output).resolve()
@@ -162,11 +188,11 @@ class MOPDRolloutDataSource(MultiTaskRolloutDataSource):
         groups = []
         microbatch_index = 0
         planned_weights = {unit["task"]: float(unit["target_weight"]) for unit in pending["task_units"]}
-        for task_index, task in enumerate(TASKS):
+        for task_index, task in enumerate(self.controller.task_names):
             count = int(pending["counts"][task])
             weight = planned_weights[task]
             for task_microbatch_index in range(count):
-                for prompt_in_microbatch in range(PROMPTS_PER_MICROBATCH):
+                for prompt_in_microbatch in range(self.controller.config.prompts_per_microbatch):
                     source = self.sources[task_index]
                     prompt = self._next_prompt(task_index)
                     metadata = dict(prompt.metadata or {})
@@ -189,7 +215,7 @@ class MOPDRolloutDataSource(MultiTaskRolloutDataSource):
                             "mopd_task_microbatch_count": count,
                             "mopd_prompt_in_microbatch": prompt_in_microbatch,
                             "mopd_target_weight": weight,
-                            "mopd_step_global_batch_size": PROMPTS_PER_MICROBATCH,
+                            "mopd_step_global_batch_size": self.controller.config.prompts_per_microbatch,
                             "mopd_task_prompt_epoch": int(source.epoch),
                             "mopd_task_prompt_ordinal": int(source.offset - 1),
                             "mopd_response_ordinal": 0,
@@ -206,8 +232,8 @@ class MOPDRolloutDataSource(MultiTaskRolloutDataSource):
                     groups.append([sample])
                 microbatch_index += 1
         pending["issued"] = len(groups)
-        if microbatch_index != MICROBATCHES_PER_STEP or len(groups) != int(num_samples):
-            raise RuntimeError("MOPD did not construct exactly sixteen four-prompt micro-batches")
+        if microbatch_index != self.controller.config.microbatches_per_step or len(groups) != int(num_samples):
+            raise RuntimeError("MOPD did not construct the configured task micro-batches")
         return groups
 
     def add_samples(self, samples) -> None:
@@ -236,6 +262,7 @@ class MOPDRolloutDataSource(MultiTaskRolloutDataSource):
         _atomic_torch_save(
             {
                 "schema_version": self.STATE_SCHEMA_VERSION,
+                "protocol_sha256": self.protocol_sha256,
                 "source_names": [source.config["name"] for source in self.sources],
                 "source_lengths": [len(source.dataset) for source in self.sources],
                 "source_offsets": [source.offset for source in self.sources],
@@ -248,6 +275,9 @@ class MOPDRolloutDataSource(MultiTaskRolloutDataSource):
         )
 
     def load(self, rollout_id: Any = None) -> None:
+        common_checkpoint = getattr(self.args, "mopd_common_checkpoint", False)
+        if common_checkpoint and self.protocol_sha256 is None:
+            return
         if not self.args.load:
             return
         path = self._state_path(self.args.load, rollout_id)
@@ -258,6 +288,10 @@ class MOPDRolloutDataSource(MultiTaskRolloutDataSource):
         state = torch.load(path, map_location="cpu", weights_only=False)
         if int(state.get("schema_version", -1)) != self.STATE_SCHEMA_VERSION:
             raise ValueError("unsupported MOPD data-source checkpoint schema")
+        if self.protocol_sha256 is not None and state.get("protocol_sha256") != self.protocol_sha256:
+            raise ValueError("Saved MOPD prompt protocol differs; start a new run for asymmetric prefixes")
+        if common_checkpoint:
+            return
         if state["source_names"] != [source.config["name"] for source in self.sources]:
             raise ValueError("saved MOPD source names differ from the manifest")
         if state["source_lengths"] != [len(source.dataset) for source in self.sources]:

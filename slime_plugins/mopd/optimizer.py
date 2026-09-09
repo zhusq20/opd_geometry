@@ -16,6 +16,8 @@ from .sampler import (
     OPEN_MOPD_GAP_FACTOR_MIN,
     PROMPTS_PER_MICROBATCH,
     TASKS,
+    PAPER_REDUCTIONS,
+    active_tasks,
 )
 
 
@@ -113,13 +115,13 @@ def _preconditioner_denominator(
     beta2 = float(view.optimizer_group["betas"][1])
     eps = float(view.optimizer_group.get("eps", 1e-8))
     exp_avg_sq = view.optimizer_state.get("exp_avg_sq")
-    if exp_avg_sq is None:
-        return torch.full((stop - start,), eps, dtype=torch.float32, device=device)
+    if exp_avg_sq is None or _state_step(view) == 0:
+        return torch.ones(stop - start, dtype=torch.float32, device=device)
     value = _local_tensor(exp_avg_sq).detach().reshape(-1)[start:stop].to(device=device, dtype=torch.float32)
     clock = _state_step(view)
     if clock and bool(view.optimizer_group.get("bias_correction", True)):
         value = value / (1.0 - beta2**clock)
-    return value.clamp_min_(0).sqrt_().add_(eps)
+    return value.clamp_min(0).sqrt_().add_(eps)
 
 
 @torch.no_grad()
@@ -141,6 +143,8 @@ def _gradient_square_sums(
     device = first.device if first is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     sums = torch.zeros(2, dtype=torch.float64, device=device)
     for view in views:
+        if not view.contributes_to_norm:
+            continue
         gradient = vectors.get(_view_key(view)) if vectors is not None else view.optimizer_gradient()
         if gradient is None:
             continue
@@ -186,6 +190,13 @@ def _uniform_step_value(data_iterator: Sequence[Any], key: str, num_microbatches
 
 
 def _teacher_loss_and_tokens(data_iterator: Sequence[Any], num_microbatches: int) -> tuple[float, int, float]:
+    metadata = data_iterator[0].rollout_data.get("metadata")
+    if metadata and any(key in metadata[0] for key in ("student_topk_ids", "teacher_topk_ids", "teacher_sampled_log_probs")):
+        records = _step_values(data_iterator, "metadata", num_microbatches)
+        masks = _step_values(data_iterator, "loss_masks", num_microbatches)
+        # These losses were measured by the same forward that produced g_i,s.
+        losses = [float(record["mopd_teacher_loss"]) for record in records]
+        return sum(losses) / len(losses), sum(int(mask.sum()) for mask in masks), 0.0
     values = _step_values(data_iterator, "sampled_reverse_kl_logratio", num_microbatches)
     masks = _step_values(data_iterator, "loss_masks", num_microbatches)
     penalties = _step_values(data_iterator, "mopd_failure_penalties", num_microbatches)
@@ -284,16 +295,46 @@ class _OperationAccumulator:
     views: list[OptimizerParameterView] = field(default_factory=list)
     total_valid_tokens: int = 0
     open_task_gradients: list[dict[tuple[int, int, int | None], torch.Tensor]] = field(default_factory=list)
+    noise_mode: str = "legacy"
+    mean_buffer: dict = field(default_factory=dict)
 
 
-def begin_mopd_operation(optimizer: Any, operation: str, aggregation: str) -> None:
+def begin_mopd_operation(optimizer: Any, operation: str, aggregation: str, *, noise_mode: str = "legacy") -> None:
     if hasattr(optimizer, "_mopd_operation_accumulator"):
         raise RuntimeError("the previous MOPD operation was not finalized")
-    if aggregation not in {"fixed_objective", "token_mean", "open_mopd", "variance_probe"}:
+    if aggregation not in {"fixed_objective", "token_mean", "open_mopd", "variance_probe", *PAPER_REDUCTIONS}:
         raise ValueError(f"unsupported MOPD aggregation {aggregation!r}")
     if (operation == "heldout_variance") != (aggregation == "variance_probe"):
         raise ValueError("held-out variance operations must use variance_probe aggregation")
-    optimizer._mopd_operation_accumulator = _OperationAccumulator(operation, aggregation)
+    if aggregation in PAPER_REDUCTIONS:
+        noise_mode = "paper"
+    optimizer._mopd_operation_accumulator = _OperationAccumulator(operation, aggregation, noise_mode=noise_mode)
+
+
+@torch.no_grad()
+def welford_gradients(views, mean, count, *, raw_only=False, chunk_size=1_048_576):
+    """Update a reusable FP32 task mean and return the Welford M2 increments."""
+    device = next(iter(mean.values())).device
+    sums = torch.zeros(2, dtype=torch.float32, device=device)
+    for view in views:
+        key = _view_key(view)
+        if key not in mean:
+            continue
+        gradient = view.optimizer_gradient().detach().reshape(-1)
+        average = mean[key].reshape(-1)
+        for start in range(0, gradient.numel(), chunk_size):
+            stop = min(start + chunk_size, gradient.numel())
+            delta = gradient[start:stop].float() - average[start:stop]
+            average[start:stop].add_(delta, alpha=1.0 / count)
+            if count > 1 and view.contributes_to_norm:
+                factor = (count - 1) / count
+                sums[0] += delta.square().sum() * factor
+                if not raw_only:
+                    denominator = _preconditioner_denominator(view, start, stop, device=device)
+                    sums[1] += (delta / denominator).square().sum() * factor
+    if _distributed():
+        torch.distributed.all_reduce(sums)
+    return float(sums[0]), float(sums[0] if raw_only else sums[1])
 
 
 @torch.no_grad()
@@ -305,6 +346,46 @@ def _finish_task(accumulator: _OperationAccumulator, chunk_size: int) -> None:
         raise ValueError(
             f"task {task.task} produced {task.microbatches} micro-batches, expected {task.expected_microbatches}"
         )
+    if accumulator.noise_mode == "paper":
+        token_reduction = accumulator.aggregation != "domain_response"
+        denominator = task.valid_tokens if token_reduction else task.microbatches
+        if accumulator.aggregation != "global_token":
+            for key, gradient in task.gradients.items():
+                accumulator.aggregate[key].add_(gradient, alpha=task.target_weight / max(denominator, 1))
+        accumulator.task_units.append({
+            "task": task.task,
+            "microbatches": task.microbatches,
+            "raw_noise": None,
+            "scaled_noise": None,
+            "noise_collected": False,
+            "teacher_loss": task.teacher_loss_sum / max(denominator, 1),
+            "valid_response_tokens": task.valid_tokens,
+            "target_weight": task.target_weight,
+            "accumulation_denominator": denominator,
+            "reduction": accumulator.aggregation,
+        })
+        accumulator.current = None
+        return
+    if accumulator.noise_mode != "legacy":
+        collect = accumulator.noise_mode != "none"
+        if collect:
+            for key, mean in task.gradients.items():
+                accumulator.aggregate[key].add_(mean, alpha=task.target_weight)
+        accumulator.task_units.append(
+            {
+                "task": task.task,
+                "microbatches": task.microbatches,
+                "raw_noise": task.raw_square_sum / (task.microbatches - 1) if collect else None,
+                "scaled_noise": task.scaled_square_sum / (task.microbatches - 1) if collect else None,
+                "noise_collected": collect,
+                "noise_preconditioner": accumulator.noise_mode,
+                "teacher_loss": task.teacher_loss_sum / task.microbatches,
+                "valid_response_tokens": task.valid_tokens,
+                "target_weight": task.target_weight,
+            }
+        )
+        accumulator.current = None
+        return
     mean_raw, mean_scaled = _gradient_square_sums(
         accumulator.views,
         task.gradients,
@@ -391,7 +472,87 @@ def mopd_capture_step(
     found_inf = optimizer.prepare_grads()
     if bool(found_inf):
         raise FloatingPointError(f"non-finite gradient in MOPD micro-batch for task {task}")
-    views = build_optimizer_parameter_views(_model_entries(model), optimizer, requested_optimizer="adam")
+    views = build_optimizer_parameter_views(
+        _model_entries(model), optimizer, requested_optimizer="adam", include_replicated=True
+    )
+    if accumulator.noise_mode == "paper":
+        if accumulator.current is not None and accumulator.current.task != task:
+            _finish_task(accumulator, int(args.mopd_score_chunk_size))
+        accumulator.views = list(views)
+        if not accumulator.aggregate:
+            accumulator.aggregate = {
+                _view_key(view): torch.zeros_like(view.optimizer_gradient(), dtype=torch.float32)
+                for view in views if view.optimizer_gradient() is not None
+            }
+        if accumulator.current is None:
+            accumulator.current = _TaskAccumulator(task, expected, target_weight, {
+                key: torch.zeros_like(value) for key, value in accumulator.aggregate.items()
+            })
+        current = accumulator.current
+        token_reduction = aggregation != "domain_response"
+        # Megatron has already normalized the gradient by this micro-batch's
+        # valid-token count or response count. Recover sums before combining
+        # unequal-length micro-batches; divide once at the domain/global level.
+        scale = valid_tokens if token_reduction else 1
+        for view in views:
+            gradient = view.optimizer_gradient()
+            if gradient is not None:
+                key = _view_key(view)
+                current.gradients[key].add_(gradient, alpha=scale)
+                if aggregation == "global_token":
+                    accumulator.aggregate[key].add_(gradient, alpha=scale)
+        records = _step_values(data_iterator, "metadata", num_microbatches)
+        masks = _step_values(data_iterator, "loss_masks", num_microbatches)
+        if token_reduction and records and "mopd_teacher_loss" in records[0]:
+            current.teacher_loss_sum += sum(float(record["mopd_teacher_loss"]) * int(mask.sum()) for record, mask in zip(records, masks, strict=True))
+        else:
+            current.teacher_loss_sum += teacher_loss * scale
+        current.microbatches += 1
+        current.valid_tokens += valid_tokens
+        accumulator.total_valid_tokens += valid_tokens
+        return True, 0.0, None, {"mopd": True, "task": task, "captured": True}
+    if accumulator.noise_mode != "legacy":
+        if accumulator.current is not None and accumulator.current.task != task:
+            _finish_task(accumulator, int(args.mopd_score_chunk_size))
+        accumulator.views = list(views)
+        if not accumulator.aggregate:
+            accumulator.aggregate = {
+                _view_key(view): torch.zeros_like(view.optimizer_gradient(), dtype=torch.float32)
+                for view in views
+                if view.optimizer_gradient() is not None
+            }
+        if accumulator.current is None:
+            if accumulator.noise_mode != "none":
+                if not accumulator.mean_buffer:
+                    accumulator.mean_buffer = {
+                        key: torch.zeros_like(value) for key, value in accumulator.aggregate.items()
+                    }
+                else:
+                    for value in accumulator.mean_buffer.values():
+                        value.zero_()
+            mean = accumulator.mean_buffer
+            accumulator.current = _TaskAccumulator(task, expected, target_weight, mean)
+        current = accumulator.current
+        current.microbatches += 1
+        if accumulator.noise_mode == "none":
+            for view in views:
+                gradient = view.optimizer_gradient()
+                if gradient is not None:
+                    accumulator.aggregate[_view_key(view)].add_(gradient, alpha=target_weight / expected)
+        else:
+            raw, scaled = welford_gradients(
+                views,
+                current.gradients,
+                current.microbatches,
+                raw_only=accumulator.noise_mode == "raw",
+                chunk_size=int(args.mopd_score_chunk_size),
+            )
+            current.raw_square_sum += raw
+            current.scaled_square_sum += scaled
+        current.teacher_loss_sum += teacher_loss
+        current.valid_tokens += valid_tokens
+        accumulator.total_valid_tokens += valid_tokens
+        return True, 0.0, None, {"mopd": True, "task": task, "captured": True}
     raw_square, scaled_square = _gradient_square_sums(
         views,
         chunk_size=int(args.mopd_score_chunk_size),
@@ -470,9 +631,10 @@ def mopd_capture_step(
 def finish_mopd_operation(args: Any, optimizer: Any) -> tuple[bool, float, dict[str, Any]]:
     accumulator: _OperationAccumulator = optimizer._mopd_operation_accumulator
     _finish_task(accumulator, int(args.mopd_score_chunk_size))
-    if [unit["task"] for unit in accumulator.task_units] != list(TASKS):
-        raise ValueError("a MOPD optimizer step must contain all four task blocks in protocol order")
-    if accumulator.aggregation == "token_mean":
+    tasks = active_tasks(args) if getattr(args, "mopd_profile", None) else TASKS
+    if [unit["task"] for unit in accumulator.task_units] != list(tasks):
+        raise ValueError("a MOPD optimizer step must contain all active task blocks in configured order")
+    if accumulator.aggregation in {"token_mean", "global_token"}:
         for gradient in accumulator.aggregate.values():
             gradient.div_(accumulator.total_valid_tokens)
     elif accumulator.aggregation == "open_mopd":
@@ -501,7 +663,7 @@ def finish_mopd_operation(args: Any, optimizer: Any) -> tuple[bool, float, dict[
                     "open_mopd_effective_share": float(weighting["effective_shares"][index]),
                 }
             )
-    is_probe = accumulator.aggregation == "variance_probe"
+    is_probe = accumulator.aggregation == "variance_probe" or accumulator.operation == "calibration"
     if is_probe:
         aggregate_norm = 0.0
         update_successful = True
@@ -511,14 +673,22 @@ def finish_mopd_operation(args: Any, optimizer: Any) -> tuple[bool, float, dict[
             if key in accumulator.aggregate:
                 view.set_optimizer_gradient(accumulator.aggregate[key])
         norm_square = next(iter(accumulator.aggregate.values())).new_zeros((), dtype=torch.float64)
-        for gradient in accumulator.aggregate.values():
-            norm_square += torch.sum(gradient.double().square())
+        for view in accumulator.views:
+            if view.contributes_to_norm and _view_key(view) in accumulator.aggregate:
+                norm_square += torch.sum(accumulator.aggregate[_view_key(view)].double().square())
         if _distributed():
             torch.distributed.all_reduce(norm_square)
         aggregate_norm = math.sqrt(float(norm_square))
+        if accumulator.operation == "diagnostic_trial":
+            from .diagnostic import record_trial_gradient
+
+            record_trial_gradient(optimizer, accumulator.views)
+        measurements = getattr(optimizer, "_paper_measurements", None)
+        if measurements is not None and accumulator.operation == "train":
+            measurements.before_step()
         clip_prepared_gradients(optimizer, aggregate_norm)
         update_successful = bool(optimizer.step_with_ready_grads())
-    attempted_responses = sum(int(unit["microbatches"]) * PROMPTS_PER_MICROBATCH for unit in accumulator.task_units)
+    attempted_responses = sum(int(unit["microbatches"]) * int(getattr(args, "mopd_prompts_per_microbatch", PROMPTS_PER_MICROBATCH)) for unit in accumulator.task_units)
     feedback = {
         "mopd": True,
         "operation": accumulator.operation,

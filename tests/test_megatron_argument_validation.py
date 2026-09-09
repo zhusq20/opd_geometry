@@ -118,6 +118,17 @@ def test_hf_validate_all_moe_skips_dense_intermediate_size(monkeypatch):
 
 
 @pytest.mark.unit
+def test_smollm3_no_rope_convention_matches_hf(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    config = types.SimpleNamespace(model_type="smollm3", num_hidden_layers=8,
+                                   no_rope_layers=[1, 1, 1, 0, 1, 1, 1, 0])
+    module._hf_validate_args(types.SimpleNamespace(no_rope_freq=4), config)
+    module._hf_validate_args(types.SimpleNamespace(no_rope_freq=[0, 0, 0, 1, 0, 0, 0, 1]), config)
+    with pytest.raises(AssertionError, match="SmolLM3 no-RoPE"):
+        module._hf_validate_args(types.SimpleNamespace(no_rope_freq=None), config)
+
+
+@pytest.mark.unit
 def test_hf_validate_checks_moe_intermediate_size(monkeypatch):
     module = load_arguments_module(monkeypatch)
 

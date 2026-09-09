@@ -535,6 +535,10 @@ def _assemble_mopd_feedback(args: Any, rollout_metrics: dict[str, Any], trainer_
     actor_gpu_count = int(args.actor_num_nodes) * int(args.actor_num_gpus_per_node)
     inference_gpu_count = int(args.rollout_num_gpus)
     allocated_gpu_count = actor_gpu_count + inference_gpu_count
+    if getattr(args, "mopd_occupied_gpus", None) is not None:
+        allocated_gpu_count = int(args.mopd_occupied_gpus)
+        if allocated_gpu_count < actor_gpu_count + inference_gpu_count:
+            raise ValueError("occupied GPU count cannot omit learner or rollout GPUs")
     feedback.update(
         {
             "rollout_wall_seconds": float(rollout_metrics["mopd/student_rollout_wall_seconds"]),
@@ -787,6 +791,22 @@ class RolloutManager:
     def save(self, rollout_id):
         self.data_source.save(rollout_id)
 
+    def prepare_mopd_bank(self, rollout_id, path, initial=False):
+        from slime_plugins.mopd.reference_bank import prepare_bank
+
+        self.health_monitoring_resume()
+        return prepare_bank(self.args, rollout_id, self.data_source, path, initial=initial)
+
+    def generate_mopd_diagnostic(self, purpose, counts, trial):
+        from slime.utils.async_utils import run
+        from slime_plugins.mopd.diagnostic import generate_samples, save_evaluation_bank
+
+        self.health_monitoring_resume()
+        samples = run(generate_samples(self.args, purpose, counts, trial))
+        if purpose == "evaluation":
+            return save_evaluation_bank(self.args, samples)
+        return self._split_train_data_by_dp(self._convert_samples_to_train_data(samples))
+
     def mopd_budget_status(self):
         if not getattr(self.args, "mopd_enabled", False):
             raise RuntimeError("mopd_budget_status requires --mopd-enabled")
@@ -849,8 +869,9 @@ class RolloutManager:
             log_values["mopd/fixed_seconds_ema"] = float(record["fixed_seconds_after"])
             for task in record["counts"]:
                 log_values[f"mopd/count/{task}"] = int(record["counts"][task])
-                log_values[f"mopd/scaled_noise/{task}"] = float(record["scaled_noise_after"][task])
-                log_values[f"mopd/raw_noise/{task}"] = float(record["raw_noise_after"][task])
+                for noise in ("scaled_noise", "raw_noise"):
+                    if record[f"{noise}_after"][task] is not None:
+                        log_values[f"mopd/{noise}/{task}"] = float(record[f"{noise}_after"][task])
                 log_values[f"mopd/loss_ema/{task}"] = float(record["loss_ema_after"][task])
                 log_values[f"mopd/task_seconds_ema/{task}"] = float(record["task_seconds_after"][task])
                 relative_change = record["scaled_noise_relative_change"][task]
@@ -891,7 +912,8 @@ class RolloutManager:
                 "empty_responses",
                 "teacher_scoring_failures",
             ):
-                log_values[f"mopd/task/{task}/{key}"] = float(unit[key])
+                if unit.get(key) is not None:
+                    log_values[f"mopd/task/{task}/{key}"] = float(unit[key])
         logging_utils.log(self.args, log_values, step_key=step_key)
         return record
 
@@ -1658,7 +1680,10 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
         rewards = data[key]["rewards"]
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
-            log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
+            sample_metrics = compute_metrics_from_samples(args, samples)
+            # Evaluation observes verifier rewards without updating parameters.
+            sample_metrics.update(reward_used_in_loss=0, reward_loss_coefficient=0.0)
+            log_dict |= dict_add_prefix(sample_metrics, f"eval/{key}/")
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
@@ -1963,7 +1988,7 @@ def _compute_training_reward_metrics(args, samples: list[Sample]) -> dict[str, f
     rewards = [value for sample in samples if (value := _scalar_task_reward(args, sample)) is not None]
     if rewards:
         metrics |= dict_add_prefix(_task_reward_statistics(rewards), "reward/")
-    use_opd = bool(getattr(args, "use_opd", False))
+    use_opd = bool(getattr(args, "use_opd", False) or getattr(args, "mopd_enabled", False))
     reward_coefficient = float(getattr(args, "opd_task_reward_weight", 0.0) or 0.0) if use_opd else 1.0
     reward_observed = bool(rewards)
     reward_used = reward_coefficient != 0.0 and any(

@@ -164,11 +164,30 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
     prompt_ids = _prepare_prompt_ids(sample, state.tokenizer, state.processor)
 
+    # Evaluation datasets may share this dictionary across prompts. Each request
+    # needs its own remaining response budget, especially near the context limit.
+    sampling_params = sampling_params.copy()
     sampling_params["max_new_tokens"] -= sample.response_length
 
     assert (
         sampling_params["max_new_tokens"] >= 0
     ), f"max_new_tokens: {sampling_params['max_new_tokens']} should not be less than 0"
+    if getattr(args, "mopd_profile", None) and getattr(args, "sglang_context_length", None):
+        context_length = int(args.sglang_context_length)
+        if len(prompt_ids) > context_length:
+            raise ValueError(f"Prompt has {len(prompt_ids)} tokens, exceeding the {context_length}-token context")
+        sampling_params["max_new_tokens"] = min(
+            sampling_params["max_new_tokens"], context_length - len(prompt_ids)
+        )
+        if "min_new_tokens" in sampling_params:
+            sampling_params["min_new_tokens"] = min(
+                sampling_params["min_new_tokens"], sampling_params["max_new_tokens"]
+            )
+        sample.metadata = dict(sample.metadata or {})
+        sample.metadata["generation_context_length"] = context_length
+        sample.metadata["generation_max_new_tokens"] = sampling_params["max_new_tokens"]
+    if not sample.tokens:
+        sample.tokens = prompt_ids
     if sampling_params["max_new_tokens"] == 0:
         sample.status = Sample.Status.TRUNCATED
         return sample
@@ -178,6 +197,11 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "sampling_params": sampling_params,
         "return_logprob": True,
     }
+    from slime_plugins.mopd.topk import append_student_topk, student_topk_size, uses_student_topk
+
+    student_topk = uses_student_topk(args)
+    if student_topk:
+        payload["top_logprobs_num"] = student_topk_size(args)
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
@@ -190,9 +214,6 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         payload["text"] = sample.prompt
     else:
         payload["input_ids"] = prompt_ids
-
-    if not sample.tokens:
-        sample.tokens = prompt_ids
 
     # Use session_id for consistent hashing routing (SGLang Model Gateway)
     headers = None
@@ -218,6 +239,8 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         meta_info=output["meta_info"],
         text=output["text"],
     )
+    if student_topk:
+        append_student_topk(sample, output["meta_info"], len(new_response_tokens), k=student_topk_size(args))
 
     return sample
 
@@ -549,6 +572,7 @@ async def eval_rollout_single_dataset(
             tool_key=dataset_cfg.tool_key,
             apply_chat_template=eval_apply_chat_template,
             apply_chat_template_kwargs=eval_apply_chat_template_kwargs,
+            chat_template_suffix_to_remove=dataset_cfg.chat_template_suffix_to_remove,
         )
     dataset = EVAL_PROMPT_DATASET[cache_key]
 

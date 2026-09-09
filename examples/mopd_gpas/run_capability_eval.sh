@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Evaluate a final run or a frozen reference model on the four capability suites.
+# Evaluate a final run or a frozen reference model on the capability suites.
 set -euo pipefail
 
 EXAMPLE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,33 +8,81 @@ MEGATRON_PATH="${MEGATRON_PATH:-/root/Megatron-LM}"
 export PYTHONPATH="${SLIME_ROOT}:${MEGATRON_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
 MOPD_DATA_ROOT="${MOPD_DATA_ROOT:-${SLIME_ROOT}/data/m2rl}"
 export MOPD_DATA_ROOT
-export MOPD_HF_CHECKPOINT="${MOPD_HF_CHECKPOINT:-/workspace/dev/checkpoints/Qwen3-1.7B}"
+export MOPD_HF_CHECKPOINT="${MOPD_HF_CHECKPOINT:-/workspace/dev/checkpoints/Qwen3-1.7B-Base}"
 export MOPD_TEACHER_HF_ROOT="${MOPD_TEACHER_HF_ROOT:-${SLIME_ROOT}/local/mopd_assets/models/teachers_hf}"
-export MOPD_QWEN3_4B="${MOPD_QWEN3_4B:-${SLIME_ROOT}/local/mopd_assets/models/qwen3-4b}"
 
 TARGET="${1:-}"
 case "${TARGET}" in
-  uniform|gpas|cost_gpas|raw_noise|loss_gap|std_mopd|d3_mopd|open_mopd|initial_student|teacher_math|teacher_if|teacher_qwen3_4b) ;;
-  *) echo "Usage: $0 {initial_student|teacher_math|teacher_if|teacher_qwen3_4b|uniform|gpas|cost_gpas|raw_noise|loss_gap|std_mopd|d3_mopd|open_mopd}" >&2; exit 2 ;;
+  uniform) TARGET=uniform-s1 ;;
+  gpas) TARGET=gpas-s1 ;;
+  raw_noise) TARGET=gpas-raw-s1 ;;
+  d3_fixed) TARGET=d3-fixed-s1 ;;
+  uniform-s1|gpas-s1|gpas-raw-s1|d3-fixed-s1|initial_student|teacher_math|teacher_code|teacher_if|teacher_science) ;;
+  *) echo "Usage: $0 {initial_student|teacher_math|teacher_code|teacher_if|teacher_science|uniform-s1|gpas-s1|gpas-raw-s1|d3-fixed-s1}" >&2; exit 2 ;;
 esac
 
-OUTPUT_ROOT="${MOPD_OUTPUT_ROOT:-${SLIME_ROOT}/outputs/mopd_gpas_v4}"
-GENERATED="${MOPD_GENERATED_DIR:-${SLIME_ROOT}/local/mopd_generated}"
+OUTPUT_ROOT="${MOPD_OUTPUT_ROOT:-${SLIME_ROOT}/outputs/mopd_no_think}"
+GENERATED="${MOPD_GENERATED_DIR:-${SLIME_ROOT}/local/mopd_no_think_generated}"
 DATA_MANIFEST="${GENERATED}/train.yaml"
 PROTOCOL="${GENERATED}/protocol.json"
-EVAL_CONFIG="${EXAMPLE_DIR}/configs/capability_eval.yaml"
-REWARD_CONFIG="${EXAMPLE_DIR}/configs/mopd_capability_rewards.yaml"
+SUITE="${MOPD_CAPABILITY_SUITE:-all}"
+case "${SUITE}" in
+  all)
+    EVAL_CONFIG="${EXAMPLE_DIR}/configs/capability_eval.yaml"
+    REWARD_CONFIG="${EXAMPLE_DIR}/configs/mopd_capability_rewards.yaml"
+    EVAL_DIR_NAME=capability_eval
+    REFERENCE_DIR_NAME=capability_references
+    ;;
+  noncode)
+    EVAL_CONFIG="${EXAMPLE_DIR}/configs/capability_eval_noncode.yaml"
+    REWARD_CONFIG="${EXAMPLE_DIR}/configs/mopd_capability_rewards_noncode.yaml"
+    EVAL_DIR_NAME=capability_eval_noncode
+    REFERENCE_DIR_NAME=capability_references_noncode
+    ;;
+  *) echo "MOPD_CAPABILITY_SUITE must be all or noncode." >&2; exit 2 ;;
+esac
+if [[ "${SUITE}" == noncode && "${TARGET}" == teacher_code ]]; then
+  exit 0
+fi
+python3 - "${PROTOCOL}" <<'PY'
+import sys
+
+from slime_plugins.mopd.prompting import protocol_identity
+
+protocol_identity(sys.argv[1])
+PY
+
+if [[ "${TARGET}" == teacher_* ]]; then
+  FILTERED_CONFIG="${GENERATED}/capability_${TARGET}_${SUITE}.yaml"
+  python3 - "${EVAL_CONFIG}" "${FILTERED_CONFIG}" "${TARGET}" <<'PY'
+import pathlib, sys, yaml
+source, target, model = sys.argv[1:]
+config = yaml.safe_load(pathlib.Path(source).read_text())
+names = {"teacher_math": {"math500_pass1"}, "teacher_code": {"livecodebench_postcutoff_pass1"},
+         "teacher_if": {"ifbench_strict"}, "teacher_science": {"gpqa_diamond_avg4"}}[model]
+config["eval"]["datasets"] = [row for row in config["eval"]["datasets"] if row["name"] in names]
+config["eval"]["defaults"]["chat_template_suffix_to_remove"] = None
+pathlib.Path(target).parent.mkdir(parents=True, exist_ok=True)
+pathlib.Path(target).write_text(yaml.safe_dump(config, sort_keys=False))
+PY
+  EVAL_CONFIG="${FILTERED_CONFIG}"
+fi
+EVAL_INCLUDES_CODE=0
+if [[ "${SUITE}" == all && ( "${TARGET}" == teacher_code || "${TARGET}" != teacher_* ) ]]; then
+  EVAL_INCLUDES_CODE=1
+fi
 EVAL_INDICES=(
   "${MOPD_DATA_ROOT}/eval/m2rl_online/eval_data_index.json"
-  "${MOPD_DATA_ROOT}/single_task/code/livecodebench_index_v6.json"
 )
+if [[ "${EVAL_INCLUDES_CODE}" == 1 ]]; then
+  EVAL_INDICES+=("${MOPD_DATA_ROOT}/single_task/code/livecodebench_index_v6.json")
+fi
 TARGET_RESPONSES="${MOPD_CAPABILITY_RESPONSE:-32000}"
 DRY_RUN="${DRY_RUN:-0}"
-MODEL_SCALE=1p7b
 
 case "${TARGET}" in
-  uniform|gpas|cost_gpas|raw_noise|loss_gap|std_mopd|d3_mopd|open_mopd)
-    RUN_DIR="${OUTPUT_ROOT}/${TARGET}-seed42"
+  uniform-s1|gpas-s1|gpas-raw-s1|d3-fixed-s1)
+    RUN_DIR="${OUTPUT_ROOT}/${TARGET}"
     INDEX="${RUN_DIR}/checkpoints/mopd_checkpoint_index.json"
     if [[ "${DRY_RUN}" == 1 ]]; then
       MODEL_PATH="${MOPD_HF_CHECKPOINT}"
@@ -51,36 +99,29 @@ print(matches[0]["hf_checkpoint"])
 PY
       )"
     fi
-    OUTPUT_DIR="${RUN_DIR}/capability_eval/response_${TARGET_RESPONSES}"
+    OUTPUT_DIR="${RUN_DIR}/${EVAL_DIR_NAME}/response_${TARGET_RESPONSES}"
     EXPERIMENT_NAME="mopd-${TARGET}-capability-r${TARGET_RESPONSES}"
     ;;
   initial_student)
     MODEL_PATH="${MOPD_HF_CHECKPOINT}"
-    OUTPUT_DIR="${OUTPUT_ROOT}/capability_references/initial_student"
+    OUTPUT_DIR="${OUTPUT_ROOT}/${REFERENCE_DIR_NAME}/initial_student"
     EXPERIMENT_NAME=mopd-capability-initial-student
     ;;
-  teacher_math)
-    MODEL_PATH="${MOPD_TEACHER_HF_ROOT}/math"
-    OUTPUT_DIR="${OUTPUT_ROOT}/capability_references/teacher_math"
-    EXPERIMENT_NAME=mopd-capability-teacher-math
-    ;;
-  teacher_if)
-    MODEL_PATH="${MOPD_TEACHER_HF_ROOT}/if"
-    OUTPUT_DIR="${OUTPUT_ROOT}/capability_references/teacher_if"
-    EXPERIMENT_NAME=mopd-capability-teacher-if
-    ;;
-  teacher_qwen3_4b)
-    MODEL_PATH="${MOPD_QWEN3_4B}"
-    OUTPUT_DIR="${OUTPUT_ROOT}/capability_references/teacher_qwen3_4b"
-    EXPERIMENT_NAME=mopd-capability-teacher-qwen3-4b
-    MODEL_SCALE=4b
+  teacher_math|teacher_code|teacher_if|teacher_science)
+    MODEL_PATH="${MOPD_TEACHER_HF_ROOT}/${TARGET#teacher_}"
+    OUTPUT_DIR="${OUTPUT_ROOT}/${REFERENCE_DIR_NAME}/${TARGET}"
+    EXPERIMENT_NAME="mopd-capability-teacher-${TARGET#teacher_}"
     ;;
 esac
+
+if [[ "${SUITE}" == noncode ]]; then
+  EXPERIMENT_NAME="${EXPERIMENT_NAME}-noncode"
+fi
 
 for path in "${EVAL_CONFIG}" "${DATA_MANIFEST}" "${PROTOCOL}" "${REWARD_CONFIG}" "${EVAL_INDICES[@]}"; do
   [[ -f "${path}" ]] || { echo "Missing required capability input: ${path}" >&2; exit 2; }
 done
-[[ -f "${MODEL_PATH}/config.json" && -f "${MODEL_PATH}/model.safetensors.index.json" ]] || {
+[[ -f "${MODEL_PATH}/config.json" && ( -f "${MODEL_PATH}/model.safetensors.index.json" || -f "${MODEL_PATH}/model.safetensors" ) ]] || {
   echo "Incomplete HuggingFace model ${MODEL_PATH}." >&2
   exit 2
 }
@@ -97,28 +138,29 @@ IFS=, read -r -a GPU_LIST <<< "${CUDA_VISIBLE_DEVICES}"
 [[ "${#GPU_LIST[@]}" == 1 ]] || { echo "Capability evaluation requires exactly one GPU." >&2; exit 2; }
 NUM_GPUS=1
 export MODEL_ARGS_ROTARY_BASE=1000000
-if [[ "${MODEL_SCALE}" == 4b ]]; then
-  source "${SLIME_ROOT}/scripts/models/qwen3-4B.sh"
-  SGLANG_FRACTION="${SGLANG_MEM_FRACTION:-0.45}"
-else
-  source "${SLIME_ROOT}/scripts/models/qwen3-1.7B.sh"
-  SGLANG_FRACTION="${SGLANG_MEM_FRACTION:-0.7}"
+source "${SLIME_ROOT}/scripts/models/qwen3-1.7B.sh"
+SGLANG_FRACTION="${SGLANG_MEM_FRACTION:-0.7}"
+STUDENT_PROMPT_ARGS=()
+if [[ "${TARGET}" != teacher_* ]]; then
+  STUDENT_PROMPT_ARGS=(--chat-template-suffix-to-remove $'<think>\n\n</think>\n\n')
 fi
 
 TRAIN_CMD=(
   python3 "${SLIME_ROOT}/train.py"
   "${MODEL_ARGS[@]}"
   --hf-checkpoint "${MODEL_PATH}" --load "${MODEL_PATH}"
+  --exit-on-missing-checkpoint
   --no-load-optim --no-load-rng --start-rollout-id 0
   --prompt-data "${DATA_MANIFEST}"
   --data-source-path slime_plugins.m2rl.data_source.MultiTaskRolloutDataSource
   --input-key prompt --label-key label --metadata-key metadata --tool-key tools
   --apply-chat-template --apply-chat-template-kwargs '{"enable_thinking":false}'
+  "${STUDENT_PROMPT_ARGS[@]}"
   --rollout-global-dataset
   --num-rollout 0 --rollout-batch-size "${NUM_GPUS}" --global-batch-size "${NUM_GPUS}"
   --n-samples-per-prompt 1
   --eval-config "${EVAL_CONFIG}" --eval-interval 1
-  --eval-max-response-len 4096 --eval-max-concurrency "${EVAL_MAX_CONCURRENCY:-48}"
+  --eval-max-response-len 32768 --eval-max-concurrency "${EVAL_MAX_CONCURRENCY:-48}"
   --m2rl-reward-config "${REWARD_CONFIG}"
   --metrics-output-dir "${OUTPUT_DIR}/metrics"
   --eval-artifact-dir "${OUTPUT_DIR}/eval_artifacts"
@@ -152,12 +194,14 @@ print("static argument validation: OK")
   exit 0
 fi
 
-[[ -r "${M2RL_SANDBOX_PREFLIGHT_MARKER}" ]] || {
-  echo "Missing readable SandboxFusion preflight marker: ${M2RL_SANDBOX_PREFLIGHT_MARKER}" >&2
-  echo "Build and start the audited sandbox with examples/optimizer_geometry/{build,start}_sandboxfusion*.sh." >&2
-  exit 2
-}
-python3 - "${REWARD_CONFIG}" <<'PY'
+SANDBOX_INPUTS=()
+if [[ "${EVAL_INCLUDES_CODE}" == 1 ]]; then
+  [[ -r "${M2RL_SANDBOX_PREFLIGHT_MARKER}" ]] || {
+    echo "Missing readable SandboxFusion preflight marker: ${M2RL_SANDBOX_PREFLIGHT_MARKER}" >&2
+    echo "Build and start the audited sandbox with examples/optimizer_geometry/{build,start}_sandboxfusion*.sh." >&2
+    exit 2
+  }
+  python3 - "${REWARD_CONFIG}" <<'PY'
 import sys
 
 from slime_plugins.m2rl.rewards import load_reward_config
@@ -168,10 +212,12 @@ url = str(route.get("preflight_url") or route.get("url") or "")
 validate_preflight_marker(route, url)
 print(f"SandboxFusion attestation: OK ({url})")
 PY
+  SANDBOX_INPUTS=(--input "${M2RL_SANDBOX_PREFLIGHT_MARKER}")
+fi
 
 python3 "${EXAMPLE_DIR}/provenance.py" start --repo "${SLIME_ROOT}" --run-dir "${OUTPUT_DIR}" \
   --input "${PROTOCOL}" --input "${DATA_MANIFEST}" --input "${EVAL_CONFIG}" --input "${REWARD_CONFIG}" \
-  --input "${M2RL_SANDBOX_PREFLIGHT_MARKER}" \
+  "${SANDBOX_INPUTS[@]}" \
   --checkpoint "${MODEL_PATH}" --source "${EXAMPLE_DIR}" \
   --source "${SLIME_ROOT}/slime_plugins/m2rl/rewards.py" \
   --source "${SLIME_ROOT}/slime_plugins/m2rl/sandbox_security.py" \

@@ -296,5 +296,212 @@ def test_heldout_task_summary_contains_only_scalar_gradient_statistics():
     assert not any(torch.is_tensor(value) for value in unit.values())
 
 
+def test_first_preconditioner_is_identity_and_reading_does_not_mutate_adam():
+    from slime_plugins.mopd.optimizer import _preconditioner_denominator
+
+    parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+    optimizer = torch.optim.AdamW([parameter])
+    view = build_optimizer_parameter_views([("p", parameter, [])], optimizer, requested_optimizer="adam")[0]
+    assert _preconditioner_denominator(view, 0, 2, device=parameter.device).tolist() == [1.0, 1.0]
+    optimizer = _initialized_adam(parameter)
+    view = build_optimizer_parameter_views([("p", parameter, [])], optimizer, requested_optimizer="adam")[0]
+    optimizer.param_groups[0]["bias_correction"] = False
+    before = optimizer.state[parameter]["exp_avg_sq"].clone()
+    _preconditioner_denominator(view, 0, 2, device=parameter.device)
+    torch.testing.assert_close(optimizer.state[parameter]["exp_avg_sq"], before)
+
+
+def test_welford_is_stable_with_large_task_means_and_raw_ablation_skips_d(monkeypatch):
+    from slime_plugins.mopd import optimizer as module
+
+    parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+    optimizer = _initialized_adam(parameter)
+    view = build_optimizer_parameter_views([("p", parameter, [])], optimizer, requested_optimizer="adam")[0]
+    mean = {_view_key(view): torch.zeros(2)}
+    gradients = torch.tensor([[1e6, 1e6], [1e6 + 2, 1e6 - 2], [1e6 + 4, 1e6 - 4]])
+    monkeypatch.setattr(module, "_preconditioner_denominator", lambda *a, **kw: pytest.fail("raw ablation used D"))
+    m2 = 0.0
+    for count, gradient in enumerate(gradients, 1):
+        parameter.grad = gradient
+        raw, scaled = module.welford_gradients([view], mean, count, raw_only=True, chunk_size=1)
+        m2 += raw
+        assert raw == scaled
+    assert m2 / 2 == pytest.approx(float(gradients.var(dim=0).sum()))
+    torch.testing.assert_close(mean[_view_key(view)], gradients.mean(dim=0))
+
+
+@pytest.mark.parametrize("support_key", ["teacher_topk_ids", "student_topk_ids"])
+def test_uniform_dense_accumulates_task_means_without_collecting_noise(monkeypatch, support_key):
+    from slime_plugins.mopd import optimizer as module
+
+    parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+    model = torch.nn.Module()
+    model.register_parameter("weight", parameter)
+    optimizer = _initialized_adam(parameter)
+    adapter = _MegatronAdamAdapter(optimizer, parameter)
+    adapter.prepare_grads = lambda: False
+    module.begin_mopd_operation(adapter, "train", "fixed_objective", noise_mode="none")
+    monkeypatch.setattr(module, "_gradient_square_sums", lambda *a, **kw: pytest.fail("Uniform measured noise"))
+    monkeypatch.setattr(module, "welford_gradients", lambda *a, **kw: pytest.fail("Uniform measured noise"))
+    for task_index, (task, count) in enumerate(zip(TASKS, [2, 2, 4, 8], strict=True)):
+        data = {
+            "mopd_operations": ["train"] * 4,
+            "mopd_tasks": [task] * 4,
+            "mopd_aggregations": ["fixed_objective"] * 4,
+            "mopd_task_microbatch_counts": [count] * 4,
+            "mopd_target_weights": [0.25] * 4,
+            "metadata": [{support_key: [], "mopd_teacher_loss": 0.3} for _ in range(4)],
+            "loss_masks": [torch.ones(1)] * 4,
+        }
+        iterator = SimpleNamespace(offset=1, micro_batch_indices=[[0, 1, 2, 3]], rollout_data=data)
+        for _ in range(count):
+            parameter.grad = torch.tensor([float(task_index + 1), 1.0])
+            module.mopd_capture_step(
+                SimpleNamespace(mopd_score_chunk_size=2), [iterator], [model], adapter, num_microbatches=1
+            )
+    module._finish_task(adapter._mopd_operation_accumulator, 2)
+    captured = adapter._mopd_operation_accumulator
+    torch.testing.assert_close(next(iter(captured.aggregate.values())), torch.tensor([2.5, 1.0]))
+    assert all(unit["scaled_noise"] is None and not unit["noise_collected"] for unit in captured.task_units)
+
+
+def test_trial_variance_uses_one_frozen_preconditioner_before_clipping():
+    from slime_plugins.mopd.diagnostic import record_trial_gradient
+    from slime_plugins.mopd.optimizer import _preconditioner_denominator
+
+    parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+    optimizer = _initialized_adam(parameter)
+    optimizer._mopd_trial_variance = {}
+    views = build_optimizer_parameter_views([("p", parameter, [])], optimizer, requested_optimizer="adam")
+    denominator = _preconditioner_denominator(views[0], 0, 2, device=parameter.device)
+    for branch, scale in [("uniform", 1.0), ("gpas", 0.5)]:
+        optimizer._mopd_trial_branch = branch
+        draws = torch.tensor([[float(i), float(i * i)] for i in range(10)]) * scale
+        for gradient in draws:
+            parameter.grad = gradient
+            record_trial_gradient(optimizer, views)
+        result = optimizer._mopd_trial_variance[branch]
+        assert result["m2"] / 9 == pytest.approx(float((draws / denominator).var(dim=0).sum()), rel=1e-5)
+    assert optimizer._mopd_trial_variance["gpas"]["m2"] / optimizer._mopd_trial_variance["uniform"][
+        "m2"
+    ] == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize("broken_restore", [False, True])
+def test_common_checkpoint_restores_distributed_master_parameters_and_moments(monkeypatch, broken_restore):
+    from megatron.core.optimizer import distrib_optimizer
+    from megatron.core.tensor_parallel import random as megatron_random
+
+    from slime_plugins.mopd.diagnostic import assert_restored_state, restore_actor, snapshot_actor
+
+    model = torch.nn.Linear(2, 1, bias=False)
+    master = torch.nn.Parameter(model.weight.detach().float().clone())
+    adam = torch.optim.AdamW([master], lr=0.01, weight_decay=0)
+    master.grad = torch.ones_like(master)
+    adam.step()
+    with torch.no_grad():
+        model.weight.copy_(master)
+
+    class MetadataOnlyDistributedOptimizer:
+        # Match Megatron's split between scalar metadata and parameter state.
+        def state_dict(self):
+            return {"lr": adam.param_groups[0]["lr"]}
+
+        def load_state_dict(self, state):
+            adam.param_groups[0]["lr"] = state["lr"]
+
+        def get_parameter_state_dp_zero(self):
+            return {"param": master, "optimizer": adam.state_dict()}
+
+        def load_parameter_state_from_dp_zero(self, state):
+            if broken_restore:
+                return
+            with torch.no_grad():
+                master.copy_(state["param"])
+            adam.load_state_dict(state["optimizer"])
+
+    monkeypatch.setattr(distrib_optimizer, "DistributedOptimizer", MetadataOnlyDistributedOptimizer)
+    tracker = SimpleNamespace(get_states=lambda: {}, set_states=lambda state: None)
+    monkeypatch.setattr(megatron_random, "get_cuda_rng_tracker", lambda: tracker)
+    monkeypatch.setattr(torch.cuda, "get_rng_state", torch.get_rng_state)
+    monkeypatch.setattr(torch.cuda, "set_rng_state", lambda state: None)
+    actor = SimpleNamespace(
+        model=[model], optimizer=MetadataOnlyDistributedOptimizer(),
+        opt_param_scheduler=torch.optim.lr_scheduler.StepLR(adam, step_size=10),
+    )
+    saved = snapshot_actor(actor)
+    expected_parameter = master.detach().clone()
+    expected_optimizer = copy.deepcopy(adam.state_dict())
+    outcomes = []
+    for _ in range(2):
+        master.grad = torch.full_like(master, 3.0)
+        adam.step()
+        with torch.no_grad():
+            model.weight.copy_(master)
+        if broken_restore:
+            with pytest.raises(RuntimeError, match="not restored exactly"):
+                restore_actor(actor, saved)
+            return
+        restore_actor(actor, saved)
+        torch.testing.assert_close(master, expected_parameter, rtol=0, atol=0)
+        torch.testing.assert_close(model.weight, expected_parameter, rtol=0, atol=0)
+        assert_restored_state(adam.state_dict(), expected_optimizer)
+        master.grad = torch.full_like(master, 2.0)
+        adam.step()
+        outcomes.append(master.detach().clone())
+    torch.testing.assert_close(outcomes[0], outcomes[1], rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+@pytest.mark.parametrize("reduction", ["global_token", "domain_token", "domain_response"])
+def test_paper_unequal_lengths_match_direct_reduction_and_one_adam_step(reduction):
+    from slime_plugins.mopd import optimizer as module
+    from slime_plugins.mopd.paper_diagnostics import prefix_weights
+
+    parameter = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+    reference_parameter = torch.nn.Parameter(parameter.detach().clone())
+    optimizer = _initialized_adam(parameter)
+    reference = _initialized_adam(reference_parameter)
+    model = torch.nn.Module()
+    model.register_parameter("weight", parameter)
+    adapter = _MegatronAdamAdapter(optimizer, parameter)
+    adapter.prepare_grads = lambda: False
+    module.begin_mopd_operation(adapter, "train", reduction)
+    args = SimpleNamespace(mopd_score_chunk_size=2, mopd_profile="smollm3", mopd_tasks="math,code,if",
+                           mopd_prompts_per_microbatch=2, clip_grad=0.0)
+    all_masks, domains, all_coefficients = [], [], []
+    for task_index, task in enumerate(("math", "code", "if")):
+        # Two unequal-length micro-batches in each task; two responses apiece.
+        for batch_index in range(2):
+            lengths = [1 + task_index + batch_index, 4 + 2 * task_index + batch_index]
+            coefficients = [torch.arange(length * 2, dtype=torch.float32).reshape(length, 2) / 9 + task_index for length in lengths]
+            losses = [coefficient @ parameter for coefficient in coefficients]
+            token_reduction = reduction != "domain_response"
+            batch_loss = sum(value.sum() for value in losses) / sum(lengths) if token_reduction else sum(value.mean() for value in losses) / 2
+            optimizer.zero_grad()
+            batch_loss.backward()
+            masks = [torch.ones(length) for length in lengths]
+            data = {
+                "mopd_operations": ["train"] * 2, "mopd_tasks": [task] * 2,
+                "mopd_aggregations": [reduction] * 2, "mopd_task_microbatch_counts": [2] * 2,
+                "mopd_target_weights": [1 / 3] * 2,
+                "metadata": [{"teacher_topk_ids": [], "mopd_teacher_loss": float(value.detach().mean())} for value in losses],
+                "loss_masks": masks,
+            }
+            iterator = SimpleNamespace(offset=1, micro_batch_indices=[[0, 1]], rollout_data=data)
+            module.mopd_capture_step(args, [iterator], [model], adapter, num_microbatches=1)
+            all_masks.extend(masks)
+            all_coefficients.extend(coefficients)
+            domains.extend([task] * 2)
+    positions = torch.cat(all_coefficients) @ reference_parameter
+    (positions * prefix_weights(all_masks, domains, reduction)).sum().backward()
+    expected_gradient = reference_parameter.grad.clone()
+    reference.step()
+    _, norm, feedback = module.finish_mopd_operation(args, adapter)
+    torch.testing.assert_close(parameter, reference_parameter)
+    torch.testing.assert_close(optimizer.state[parameter]["exp_avg"], reference.state[reference_parameter]["exp_avg"])
+    assert norm == pytest.approx(float(expected_gradient.norm()))
+    assert feedback["attempted_responses"] == 12

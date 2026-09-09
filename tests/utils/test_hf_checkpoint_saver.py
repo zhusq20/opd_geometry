@@ -18,6 +18,39 @@ from slime.backends.megatron_utils.hf_checkpoint_saver import (
 NUM_GPUS = 0
 
 
+@pytest.mark.parametrize("directory", ["snapshot", "iter_0000499"])
+@pytest.mark.parametrize("weight_file", ["model.safetensors", "model.safetensors.index.json"])
+def test_hf_exports_load_as_hf_even_with_iteration_directory_names(tmp_path, monkeypatch, directory, weight_file):
+    pytest.importorskip("megatron.training")
+    from slime.backends.megatron_utils import checkpoint
+
+    path = tmp_path / directory
+    path.mkdir()
+    (path / weight_file).write_bytes(b"weights")
+    args = SimpleNamespace(load=str(path))
+    monkeypatch.setattr(checkpoint, "get_args", lambda: args)
+    loaded = []
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_hf", lambda **kwargs: loaded.append(kwargs) or (0, 0))
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", lambda **_: pytest.fail("HF export routed to Megatron"))
+
+    assert checkpoint.load_checkpoint(None, None, None, None, False) == (0, 0)
+    assert loaded[0]["load_path"] == str(path)
+
+
+def test_megatron_checkpoint_selector_and_iteration_directories_still_load_as_megatron(tmp_path):
+    pytest.importorskip("megatron.training")
+    from slime.backends.megatron_utils.checkpoint import _is_megatron_checkpoint
+
+    root = tmp_path / "checkpoints"
+    root.mkdir()
+    (root / "latest_checkpointed_iteration.txt").write_text("499")
+    iteration = root / "iter_0000499"
+    iteration.mkdir()
+    (iteration / ".metadata").write_bytes(b"distributed checkpoint metadata")
+    assert _is_megatron_checkpoint(root)
+    assert _is_megatron_checkpoint(iteration)
+
+
 def test_copy_hf_assets_keeps_quantized_config_and_skips_weights(tmp_path: Path):
     src = tmp_path / "src"
     dst = tmp_path / "dst"

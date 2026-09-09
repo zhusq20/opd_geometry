@@ -5,7 +5,7 @@ set -euo pipefail
 RUN_ID="$1"
 ALLOCATION="$2"
 case "${ALLOCATION}" in
-  uniform|gpas|cost_gpas|raw_noise|loss_gap|std_mopd|d3_mopd|open_mopd) ;;
+  uniform|gpas|raw_noise|d3_fixed) ;;
   *) echo "Unknown allocation: ${ALLOCATION}" >&2; exit 2 ;;
 esac
 
@@ -13,28 +13,74 @@ EXAMPLE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SLIME_ROOT="$(cd -- "${EXAMPLE_DIR}/../.." && pwd)"
 MEGATRON_PATH="${MEGATRON_PATH:-/root/Megatron-LM}"
 export PYTHONPATH="${SLIME_ROOT}:${MEGATRON_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
-export MOPD_HF_CHECKPOINT="${MOPD_HF_CHECKPOINT:-/workspace/dev/checkpoints/Qwen3-1.7B}"
-export MOPD_BASE_MEGATRON="${MOPD_BASE_MEGATRON:-/workspace/dev/checkpoints/Qwen3-1.7B_torch_dist}"
+export MOPD_HF_CHECKPOINT="${MOPD_HF_CHECKPOINT:-/workspace/dev/checkpoints/Qwen3-1.7B-Base}"
+export MOPD_BASE_MEGATRON="${MOPD_BASE_MEGATRON:-/workspace/dev/checkpoints/Qwen3-1.7B-Base_torch_dist}"
 export MOPD_TEACHER_HF_ROOT="${MOPD_TEACHER_HF_ROOT:-${SLIME_ROOT}/local/mopd_assets/models/teachers_hf}"
-export MOPD_QWEN3_4B="${MOPD_QWEN3_4B:-${SLIME_ROOT}/local/mopd_assets/models/qwen3-4b}"
 export MOPD_TRAIN_GPU="${MOPD_TRAIN_GPU:-0}"
+export MOPD_TRAIN_GPUS="${MOPD_TRAIN_GPUS:-${MOPD_TRAIN_GPU}}"
 export MOPD_INFERENCE_GPU="${MOPD_INFERENCE_GPU:-1}"
+export MOPD_HARDWARE_PROFILE="${MOPD_HARDWARE_PROFILE:-frozen-96gb-tp1}"
 export MOPD_TEACHER_MATH_PORT="${MOPD_TEACHER_MATH_PORT:-31001}"
 export MOPD_TEACHER_CODE_PORT="${MOPD_TEACHER_CODE_PORT:-31002}"
 export MOPD_TEACHER_IF_PORT="${MOPD_TEACHER_IF_PORT:-31003}"
 export MOPD_TEACHER_SCIENCE_PORT="${MOPD_TEACHER_SCIENCE_PORT:-31004}"
-[[ "${MOPD_TRAIN_GPU}" != "${MOPD_INFERENCE_GPU}" ]] || {
-  echo "Training and inference GPU IDs must differ." >&2
-  exit 2
-}
+export MOPD_TEACHER_MATH_GPU="${MOPD_TEACHER_MATH_GPU:-${MOPD_INFERENCE_GPU}}"
+export MOPD_TEACHER_CODE_GPU="${MOPD_TEACHER_CODE_GPU:-${MOPD_INFERENCE_GPU}}"
+export MOPD_TEACHER_IF_GPU="${MOPD_TEACHER_IF_GPU:-${MOPD_INFERENCE_GPU}}"
+export MOPD_TEACHER_SCIENCE_GPU="${MOPD_TEACHER_SCIENCE_GPU:-${MOPD_INFERENCE_GPU}}"
+IFS=',' read -r -a TRAIN_GPU_IDS <<<"${MOPD_TRAIN_GPUS}"
+case "${MOPD_HARDWARE_PROFILE}" in
+  frozen-96gb-tp1)
+    [[ "${#TRAIN_GPU_IDS[@]}" == 1 ]] || {
+      echo "frozen-96gb-tp1 requires exactly one training GPU." >&2
+      exit 2
+    }
+    TENSOR_MODEL_PARALLEL_SIZE=1
+    ;;
+  dual-48gb-tp2)
+    [[ "${#TRAIN_GPU_IDS[@]}" == 2 ]] || {
+      echo "dual-48gb-tp2 requires exactly two training GPUs." >&2
+      exit 2
+    }
+    TENSOR_MODEL_PARALLEL_SIZE=2
+    # This A6000 host's PCIe P2P path lets one NCCL rank complete while the
+    # peer spins indefinitely.  Shared-memory NCCL passed the same two-rank
+    # collective and changes transport only, not the experiment protocol.
+    export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
+    ;;
+  *)
+    echo "Unknown MOPD hardware profile: ${MOPD_HARDWARE_PROFILE}" >&2
+    exit 2
+    ;;
+esac
+declare -A REQUESTED_GPU_IDS=()
+for gpu in "${TRAIN_GPU_IDS[@]}" "${MOPD_INFERENCE_GPU}"; do
+  [[ "${gpu}" =~ ^[0-9]+$ ]] || { echo "Invalid physical GPU ID: ${gpu}" >&2; exit 2; }
+  [[ -z "${REQUESTED_GPU_IDS[${gpu}]:-}" ]] || { echo "GPU ${gpu} is assigned twice." >&2; exit 2; }
+  REQUESTED_GPU_IDS["${gpu}"]=1
+done
+export MOPD_TRAIN_GPU="${TRAIN_GPU_IDS[0]}"
+TOTAL_GPUS_PER_RUN=$((${#TRAIN_GPU_IDS[@]} + 1))
+HARDWARE_ARGS=(--profile "${MOPD_HARDWARE_PROFILE}")
+for gpu in "${TRAIN_GPU_IDS[@]}"; do HARDWARE_ARGS+=(--training-gpu "${gpu}"); done
+HARDWARE_ARGS+=(--inference-gpu "${MOPD_INFERENCE_GPU}")
+for gpu in \
+  "${MOPD_TEACHER_MATH_GPU}" \
+  "${MOPD_TEACHER_CODE_GPU}" \
+  "${MOPD_TEACHER_IF_GPU}" \
+  "${MOPD_TEACHER_SCIENCE_GPU}"; do
+  HARDWARE_ARGS+=(--service-gpu "${gpu}")
+  REQUESTED_GPU_IDS["${gpu}"]=1
+done
+OCCUPIED_GPUS="${#REQUESTED_GPU_IDS[@]}"
 
-GENERATED="${MOPD_GENERATED_DIR:-${SLIME_ROOT}/local/mopd_generated}"
+GENERATED="${MOPD_GENERATED_DIR:-${SLIME_ROOT}/local/mopd_no_think_generated}"
 TRAIN_MANIFEST="${GENERATED}/train.yaml"
 EVAL_CONFIG="${GENERATED}/teacher_loss_eval.yaml"
 PROTOCOL="${GENERATED}/protocol.json"
-TEACHER_ROUTER="${EXAMPLE_DIR}/configs/teacher_router.yaml"
-OUTPUT_ROOT="${MOPD_OUTPUT_ROOT:-${SLIME_ROOT}/outputs/mopd_gpas_v4}"
-RUN_DIR="${OUTPUT_ROOT}/${RUN_ID}-seed42"
+TEACHER_ROUTER="${MOPD_TEACHER_ROUTER_CONFIG:-${EXAMPLE_DIR}/configs/teacher_router.yaml}"
+OUTPUT_ROOT="${MOPD_OUTPUT_ROOT:-${SLIME_ROOT}/outputs/mopd_no_think}"
+RUN_DIR="${OUTPUT_ROOT}/${RUN_ID}"
 MODEL_CONFIG="${SLIME_ROOT}/scripts/models/qwen3-1.7B.sh"
 DRY_RUN="${DRY_RUN:-0}"
 USE_WANDB="${USE_WANDB:-1}"
@@ -68,8 +114,11 @@ elif [[ "${MOPD_SMOKE_TEST}" == 1 ]]; then
 else
   TOTAL_STEPS=500
   RESPONSE_BUDGET=32000
-  CHECKPOINT_STEPS=50,100,150,200,250,300,350,400,450,500
-  EVAL_RESPONSES=3200,6400,9600,12800,16000,19200,22400,25600,28800,32000
+  CHECKPOINT_STEPS=100,200,300,400,500
+  if [[ "${ALLOCATION}" == uniform || "${ALLOCATION}" == gpas ]]; then
+    CHECKPOINT_STEPS=100,200,250,300,400,500
+  fi
+  EVAL_RESPONSES=6400,12800,19200,25600,32000
   ROLLOUT_MAX_RESPONSE_LEN=4096
   MOPD_MODE_ARGS=()
   EVAL_ARGS=(
@@ -85,12 +134,32 @@ for path in "${TRAIN_MANIFEST}" "${EVAL_CONFIG}" "${PROTOCOL}" "${TEACHER_ROUTER
 done
 [[ -f "${MOPD_HF_CHECKPOINT}/config.json" ]] || { echo "Missing student HF checkpoint." >&2; exit 2; }
 
+python3 - "${PROTOCOL}" "${TRAIN_MANIFEST}" "${TEACHER_ROUTER}" <<'PY'
+import sys
+from types import SimpleNamespace
+
+from slime_plugins.m2rl.data_source import load_manifest
+from slime_plugins.mopd.prompting import EMPTY_THINKING_SUFFIX, validate_prompt_runtime
+
+validate_prompt_runtime(
+    SimpleNamespace(
+        experiment_data_index=sys.argv[1],
+        mopd_loss="teacher_topk",
+        chat_template_suffix_to_remove=EMPTY_THINKING_SUFFIX,
+        opd_teacher_router_config=sys.argv[3],
+        apply_chat_template=True,
+        apply_chat_template_kwargs={"enable_thinking": False},
+    ),
+    load_manifest(sys.argv[2])[0],
+)
+PY
+
 START_ARGS=()
 EXTRA_LOAD_ARGS=()
 CHECKPOINT_FOR_PROVENANCE="${MOPD_BASE_MEGATRON}"
 if [[ "${MOPD_RESUME}" == 1 ]]; then
   [[ "${DRY_RUN}" == 0 ]] || { echo "A dry run cannot resume mutable state." >&2; exit 2; }
-  RESUME_JSON="$(python3 "${EXAMPLE_DIR}/prepare_resume.py" --run-dir "${RUN_DIR}")"
+  RESUME_JSON="$(python3 "${EXAMPLE_DIR}/prepare_resume.py" --run-dir "${RUN_DIR}" --protocol "${PROTOCOL}")"
   read -r RESUME_CHECKPOINT_ID RESUME_START_ID RESUME_EVAL_ON_START < <(
     python3 - "${RESUME_JSON}" <<'PY'
 import json, sys
@@ -103,6 +172,15 @@ PY
   [[ "${RESUME_EVAL_ON_START}" == 0 ]] || START_ARGS+=(--mopd-eval-on-start)
   EXTRA_LOAD_ARGS=(--ckpt-step "${RESUME_CHECKPOINT_ID}")
   CHECKPOINT_FOR_PROVENANCE="${LOAD_CHECKPOINT}/iter_$(printf '%07d' "${RESUME_CHECKPOINT_ID}")"
+elif [[ "${MOPD_COMMON_CHECKPOINT:-0}" == 1 ]]; then
+  LOAD_CHECKPOINT="${OUTPUT_ROOT}/uniform-s1/checkpoints"
+  START_ARGS=(--start-rollout-id 250)
+  EXTRA_LOAD_ARGS=(--ckpt-step 249 --mopd-common-checkpoint --mopd-diagnostic-data "${GENERATED}/diagnostic.yaml")
+  CHECKPOINT_FOR_PROVENANCE="${LOAD_CHECKPOINT}/iter_0000249"
+  if [[ "${DRY_RUN}" == 0 && -e "${RUN_DIR}" ]]; then
+    echo "Common-checkpoint output already exists: ${RUN_DIR}" >&2
+    exit 2
+  fi
 else
   LOAD_CHECKPOINT="${MOPD_BASE_MEGATRON}"
   START_ARGS=(--start-rollout-id 0 --no-load-optim --no-load-rng --override-opt-param-scheduler)
@@ -113,8 +191,7 @@ else
 fi
 
 if [[ "${DRY_RUN}" == 0 ]]; then
-  python3 "${EXAMPLE_DIR}/verify_hardware.py" \
-    --training-gpu "${MOPD_TRAIN_GPU}" --inference-gpu "${MOPD_INFERENCE_GPU}"
+  python3 "${EXAMPLE_DIR}/verify_hardware.py" "${HARDWARE_ARGS[@]}"
   bash "${EXAMPLE_DIR}/serve_teachers.sh" status
   if [[ "${USE_WANDB}" == 1 && "${WANDB_MODE:-online}" == online ]]; then
     python3 - <<'PY'
@@ -125,7 +202,7 @@ PY
   fi
 fi
 
-export RAY_TEMP_DIR="${RAY_TEMP_DIR:-/dev/shm/mopd_${MOPD_TRAIN_GPU}_${MOPD_INFERENCE_GPU}_$$}"
+export RAY_TEMP_DIR="${RAY_TEMP_DIR:-/dev/shm/mopd_${MOPD_TRAIN_GPUS//,/_}_${MOPD_INFERENCE_GPU}_$$}"
 export RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
 export RAY_GCS_PORT="${RAY_GCS_PORT:-6379}"
 export RAY_AUX_PORT_STRIDE="${RAY_AUX_PORT_STRIDE:-128}"
@@ -141,7 +218,8 @@ export SLIME_ROLLOUT_PORT_BASE="${SLIME_ROLLOUT_PORT_BASE:-$((20000 + (RAY_DASHB
 
 export MODEL_ARGS_ROTARY_BASE=1000000
 source "${MODEL_CONFIG}"
-export CUDA_VISIBLE_DEVICES="${MOPD_TRAIN_GPU},${MOPD_INFERENCE_GPU}"
+export CUDA_VISIBLE_DEVICES="${MOPD_TRAIN_GPUS},${MOPD_INFERENCE_GPU}"
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 TRAIN_CMD=(
   python3 "${SLIME_ROOT}/train.py"
@@ -159,6 +237,7 @@ TRAIN_CMD=(
   --rollout-function-path slime_plugins.mopd.rollout.generate_rollout
   --input-key prompt --label-key label --metadata-key metadata --tool-key tools
   --apply-chat-template --apply-chat-template-kwargs '{"enable_thinking":false}'
+  --chat-template-suffix-to-remove $'<think>\n\n</think>\n\n'
   --rollout-global-dataset --rollout-shuffle --rollout-seed 42
   --num-rollout "${TOTAL_STEPS}" --rollout-batch-size 64 --global-batch-size 4 --micro-batch-size 1
   --n-samples-per-prompt 1
@@ -167,6 +246,8 @@ TRAIN_CMD=(
   --balance-data
 
   --mopd-enabled --mopd-allocation "${ALLOCATION}" --mopd-seed 42
+  --mopd-loss teacher_topk --mopd-reference-bank "${GENERATED}/reference_bank.pt"
+  --mopd-occupied-gpus "${OCCUPIED_GPUS}"
   "${MOPD_MODE_ARGS[@]}"
   --mopd-ema-decay 0.9 --mopd-total-steps "${TOTAL_STEPS}"
   --mopd-microbatches-per-step 16 --mopd-prompts-per-microbatch 4
@@ -177,11 +258,11 @@ TRAIN_CMD=(
   --mopd-failure-penalty 10.0 --mopd-score-chunk-size 1048576
   --mopd-output-dir "${RUN_DIR}/allocation"
 
-  --advantage-estimator grpo --use-rollout-logprobs
-  --use-opd --opd-type sglang --opd-kl-coef 1.0
+  --disable-compute-advantages-and-returns
+  --loss-type custom_loss --custom-loss-function-path slime_plugins.mopd.loss.teacher_topk_loss
   --opd-teacher-router-config "${TEACHER_ROUTER}" --opd-task-reward-weight 0.0
   --custom-rm-path slime_plugins.m2rl.opd.teacher_reward
-  --custom-reward-post-process-path slime_plugins.m2rl.opd.post_process_rewards
+  --custom-reward-post-process-path slime_plugins.mopd.loss.post_process_rewards
   --entropy-coef 0.0 --kl-coef 0.0 --kl-loss-coef 0.0
   --eps-clip 0.2 --eps-clip-high 0.2
 
@@ -189,33 +270,34 @@ TRAIN_CMD=(
   --adam-beta1 0.9 --adam-beta2 0.98 --adam-eps 1e-8
   --lr-decay-style constant --lr-warmup-iters 0 --lr-decay-iters "${TOTAL_STEPS}" --clip-grad 1.0
 
-  --tensor-model-parallel-size 1 --pipeline-model-parallel-size 1 --context-parallel-size 1
+  --tensor-model-parallel-size "${TENSOR_MODEL_PARALLEL_SIZE}"
+  --pipeline-model-parallel-size 1 --context-parallel-size 1
   --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
   "${EVAL_ARGS[@]}"
 
   --metrics-output-dir "${RUN_DIR}/metrics"
   --run-manifest-path "${RUN_DIR}/provenance/run_manifest.json"
   --completion-marker-path "${RUN_DIR}/run_complete.json"
-  --experiment-task multi --experiment-teacher math_if_rl_code_science_qwen3_4b_resident
+  --experiment-task multi --experiment-teacher math_code_if_science_qwen3_1p7b_rl_resident
   --experiment-condition "${RUN_ID}" --experiment-name "${RUN_ID}-seed42"
   --experiment-optimizer adamw --experiment-data-index "${PROTOCOL}"
 
-  --rollout-num-gpus 1 --rollout-num-gpus-per-engine 1 --num-gpus-per-node 2
+  --rollout-num-gpus 1 --rollout-num-gpus-per-engine 1 --num-gpus-per-node "${TOTAL_GPUS_PER_RUN}"
   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION:-0.32}"
   --sglang-enable-deterministic-inference
-  --actor-num-nodes 1 --actor-num-gpus-per-node 1
+  --actor-num-nodes 1 --actor-num-gpus-per-node "${#TRAIN_GPU_IDS[@]}"
   --attention-dropout 0.0 --hidden-dropout 0.0
   --accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32
   --attention-backend flash --seed 42
 )
-if [[ "${ALLOCATION}" == std_mopd || "${ALLOCATION}" == d3_mopd || "${ALLOCATION}" == open_mopd ]]; then
-  TRAIN_CMD+=(--calculate-per-token-loss)
+if [[ -n "${SGLANG_ROUTER_PORT:-}" ]]; then
+  TRAIN_CMD+=(--sglang-router-port "${SGLANG_ROUTER_PORT}")
 fi
 if [[ "${USE_WANDB}" == 1 ]]; then
   TRAIN_CMD+=(
     --use-wandb --wandb-mode "${WANDB_MODE:-online}" --wandb-dir "${RUN_DIR}/wandb"
-    --wandb-team "${WANDB_ENTITY:-zsqzz}" --wandb-project "${WANDB_PROJECT:-iclr2027-mopd-gpas-v4}"
-    --wandb-group "Qwen3-1.7B-4T-microbatch-MOPD-${TOTAL_STEPS}-step"
+    --wandb-team "${WANDB_ENTITY:-zsqzz}" --wandb-project "${WANDB_PROJECT:-iclr2027-mopd-gpas-core}"
+    --wandb-group "Qwen3-1.7B-Base-4T-microbatch-MOPD-${TOTAL_STEPS}-step"
     --wandb-run-name "${RUN_ID}-seed42"
     --wandb-run-id-file "${RUN_DIR}/wandb_run_id.txt" --disable-wandb-random-suffix
   )
@@ -224,10 +306,12 @@ fi
 printf 'Launch command:'; printf ' %q' "${TRAIN_CMD[@]}"; printf '\n'
 if [[ "${DRY_RUN}" == 1 ]]; then
   python3 -c '
+import slime.backends.megatron_utils.arguments as ma
 import slime.utils.arguments as sa
+ma.validate_args=lambda args: args
 sa.sglang_validate_args=lambda args: args
 sa.parse_args()
-print("static argument validation: OK")
+print("static MOPD argument validation: OK (GPU/Megatron checks run at launch)")
 ' "${TRAIN_CMD[@]:2}"
   exit 0
 fi
@@ -235,7 +319,7 @@ fi
 mkdir -p "${RUN_DIR}"
 PROVENANCE_ACTION=start
 if [[ "${MOPD_RESUME}" == 1 ]]; then
-  APPLIED_RESUME_JSON="$(python3 "${EXAMPLE_DIR}/prepare_resume.py" --run-dir "${RUN_DIR}" --apply)"
+  APPLIED_RESUME_JSON="$(python3 "${EXAMPLE_DIR}/prepare_resume.py" --run-dir "${RUN_DIR}" --protocol "${PROTOCOL}" --apply)"
   python3 - "${RESUME_JSON}" "${APPLIED_RESUME_JSON}" <<'PY'
 import json, sys
 before, after = map(json.loads, sys.argv[1:])
@@ -253,7 +337,8 @@ python3 "${EXAMPLE_DIR}/provenance.py" "${PROVENANCE_ACTION}" --repo "${SLIME_RO
   --source "${SLIME_ROOT}/slime/backends/megatron_utils/data.py" \
   --source "${SLIME_ROOT}/slime/backends/megatron_utils/model.py" \
   --source "${SLIME_ROOT}/slime/ray/rollout.py" \
-  --source "${SLIME_ROOT}/slime/utils/arguments.py" --source "${SLIME_ROOT}/train.py" -- "${TRAIN_CMD[@]}"
+  --source "${SLIME_ROOT}/slime/utils/arguments.py" \
+  --source "${SLIME_ROOT}/train.py" -- "${TRAIN_CMD[@]}"
 
 RAY_PID=""
 cleanup() {
@@ -268,7 +353,7 @@ if [[ -z "${RAY_ADDRESS}" ]]; then
   MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
   mkdir -p "${RAY_TEMP_DIR}"
   ray start --head --node-ip-address "${MASTER_ADDR}" --port "${RAY_GCS_PORT}" \
-    --num-cpus "${RAY_NUM_CPUS}" --num-gpus 2 --disable-usage-stats \
+    --num-cpus "${RAY_NUM_CPUS}" --num-gpus "${TOTAL_GPUS_PER_RUN}" --disable-usage-stats \
     --dashboard-host 0.0.0.0 --dashboard-port "${RAY_DASHBOARD_PORT}" \
     --dashboard-agent-listen-port "$((RAY_AUX_PORT_BASE + 0))" \
     --dashboard-agent-grpc-port "$((RAY_AUX_PORT_BASE + 1))" \
@@ -299,8 +384,11 @@ RUNTIME_ENV_JSON="$(python3 - "${PYTHONPATH}" <<'PY'
 import json, os, sys
 keys = (
     "WANDB_API_KEY", "WANDB_BASE_URL", "NLTK_DATA", "CUDA_VISIBLE_DEVICES",
-    "MOPD_HF_CHECKPOINT", "MOPD_TEACHER_HF_ROOT", "MOPD_QWEN3_4B",
-    "MOPD_TRAIN_GPU", "MOPD_INFERENCE_GPU", "MOPD_TEACHER_MATH_PORT",
+    "NCCL_P2P_DISABLE",
+    "MOPD_HF_CHECKPOINT", "MOPD_TEACHER_HF_ROOT",
+    "MOPD_HARDWARE_PROFILE", "MOPD_TRAIN_GPU", "MOPD_TRAIN_GPUS", "MOPD_INFERENCE_GPU",
+    "MOPD_TEACHER_MATH_GPU", "MOPD_TEACHER_CODE_GPU", "MOPD_TEACHER_IF_GPU", "MOPD_TEACHER_SCIENCE_GPU",
+    "MOPD_TEACHER_MATH_PORT",
     "MOPD_TEACHER_CODE_PORT", "MOPD_TEACHER_IF_PORT", "MOPD_TEACHER_SCIENCE_PORT",
     "SLIME_ROLLOUT_PORT_BASE",
 )

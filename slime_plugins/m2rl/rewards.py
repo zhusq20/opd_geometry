@@ -11,12 +11,17 @@ Knights-and-Knaves uses a local strict binary verifier.
 from __future__ import annotations
 
 import asyncio
+import base64
+import importlib.util
 import json
 import math
 import os
 import random
 import re
+import pickle
+import zlib
 from pathlib import Path
+from functools import lru_cache
 from typing import Any
 
 import aiohttp
@@ -133,8 +138,19 @@ async def code_reward(args: Any, sample: Sample, config: dict[str, Any]) -> floa
     unit_tests = (sample.metadata or {}).get("unit_tests") or {}
     if isinstance(unit_tests, str):
         unit_tests = json.loads(unit_tests)
+    function_name = unit_tests.get("fn_name")
+    if function_name:
+        code = _functional_test_program(code, str(function_name))
     inputs = list(unit_tests.get("inputs") or [])
     outputs = list(unit_tests.get("outputs") or [])
+    if function_name:
+        # Released TACO rows store arguments as arrays and each return value
+        # inside a singleton output array. LCB-style string cases already use
+        # one JSON argument per line and an unwrapped JSON result.
+        inputs = [
+            "\n".join(json.dumps(arg) for arg in value) if isinstance(value, list) else value for value in inputs
+        ]
+        outputs = [value[0] if isinstance(value, list) and len(value) == 1 else value for value in outputs]
     if len(inputs) != len(outputs) or not inputs:
         return 0.0
 
@@ -159,28 +175,53 @@ async def code_reward(args: Any, sample: Sample, config: dict[str, Any]) -> floa
             *[_execute_code(session, str(url), code, str(stdin), config) for stdin in inputs],
             return_exceptions=True,
         )
-    passed = 0
-    errors = 0
-    timeouts = 0
+    passed = errors = timeouts = infrastructure_errors = execution_errors = 0
+    statuses: dict[str, int] = {}
     for result, expected in zip(results, outputs, strict=True):
         if isinstance(result, Exception):
             status = type(result).__name__.lower()
             errors += 1
+            infrastructure_errors += 1
         else:
             status = str(result.get("status", "unknown")).lower()
             stdout = result.get("stdout")
-            if status == "success" and isinstance(stdout, str) and stdout.strip() == str(expected).strip():
+            if (
+                status == "success"
+                and isinstance(stdout, str)
+                and _test_output_matches(stdout, expected, bool(function_name))
+            ):
                 passed += 1
             elif status != "success":
                 errors += 1
+                infrastructure = status.startswith("http_") or status in {
+                    "sandboxerror",
+                    "sandbox_error",
+                    "service_failed",
+                    "malformed_result",
+                }
+                infrastructure_errors += int(infrastructure)
+                execution_errors += int(not infrastructure)
+        statuses[status] = statuses.get(status, 0) + 1
         timeouts += int("time" in status)
-    outcome = "accepted" if passed == len(inputs) else ("sandbox_error" if errors else "wrong_answer")
+    if passed == len(inputs):
+        outcome = "accepted"
+    elif infrastructure_errors:
+        outcome = "sandbox_error"
+    elif timeouts:
+        outcome = "timeout"
+    elif execution_errors:
+        outcome = "execution_error"
+    else:
+        outcome = "wrong_answer"
     sample.metadata["sandbox_eval"] = {
         "evaluator": "unit_test",
         "outcome": outcome,
         "cases_total": len(inputs),
         "cases_passed": passed,
         "errors": errors,
+        "infrastructure_errors": infrastructure_errors,
+        "execution_errors": execution_errors,
+        "status_counts": statuses,
         "timeouts": timeouts,
     }
     metric = str(config.get("metric", "pass_all"))
@@ -189,6 +230,88 @@ async def code_reward(args: Any, sample: Sample, config: dict[str, Any]) -> floa
     if metric == "pass_all":
         return float(passed == len(inputs))
     raise ValueError(f"Unknown code reward metric {metric!r}; expected pass_all or pass_avg.")
+
+
+def _functional_test_program(code: str, function_name: str) -> str:
+    """Run TACO call-based tests inside the existing external sandbox."""
+    return (
+        "from typing import *\nimport json, sys\n"
+        + code
+        + "\n_opd_args = [json.loads(line) for line in sys.stdin.read().splitlines() if line.strip()]\n"
+        + f"_opd_fn_name = {function_name!r}\n"
+        + "_opd_fn = globals().get(_opd_fn_name)\n"
+        + "if _opd_fn is None:\n    _opd_fn = getattr(Solution(), _opd_fn_name)\n"
+        + "print(json.dumps(_opd_fn(*_opd_args)))\n"
+    )
+
+
+def _test_output_matches(stdout: str, expected: Any, functional: bool) -> bool:
+    if functional:
+        try:
+            wanted = json.loads(expected) if isinstance(expected, str) else expected
+            return json.loads(stdout) == wanted
+        except (TypeError, ValueError):
+            return False
+    return stdout.strip() == str(expected).strip()
+
+
+@lru_cache(maxsize=4)
+def _open_mopd_if_scorer(path: str):
+    specification = importlib.util.spec_from_file_location("open_mopd_instruction_reward", path)
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module.compute_score
+
+
+def open_mopd_if_reward(sample: Sample, config: dict[str, Any]) -> float:
+    """Reuse Open-MOPD's exact Nemotron registry and native reward convention."""
+    if sample.metadata.get("open_mopd_evaluation") and sample.metadata.get("evaluator") == "ifbench":
+        if not os.environ.get("OPENOPD_IFBENCH_REPO"):
+            from slime.rollout.rm_hub.ifbench import _ensure_ifbench_repo
+
+            os.environ["OPENOPD_IFBENCH_REPO"] = str(_ensure_ifbench_repo())
+    scorer = _open_mopd_if_scorer(str(Path(config["scorer_path"]).resolve()))
+    result = scorer(
+        solution_str=_instruction_verifier_response(sample.response),
+        ground_truth=sample.label,
+        extra_info=sample.metadata,
+        data_source=str(sample.metadata.get("source_dataset") or "nemotron_if_rl"),
+        **({"scoring_mode": "official_eval"} if sample.metadata.get("open_mopd_evaluation") else {}),
+    )
+    sample.metadata["instruction_eval"] = result
+    return float(result["score"])
+
+
+def open_mopd_lcb_row(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Translate released LCB problem metadata to SandboxFusion's native row."""
+    problem = metadata.get("metadata", metadata)
+    if isinstance(problem, str):
+        problem = json.loads(problem)
+    public = problem["public_test_cases"]
+    public = json.loads(public) if isinstance(public, str) else public
+    private = problem["private_test_cases"]
+    if isinstance(private, str):
+        try:
+            private = json.loads(private)
+        except json.JSONDecodeError:
+            # The pinned Open-MOPD release preserves LCB's serialized JSON
+            # string representation for private test cases.
+            private = json.loads(pickle.loads(zlib.decompress(base64.b64decode(private))))
+    tests = public + private
+    details = problem.get("metadata") or {}
+    details = json.loads(details) if isinstance(details, str) else details
+    input_output = {
+        "inputs": [test["input"] for test in tests],
+        "outputs": [test["output"] for test in tests],
+    }
+    if details.get("func_name"):
+        input_output["fn_name"] = details["func_name"]
+    return {
+        "id": problem["question_id"],
+        "content": problem["question_content"],
+        "labels": "{}",
+        "test": json.dumps({"input_output": json.dumps(input_output)}),
+    }
 
 
 def _livecodebench_diagnostics(result: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
@@ -327,10 +450,15 @@ async def reward(
 
     if rm_type == "livecodebench":
         return await livecodebench_reward(args, sample, route_config)
+    if rm_type == "open_mopd_lcb":
+        sample.metadata["sandboxfusion_row"] = open_mopd_lcb_row(metadata)
+        return await livecodebench_reward(args, sample, route_config)
     if route_config.get("url") and rm_type not in {"unit_test"}:
         return await remote_reward(args, sample, route_config)
     if rm_type == "unit_test":
         return await code_reward(args, sample, route_config or config.get("code", {}))
+    if rm_type == "open_mopd_if":
+        return open_mopd_if_reward(sample, route_config)
     if rm_type == "ifevalg":
         from slime_plugins.m2rl.ifevalg import compute_ifevalg_reward
 

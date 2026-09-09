@@ -91,6 +91,11 @@ DATASET_SAMPLE_SPECS: dict[str, dict[str, tuple[str, ...]]] = {
         "default_keys": ("apply_chat_template_kwargs",),
         "arg_attrs": ("apply_chat_template_kwargs",),
     },
+    "chat_template_suffix_to_remove": {
+        "dataset_keys": ("chat_template_suffix_to_remove",),
+        "default_keys": ("chat_template_suffix_to_remove",),
+        "arg_attrs": ("chat_template_suffix_to_remove",),
+    },
     "custom_rm_path": {
         "dataset_keys": ("custom_rm_path",),
         "default_keys": ("custom_rm_path",),
@@ -148,6 +153,7 @@ class EvalDatasetConfig:
     multimodal_keys: dict[str, str] | None = None
     apply_chat_template: bool | None = None
     apply_chat_template_kwargs: dict[str, Any] | None = None
+    chat_template_suffix_to_remove: str | None = None
 
     n_samples_per_eval_prompt: int | None = None
 
@@ -203,6 +209,7 @@ class EvalDatasetConfig:
             self.label_key,
             self.tool_key,
             self.metadata_key,
+            self.chat_template_suffix_to_remove,
         )
 
     def inject_metadata(self, sample_metadata: Any) -> dict[str, Any]:
